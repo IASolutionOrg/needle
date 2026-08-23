@@ -1,0 +1,7 @@
+fix: docs: document router-cache benchmark fixtures
+
+- benchmarks/corpus/router-cache/README.md: document fixtures
+
+Fixes #27
+
+Signed-off-by: Vedant Madane <6527493+VedantMadane@users.noreply.github.com>
