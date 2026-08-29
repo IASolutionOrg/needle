@@ -1,15 +1,20 @@
+use crate::action_resolution::{
+    ShadowActionResolutionProjectionInput, project_shadow_action_resolutions,
+};
 use crate::semantic_claim_projection::project_claim_brief;
 use crate::store::now_ms;
 use crate::store::route_set_digest;
 use crate::{
     ArtifactCache, ArtifactCacheError, ClaimProofMaterial, NeedShadowWrite, RuntimeStore,
-    SemanticCostEstimates, SemanticResolver, SemanticReuseDecision, SnapshotError, StoreError,
-    ValidatedSemanticArtifact, bind_evidence_digests, capture_git_snapshot, select_route,
-    validate_cached_need_result, validate_need_result, validate_semantic_artifact_with_trace,
-    validate_semantic_test_plan, validate_semantic_test_plan_with_evidence,
+    SemanticCostEstimates, SemanticResolver, SemanticReuseDecision, ShadowActionResolutionSummary,
+    SnapshotError, StoreError, ValidatedSemanticArtifact, bind_evidence_digests,
+    capture_git_snapshot, select_route, validate_cached_need_result, validate_need_result,
+    validate_semantic_artifact_with_trace, validate_semantic_test_plan,
+    validate_semantic_test_plan_with_evidence,
 };
+use crate::{built_in_action_for_artifact_kind, built_in_action_for_predicate};
 use needle_core::{
-    ARTIFACT_RESULT_SCHEMA_ID, Artifact, ArtifactContract, ArtifactId, ArtifactKind,
+    ARTIFACT_RESULT_SCHEMA_ID, ActionRequest, Artifact, ArtifactContract, ArtifactId, ArtifactKind,
     ArtifactRequest, BehaviorStep, BehaviorTrace, CacheLookup, CacheResolution, CacheScope,
     CodeLocation, Dependency, DependencyManifest, Digest, EvidenceBrief, FrontierItem,
     FrontierView, Need, NeedCacheEntry, NeedCacheIdentity, NeedFragment, NeedIr, NeedRequest,
@@ -100,6 +105,12 @@ pub struct ResolveOutcome {
     pub result_digest: Digest,
     #[serde(default)]
     pub semantic_artifact_ids: Vec<ArtifactId>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::action_resolution::deserialize_shadow_action_resolution_summaries"
+    )]
+    pub action_resolutions: Vec<ShadowActionResolutionSummary>,
     #[serde(skip)]
     pub compiled_need: Option<Need>,
 }
@@ -134,6 +145,7 @@ struct WaitForResult<'a> {
     semantic_reused: &'a [Artifact],
     semantic_claim_material: Option<&'a ClaimProofMaterial>,
     partial_resolution: Option<&'a CacheResolution>,
+    action_resolutions: &'a [ShadowActionResolutionSummary],
 }
 
 impl<W: WorkerExecutor> RuntimeEngine<W> {
@@ -344,6 +356,7 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
             semantic_fragment,
         };
         let mut semantic_partial = None;
+        let mut semantic_action_resolutions = Vec::new();
         if let Some(need) = semantic_need.as_ref() {
             worker_request.requested_artifact_kinds =
                 artifact_kinds_for_obligations(&need.required);
@@ -361,30 +374,32 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                 route.matcher.need_key.as_str(),
                 "claim_partial_reuse",
             )?;
-            let exact_request_ids = worker_request
+            let action_requests = worker_request
                 .semantic_fragment
                 .as_ref()
                 .into_iter()
                 .flat_map(|fragment| {
                     need.required
                         .iter()
-                        .map(|obligation| artifact_kind_for_predicate(obligation.predicate))
+                        .map(|obligation| {
+                            built_in_action_for_predicate(obligation.predicate)
+                                .artifact_kind()
+                                .clone()
+                        })
                         .collect::<BTreeSet<_>>()
                         .into_iter()
                         .map(|kind| {
-                            semantic_artifact_request(
+                            semantic_action_request(
                                 &request.need,
                                 fragment,
                                 snapshot.repository_id,
                                 snapshot.source_digest,
                                 &kind,
                             )
-                            .semantic_id()
-                            .digest()
                         })
                 })
-                .collect::<Vec<_>>();
-            let mut decision = self.semantic_resolver.resolve_for_route(
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut decision = self.semantic_resolver.resolve_for_route_actions(
                 need,
                 &route.matcher.need_key,
                 &repository_root,
@@ -395,7 +410,7 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                     claim_reuse_microusd: expected_claim_reuse_microusd,
                     claim_partial_reuse_microusd: expected_claim_partial_reuse_microusd,
                 },
-                &exact_request_ids,
+                &action_requests,
             )?;
             let claim_backed_partial = matches!(
                 &decision.resolution,
@@ -426,9 +441,22 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                         .clone()
                         .expect("calibration selection requires a validated resolution");
                 }
+                let action_resolutions = shadow_action_resolutions_for_decision(
+                    &request.need,
+                    need,
+                    worker_request.semantic_fragment.as_ref(),
+                    snapshot.repository_id,
+                    snapshot.source_digest,
+                    &mut decision,
+                );
                 if decision.plan.as_ref().is_some_and(|plan| plan.missing_mask == 0) {
                     return with_compiled_need(
-                        semantic_artifact_outcome(&request.need, decision, &repository_root),
+                        semantic_artifact_outcome(
+                            &request.need,
+                            decision,
+                            &repository_root,
+                            action_resolutions,
+                        ),
                         &semantic_need,
                     )
                     .map(|mut outcome| {
@@ -464,6 +492,7 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                         decision.claim_material.as_ref(),
                     );
                     worker_request.semantic_fragment = Some(fragment);
+                    semantic_action_resolutions = action_resolutions;
                     semantic_partial = Some(decision);
                 }
             }
@@ -495,15 +524,18 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                 &entry.worker_outcome,
             )?;
             return with_compiled_need(
-                artifact_outcome(
-                    &request.need,
-                    CacheResolution::ExactHit {
-                        artifact_id: materialized.brief.id,
-                        sufficiency_certificate_id: None,
-                        selected_plan_id: None,
-                        resolution_format_revision: None,
-                    },
-                    materialized.brief,
+                with_action_resolutions(
+                    artifact_outcome(
+                        &request.need,
+                        CacheResolution::ExactHit {
+                            artifact_id: materialized.brief.id,
+                            sufficiency_certificate_id: None,
+                            selected_plan_id: None,
+                            resolution_format_revision: None,
+                        },
+                        materialized.brief,
+                    ),
+                    &semantic_action_resolutions,
                 ),
                 &semantic_need,
             );
@@ -561,6 +593,7 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                 calibration: false,
                 result_digest: materialized.brief.id,
                 semantic_artifact_ids: materialized.semantic_artifact_ids,
+                action_resolutions: semantic_action_resolutions.clone(),
                 compiled_need: semantic_need.clone(),
             });
         }
@@ -613,7 +646,10 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
             artifact_cache.resolve(&artifact_request, &repository_root)?;
         if let Some(artifact) = artifact {
             return with_compiled_need(
-                artifact_outcome(&request.need, artifact_resolution, artifact),
+                with_action_resolutions(
+                    artifact_outcome(&request.need, artifact_resolution, artifact),
+                    &semantic_action_resolutions,
+                ),
                 &semantic_need,
             );
         }
@@ -637,15 +673,18 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                 &entry.worker_outcome,
             )?;
             return with_compiled_need(
-                artifact_outcome(
-                    &request.need,
-                    CacheResolution::ExactHit {
-                        artifact_id: materialized.brief.id,
-                        sufficiency_certificate_id: None,
-                        selected_plan_id: None,
-                        resolution_format_revision: None,
-                    },
-                    materialized.brief,
+                with_action_resolutions(
+                    artifact_outcome(
+                        &request.need,
+                        CacheResolution::ExactHit {
+                            artifact_id: materialized.brief.id,
+                            sufficiency_certificate_id: None,
+                            selected_plan_id: None,
+                            resolution_format_revision: None,
+                        },
+                        materialized.brief,
+                    ),
+                    &semantic_action_resolutions,
                 ),
                 &semantic_need,
             );
@@ -669,6 +708,7 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                 semantic_reused: semantic_reused_artifacts,
                 semantic_claim_material,
                 partial_resolution: partial_resolution.as_ref(),
+                action_resolutions: &semantic_action_resolutions,
             })? {
                 return with_compiled_need(Ok(outcome), &semantic_need);
             }
@@ -717,11 +757,14 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
         let materialized = materialized?;
         release?;
         with_compiled_need(
-            artifact_generated_outcome(
-                &request.need,
-                materialized.brief,
-                partial_resolution.unwrap_or(CacheResolution::Miss),
-                materialized.semantic_artifact_ids,
+            with_action_resolutions(
+                artifact_generated_outcome(
+                    &request.need,
+                    materialized.brief,
+                    partial_resolution.unwrap_or(CacheResolution::Miss),
+                    materialized.semantic_artifact_ids,
+                ),
+                &semantic_action_resolutions,
             ),
             &semantic_need,
         )
@@ -808,8 +851,11 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                     if let Some(brief) = plan_cache.artifacts.get("brief").cloned()
                         && matches!(&plan_cache.resolution, CacheResolution::CompositeHit { .. })
                     {
-                        return artifact_outcome(context.need, plan_cache.resolution, brief)
-                            .map(Some);
+                        return with_action_resolutions(
+                            artifact_outcome(context.need, plan_cache.resolution, brief),
+                            context.action_resolutions,
+                        )
+                        .map(Some);
                     }
                 }
                 let materialized = materialize_worker_artifact(
@@ -829,14 +875,13 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                     },
                     &entry.worker_outcome,
                 )?;
-                return if let Some(resolution) = context.partial_resolution {
+                let outcome = if let Some(resolution) = context.partial_resolution {
                     artifact_generated_outcome(
                         context.need,
                         materialized.brief,
                         resolution.clone(),
                         materialized.semantic_artifact_ids,
                     )
-                    .map(Some)
                 } else {
                     artifact_outcome(
                         context.need,
@@ -848,8 +893,8 @@ impl<W: WorkerExecutor> RuntimeEngine<W> {
                         },
                         materialized.brief,
                     )
-                    .map(Some)
                 };
+                return with_action_resolutions(outcome, context.action_resolutions).map(Some);
             }
         }
         Ok(None)
@@ -937,8 +982,13 @@ fn materialize_worker_artifact(
                 continue;
             }
             let kind = worker_artifact.kind();
-            let preferred_fragment = predicate_for_artifact_kind(&kind).and_then(|predicate| {
-                (!fragment.obligations.iter().any(|obligation| obligation.predicate == predicate))
+            let preferred_fragment =
+                built_in_action_for_artifact_kind(&kind).and_then(|definition| {
+                    let predicate = definition.predicate()?;
+                    (!fragment
+                        .obligations
+                        .iter()
+                        .any(|obligation| obligation.predicate == predicate))
                     .then(|| {
                         need.preferred
                             .iter()
@@ -953,26 +1003,26 @@ fn materialize_worker_artifact(
                             })
                     })
                     .flatten()
-            });
+                });
             let validation_fragment = preferred_fragment.as_ref().unwrap_or(fragment);
-            let request = semantic_artifact_request(
+            let action_request = semantic_action_request(
                 context.need,
                 validation_fragment,
                 context.repository_id,
                 context.source_snapshot_digest,
                 &kind,
-            );
+            )?;
+            let request = &action_request.artifact_request;
             match validate_semantic_artifact_with_trace(
                 validation_fragment,
                 worker_artifact,
                 context.repository_root,
-                request.semantic_id().digest(),
+                action_request.semantic_id().digest(),
                 Some(semantic_trace(result, &kind)),
             ) {
                 Ok(validated) => {
-                    context.store.publish_semantic_artifact(
-                        &request,
-                        need,
+                    context.store.publish_action_artifact(
+                        &action_request,
                         &validated.artifact,
                         &validated.certificate,
                     )?;
@@ -989,7 +1039,7 @@ fn materialize_worker_artifact(
                 }
                 Err(error) => {
                     context.store.record_semantic_validation_rejection(
-                        &request,
+                        request,
                         need,
                         worker_artifact,
                         &error.to_string(),
@@ -1006,13 +1056,14 @@ fn materialize_worker_artifact(
         {
             let test_artifact = parent_owned_test_plan_artifact(plan, outcome, result);
             let kind = ArtifactKind::test_plan();
-            let request = semantic_artifact_request(
+            let action_request = semantic_action_request(
                 context.need,
                 fragment,
                 context.repository_id,
                 context.source_snapshot_digest,
                 &kind,
-            );
+            )?;
+            let request = &action_request.artifact_request;
             let command_evidence =
                 context.store.latest_command_evidence(context.source_snapshot_digest, plan)?;
             let validation = if let Some(evidence) = command_evidence.as_ref() {
@@ -1020,7 +1071,7 @@ fn materialize_worker_artifact(
                     fragment,
                     &test_artifact,
                     context.repository_root,
-                    request.semantic_id().digest(),
+                    action_request.semantic_id().digest(),
                     Some(semantic_trace(result, &kind)),
                     plan,
                     evidence,
@@ -1030,16 +1081,15 @@ fn materialize_worker_artifact(
                     fragment,
                     &test_artifact,
                     context.repository_root,
-                    request.semantic_id().digest(),
+                    action_request.semantic_id().digest(),
                     Some(semantic_trace(result, &kind)),
                     plan,
                 )
             };
             match validation {
                 Ok(validated) => {
-                    context.store.publish_semantic_artifact(
-                        &request,
-                        need,
+                    context.store.publish_action_artifact(
+                        &action_request,
                         &validated.artifact,
                         &validated.certificate,
                     )?;
@@ -1056,7 +1106,7 @@ fn materialize_worker_artifact(
                 }
                 Err(error) => {
                     context.store.record_semantic_validation_rejection(
-                        &request,
+                        request,
                         need,
                         &test_artifact,
                         &error.to_string(),
@@ -1350,23 +1400,59 @@ fn has_absent_or_exact_facet(
         .is_none_or(|facet| facet.value == accepted)
 }
 
-fn semantic_artifact_request(
+fn semantic_action_request(
     need: &NeedRequest,
     fragment: &NeedFragment,
     repository_id: Digest,
     source_snapshot_digest: Digest,
     kind: &ArtifactKind,
-) -> ArtifactRequest {
-    ArtifactRequest {
-        contract_id: format!("needle.semantic.{}", kind.0),
-        contract_revision: 2,
+) -> Result<ActionRequest, RuntimeError> {
+    let action = built_in_action_for_artifact_kind(kind).ok_or_else(|| {
+        RuntimeError::ArtifactProtocol(format!("no built-in action for artifact kind {}", kind.0))
+    })?;
+    crate::semantic_action_request::build_semantic_action_request(
+        need,
+        fragment,
         repository_id,
         source_snapshot_digest,
-        route_key: need.key.clone(),
-        normalized_request: need.body.clone(),
-        semantic_fragment_id: Some(fragment.id),
-        input_artifact_ids: fragment.semantic_inputs.iter().map(|input| input.digest()).collect(),
+        action,
+    )
+    .map_err(RuntimeError::ArtifactProtocol)
+}
+
+fn shadow_action_resolutions_for_decision(
+    request: &NeedRequest,
+    need: &Need,
+    fragment: Option<&NeedFragment>,
+    repository_id: Digest,
+    source_snapshot_digest: Digest,
+    decision: &mut SemanticReuseDecision,
+) -> Vec<ShadowActionResolutionSummary> {
+    if !matches!(
+        decision.resolution,
+        CacheResolution::ExactHit { .. }
+            | CacheResolution::CoverageHit { .. }
+            | CacheResolution::CompositeHit { .. }
+            | CacheResolution::PartialHit { .. }
+    ) {
+        return Vec::new();
     }
+    let (Some(fragment), Some(plan), Some(descriptors)) =
+        (fragment, decision.plan.as_ref(), decision.action_descriptors.take())
+    else {
+        return Vec::new();
+    };
+    project_shadow_action_resolutions(ShadowActionResolutionProjectionInput {
+        request,
+        need,
+        fragment,
+        repository_id,
+        source_snapshot_digest,
+        descriptors,
+        plan,
+        sufficiency_certificate: decision.certificate.as_ref().map(|certificate| certificate.id),
+    })
+    .unwrap_or_default()
 }
 
 fn artifact_bundle_from_outcome(
@@ -1999,6 +2085,7 @@ fn semantic_artifact_outcome(
     need: &NeedRequest,
     decision: SemanticReuseDecision,
     repository_root: &Path,
+    action_resolutions: Vec<ShadowActionResolutionSummary>,
 ) -> Result<ResolveOutcome, RuntimeError> {
     let repository_id = decision
         .certificate
@@ -2033,7 +2120,10 @@ fn semantic_artifact_outcome(
             &decision.artifacts,
         )?
     };
-    artifact_outcome(need, decision.resolution, artifact)
+    artifact_outcome(need, decision.resolution, artifact).map(|mut outcome| {
+        outcome.action_resolutions = action_resolutions;
+        outcome
+    })
 }
 
 fn semantic_brief_artifact(
@@ -2195,27 +2285,12 @@ fn semantic_evidence_brief(
     })
 }
 
-fn artifact_kind_for_predicate(predicate: PredicateKind) -> ArtifactKind {
-    match predicate {
-        PredicateKind::ImplementationLocation => ArtifactKind::code_location(),
-        PredicateKind::RuntimeFlow => ArtifactKind::behavior_trace(),
-        PredicateKind::FocusedTests => ArtifactKind::test_plan(),
-    }
-}
-
-fn predicate_for_artifact_kind(kind: &ArtifactKind) -> Option<PredicateKind> {
-    match kind.0.as_str() {
-        "code-location" => Some(PredicateKind::ImplementationLocation),
-        "behavior-trace" => Some(PredicateKind::RuntimeFlow),
-        "test-plan" => Some(PredicateKind::FocusedTests),
-        _ => None,
-    }
-}
-
 fn artifact_kinds_for_obligations(obligations: &[needle_core::Obligation]) -> Vec<ArtifactKind> {
     let mut kinds = obligations
         .iter()
-        .map(|obligation| artifact_kind_for_predicate(obligation.predicate))
+        .map(|obligation| {
+            built_in_action_for_predicate(obligation.predicate).artifact_kind().clone()
+        })
         .collect::<Vec<_>>();
     kinds.sort();
     kinds.dedup();
@@ -2272,6 +2347,7 @@ fn artifact_outcome(
         calibration: false,
         result_digest: artifact.id,
         semantic_artifact_ids,
+        action_resolutions: Vec::new(),
         compiled_need: None,
     })
 }
@@ -2294,7 +2370,18 @@ fn artifact_generated_outcome(
         calibration: false,
         result_digest: artifact.id,
         semantic_artifact_ids,
+        action_resolutions: Vec::new(),
         compiled_need: None,
+    })
+}
+
+fn with_action_resolutions(
+    outcome: Result<ResolveOutcome, RuntimeError>,
+    action_resolutions: &[ShadowActionResolutionSummary],
+) -> Result<ResolveOutcome, RuntimeError> {
+    outcome.map(|mut outcome| {
+        outcome.action_resolutions = action_resolutions.to_vec();
+        outcome
     })
 }
 
@@ -3192,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_coverage_hit_bypasses_worker_after_explicit_economic_promotion() {
+    fn semantic_action_identity_ignores_wording_after_explicit_economic_promotion() {
         let context = TestContext::create();
         fs::create_dir_all(context.root.join("tests")).unwrap();
         fs::write(context.root.join("tests/focused.rs"), "#[test] fn answer() {}\n").unwrap();
@@ -3288,6 +3375,8 @@ mod tests {
         assert!(hit.cache_hit);
         assert!(!hit.worker_spawned);
         assert!(matches!(hit.cache_resolution, CacheResolution::ExactHit { .. }));
+        assert_eq!(hit.action_resolutions.len(), 1);
+        assert_eq!(hit.action_resolutions[0].resolution, crate::ShadowActionResolutionKind::Exact);
         assert_eq!(hit.result_digest, generated.result_digest);
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
         let (_, snapshot) = capture_git_snapshot(&context.root).unwrap();
@@ -3313,8 +3402,25 @@ mod tests {
             .unwrap();
         assert!(matches!(
             bootstrap_coverage_hit.cache_resolution,
-            CacheResolution::CoverageHit { .. }
+            CacheResolution::ExactHit { .. }
         ));
+        assert_eq!(bootstrap_coverage_hit.action_resolutions.len(), 1);
+        assert_eq!(
+            bootstrap_coverage_hit.action_resolutions[0].resolution,
+            crate::ShadowActionResolutionKind::Exact
+        );
+        let mut legacy_wire = serde_json::to_value(&bootstrap_coverage_hit).unwrap();
+        assert!(legacy_wire.get("action_resolutions").is_some());
+        let mut oversized_wire = legacy_wire.clone();
+        let action_resolution = oversized_wire["action_resolutions"][0].clone();
+        oversized_wire["action_resolutions"] = serde_json::Value::Array(
+            (0..=crate::BUILT_IN_ACTION_COUNT).map(|_| action_resolution.clone()).collect(),
+        );
+        assert!(serde_json::from_value::<ResolveOutcome>(oversized_wire).is_err());
+        legacy_wire.as_object_mut().unwrap().remove("action_resolutions");
+        let decoded_legacy: ResolveOutcome = serde_json::from_value(legacy_wire).unwrap();
+        assert!(decoded_legacy.action_resolutions.is_empty());
+        assert_eq!(decoded_legacy.cache_resolution, bootstrap_coverage_hit.cache_resolution);
         assert!(!bootstrap_coverage_hit.worker_spawned);
         assert_eq!(bootstrap_coverage_hit.result_digest, generated.result_digest);
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
@@ -3441,13 +3547,15 @@ mod tests {
                 fragments: std::slice::from_ref(&fragment),
             })
             .unwrap();
-        let semantic_request = semantic_artifact_request(
+        let semantic_request = semantic_action_request(
             &compatibility,
             &fragment,
             snapshot.repository_id,
             snapshot.source_digest,
             &ArtifactKind::code_location(),
-        );
+        )
+        .unwrap()
+        .artifact_request;
         let worker_artifact = SemanticWorkerArtifact::CodeLocation {
             locations: vec![
                 SemanticLocation {
@@ -3560,6 +3668,7 @@ mod tests {
             outcome.cache_resolution,
             CacheResolution::ClaimHit { resolution_format_revision: 2, .. }
         ));
+        assert!(outcome.action_resolutions.is_empty());
         assert!(outcome.rendered.contains("src/lib.rs"));
         assert!(!outcome.rendered.contains("src/support.rs"));
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
@@ -3801,6 +3910,12 @@ mod tests {
         assert!(partial.cache_hit);
         assert_eq!(partial.status, "generated-partial");
         assert!(matches!(partial.cache_resolution, CacheResolution::PartialHit { .. }));
+        assert_eq!(partial.action_resolutions.len(), 1);
+        assert_eq!(
+            partial.action_resolutions[0].resolution,
+            crate::ShadowActionResolutionKind::Coverage
+        );
+        assert!(partial.action_resolutions[0].sufficiency_certificate.is_none());
         assert!(partial.rendered.contains("\"partial_hit\""));
         assert_eq!(spawns.load(Ordering::SeqCst), 2);
         assert_eq!(requests.lock().unwrap().last(), Some(&vec![ArtifactKind::behavior_trace()]));
@@ -3831,6 +3946,13 @@ mod tests {
         assert!(composite.cache_hit);
         assert!(!composite.worker_spawned);
         assert!(matches!(composite.cache_resolution, CacheResolution::CompositeHit { .. }));
+        assert_eq!(composite.action_resolutions.len(), 2);
+        assert!(
+            composite
+                .action_resolutions
+                .iter()
+                .all(|summary| summary.resolution == crate::ShadowActionResolutionKind::Coverage)
+        );
         assert!(composite.rendered.contains("\"composite_hit\""));
         assert_eq!(spawns.load(Ordering::SeqCst), 2);
 
@@ -3839,6 +3961,7 @@ mod tests {
             engine.resolve(&semantic_request("r70-trace-irrelevant", trace_marker)).unwrap();
         fs::remove_file(context.root.join("irrelevant.txt")).unwrap();
         assert!(matches!(irrelevant.cache_resolution, CacheResolution::CompositeHit { .. }));
+        assert_eq!(irrelevant.action_resolutions.len(), 2);
         assert!(!irrelevant.worker_spawned);
         assert_eq!(spawns.load(Ordering::SeqCst), 2);
 
@@ -3851,6 +3974,7 @@ mod tests {
             engine.resolve(&semantic_request("r70-trace-relevant", trace_marker)).unwrap();
         fs::write(&flow, original).unwrap();
         assert!(matches!(relevant.cache_resolution, CacheResolution::PartialHit { .. }));
+        assert_eq!(relevant.action_resolutions.len(), 1);
         assert!(relevant.worker_spawned);
         assert_eq!(spawns.load(Ordering::SeqCst), 3);
         assert_eq!(requests.lock().unwrap().last(), Some(&vec![ArtifactKind::behavior_trace()]));
@@ -3981,6 +4105,11 @@ mod tests {
         assert!(tests.cache_hit);
         assert!(!tests.worker_spawned);
         assert!(matches!(tests.cache_resolution, CacheResolution::CoverageHit { .. }));
+        assert_eq!(tests.action_resolutions.len(), 1);
+        assert_eq!(
+            tests.action_resolutions[0].resolution,
+            crate::ShadowActionResolutionKind::Coverage
+        );
         assert_eq!(spawns.load(Ordering::SeqCst), before + 1);
         let test_artifact = context
             .store

@@ -1,10 +1,13 @@
 use super::{
-    LifecycleError, bounded_identifier, safe_relative_directory, test_plan_contains_absolute_path,
+    LifecycleActionPhasePlans, LifecycleError, LifecycleExploreActionPlan, bounded_identifier,
+    safe_relative_directory, test_plan_contains_absolute_path,
 };
 use crate::{
-    AcceptanceStatus, ApprovalDecisionSource, CanonicalHasher, ChangeApplyId, ChangeApplyStatus,
-    ChangeId, Digest, PatchId, RoleProfileProvenance, TestPlan, VerificationArtifactId,
-    VerificationStatus,
+    AcceptanceStatus, ActionAssuranceEvidenceId, ActionCapabilityClassId,
+    ActionCapabilityDecisionId, ApprovalDecisionSource, ArtifactId, ArtifactRequestId,
+    ArtifactValidationCertificateId, CanonicalHasher, ChangeApplyId, ChangeApplyStatus, ChangeId,
+    Digest, PatchId, ReuseSufficiencyCertificateId, RoleProfileProvenance, SelectedPlanId,
+    TestPlan, VerificationArtifactId, VerificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -255,10 +258,30 @@ impl LifecycleTestPlanBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct LifecycleResolvedTestPlan {
+    pub artifact: crate::ArtifactId,
+    pub binding: LifecycleTestPlanBinding,
+}
+
+impl LifecycleResolvedTestPlan {
+    pub fn validate(&self) -> Result<(), LifecycleError> {
+        if self.artifact.digest() == Digest([0; 32]) {
+            return Err(LifecycleError::InvalidTestPlan);
+        }
+        self.binding.validate()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleSpec {
     pub worker_depth_limit: u8,
     pub profiles: LifecycleWorkerProfiles,
     pub budget: LifecycleBudget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explore_action_plan: Option<LifecycleExploreActionPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_phase_plans: Option<LifecycleActionPhasePlans>,
     pub test_plans: Vec<LifecycleTestPlanBinding>,
 }
 
@@ -269,7 +292,13 @@ impl LifecycleSpec {
         }
         self.profiles.validate()?;
         self.budget.validate()?;
-        if self.test_plans.is_empty() || self.test_plans.len() > MAX_LIFECYCLE_TEST_PLANS {
+        if let Some(plan) = &self.explore_action_plan {
+            plan.validate()?;
+        }
+        if let Some(plans) = &self.action_phase_plans {
+            plans.validate()?;
+        }
+        if self.test_plans.len() > MAX_LIFECYCLE_TEST_PLANS {
             return Err(LifecycleError::InvalidTestPlan);
         }
         let mut prior = None;
@@ -315,6 +344,8 @@ pub struct LifecycleTestResult {
     pub executed: bool,
     pub passed: bool,
     pub evidence_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_evidence_artifact: Option<ArtifactId>,
     pub failure_code: Option<String>,
 }
 
@@ -328,6 +359,9 @@ impl LifecycleTestResult {
                 .failure_code
                 .as_deref()
                 .is_some_and(|value| !bounded_identifier(value, MAX_LIFECYCLE_REASON_CODE_BYTES))
+            || self
+                .action_evidence_artifact
+                .is_some_and(|artifact| artifact.digest() == Digest([0; 32]))
         {
             return Err(LifecycleError::InvalidTestEvidence);
         }
@@ -576,20 +610,120 @@ pub struct LifecycleWorkerCompletion {
     pub usage: LifecycleUsage,
 }
 
+/// Exact operator authority consumed by a lifecycle reuse transition.
+///
+/// The capability remains immutable catalog material. These identifiers bind
+/// the transition to the effective append-only decision and its accepted
+/// assurance evidence without representing a worker execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleExploreReuseAuthority {
+    pub capability_class: ActionCapabilityClassId,
+    pub capability_definition_digest: Digest,
+    pub evidence: ActionAssuranceEvidenceId,
+    pub decision: ActionCapabilityDecisionId,
+}
+
+impl LifecycleExploreReuseAuthority {
+    pub fn validate(&self) -> Result<(), LifecycleError> {
+        if self.capability_class.digest() == Digest([0; 32])
+            || self.capability_definition_digest == Digest([0; 32])
+            || self.evidence.digest() == Digest([0; 32])
+            || self.decision.digest() == Digest([0; 32])
+        {
+            return Err(LifecycleError::InvalidExploreReuse);
+        }
+        Ok(())
+    }
+}
+
+/// Fixed provenance for an Explore phase completed from one exact validated
+/// action artifact. It is deliberately distinct from `LifecycleWorkerCompletion`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleExploreReuseCompletion {
+    pub authority: LifecycleExploreReuseAuthority,
+    pub action_request: ArtifactRequestId,
+    pub origin_request: ArtifactRequestId,
+    pub artifact: ArtifactId,
+    pub validation_certificate: ArtifactValidationCertificateId,
+    pub selected_plan: SelectedPlanId,
+    pub sufficiency_certificate: ReuseSufficiencyCertificateId,
+    pub repository_id: Digest,
+    pub source_snapshot: Digest,
+    pub resolution_definition_digest: Digest,
+}
+
+impl LifecycleExploreReuseCompletion {
+    pub fn validate(&self) -> Result<(), LifecycleError> {
+        self.authority.validate()?;
+        if self.action_request.digest() == Digest([0; 32])
+            || self.origin_request.digest() == Digest([0; 32])
+            || self.artifact.digest() == Digest([0; 32])
+            || self.validation_certificate.digest() == Digest([0; 32])
+            || self.selected_plan.digest() == Digest([0; 32])
+            || self.sufficiency_certificate.digest() == Digest([0; 32])
+            || self.repository_id == Digest([0; 32])
+            || self.source_snapshot == Digest([0; 32])
+            || self.resolution_definition_digest == Digest([0; 32])
+        {
+            return Err(LifecycleError::InvalidExploreReuse);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LifecycleTransition {
-    CompleteExplore { worker: LifecycleWorkerCompletion, artifacts: Vec<LifecycleArtifactRef> },
-    CompleteImplement { worker: LifecycleWorkerCompletion, patch: LifecyclePatchRef },
-    CompleteTest { worker: LifecycleWorkerCompletion, results: Vec<LifecycleTestResult> },
-    CompleteReview { worker: LifecycleWorkerCompletion, review: ReviewArtifact },
-    CompleteVerify { worker: LifecycleWorkerCompletion, verification: LifecycleVerificationRef },
+    CompleteExplore {
+        worker: LifecycleWorkerCompletion,
+        artifacts: Vec<LifecycleArtifactRef>,
+    },
+    CompleteExploreFromReuse {
+        reuse: LifecycleExploreReuseCompletion,
+        artifacts: Vec<LifecycleArtifactRef>,
+    },
+    CompleteImplement {
+        worker: LifecycleWorkerCompletion,
+        patch: LifecyclePatchRef,
+    },
+    BindTestPlans {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<LifecycleWorkerCompletion>,
+        plans: Vec<LifecycleResolvedTestPlan>,
+    },
+    CompleteTest {
+        worker: LifecycleWorkerCompletion,
+        results: Vec<LifecycleTestResult>,
+    },
+    CompleteReview {
+        worker: LifecycleWorkerCompletion,
+        review: ReviewArtifact,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_artifact: Option<crate::ArtifactId>,
+    },
+    CompleteVerify {
+        worker: LifecycleWorkerCompletion,
+        verification: LifecycleVerificationRef,
+    },
     ConsumeRepair,
-    ApproveApply { approval: LifecycleApplyApproval },
-    StartApply { apply_id: ChangeApplyId },
-    FinishApply { apply_id: ChangeApplyId, status: ChangeApplyStatus },
-    Cancel { reason: LifecycleReason },
-    Fail { reason: LifecycleReason },
+    ApproveApply {
+        approval: LifecycleApplyApproval,
+    },
+    StartApply {
+        apply_id: ChangeApplyId,
+    },
+    FinishApply {
+        apply_id: ChangeApplyId,
+        status: ChangeApplyStatus,
+    },
+    Cancel {
+        reason: LifecycleReason,
+    },
+    Fail {
+        reason: LifecycleReason,
+    },
 }
 
 impl LifecycleTransition {
@@ -600,6 +734,7 @@ impl LifecycleTransition {
             | Self::CompleteTest { worker, .. }
             | Self::CompleteReview { worker, .. }
             | Self::CompleteVerify { worker, .. } => Some(worker),
+            Self::BindTestPlans { worker: Some(worker), .. } => Some(worker),
             _ => None,
         }
     }

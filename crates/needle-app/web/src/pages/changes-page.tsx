@@ -271,7 +271,7 @@ function AttemptTable({ attempts }: { attempts: ChangeAttempt[] }) {
           {attempts.map((attempt, index) => (
             <TableRow key={`${attempt.patch_id}-${attempt.role}-${index}`}>
               <TableCell>{attempt.role}</TableCell>
-              <TableCell className="max-w-64 truncate font-mono">{attempt.patch_id}</TableCell>
+              <TableCell className="max-w-64 truncate font-mono">{attempt.patch_id ?? "Rejected before publication"}</TableCell>
               <TableCell className="font-mono">
                 {attempt.usage.input_tokens ?? "—"} / {attempt.usage.cached_input_tokens ?? "—"} / {attempt.usage.output_tokens ?? "—"}
               </TableCell>

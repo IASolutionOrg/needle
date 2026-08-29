@@ -1,0 +1,113 @@
+{
+  "format_revision": 1,
+  "schema": "needle.test-target-refresh-gate-a4-manifest/1",
+  "package_count": 64,
+  "samples_per_refresh_case": 12,
+  "p95_budget_micros": 250000,
+  "fixture_definition_digest": "b3:645fd27a8f22dcefae62e3d0ace4c569e6b419f3011c42fae31c131f7ab99dab",
+  "adapter_definition_digest": "b3:c944146d0d5a52d5a0820db85f1cd4ab535c27b4ba5b932c9ead5c1a97a6b524",
+  "acquisition_definition_digest": "b3:6ffc40a7dc21a18a875dbd292dbb7f275a2e689d92f6b30a370c42ff03aa8619",
+  "refresh_definition_digest": "b3:969a88360b06c49450b00dc1556ce7066a8faa4c8f379b77f94fc31350c02c05",
+  "validator_definition_digest": "b3:fc22e6ec95e9af380d565f95d4830a9c6f596b924de2ed29784aec2cf6ce0a4c",
+  "partition_policy_definition_digest": "b3:8c83b0b9484f5d0d21ad9c51293d6a9bd24d5bfe1e8d5b4cb659b91a82a3a410",
+  "tasks": [
+    {
+      "id": "conventional-target-addition",
+      "mutation": "conventional_target_addition",
+      "mutation_definition_digest": "b3:f19a5d53ef373b9fe339e6d288796df5b4ed894e0c764e23e3b89698656486a9",
+      "expected": {
+        "decision": "refresh",
+        "acquisition_retained_partitions": 63,
+        "retained_partitions": 65,
+        "recomputed_partitions": 3,
+        "refreshed_partitions": 0,
+        "added_partitions": 1,
+        "removed_partitions": 0
+      }
+    },
+    {
+      "id": "explicit-target-addition",
+      "mutation": "explicit_target_addition",
+      "mutation_definition_digest": "b3:a5767097c830d28e6064f81aaecd5fd30f66adc1f32b0d2e7f28af0d840b5fea",
+      "expected": {
+        "decision": "refresh",
+        "acquisition_retained_partitions": 63,
+        "retained_partitions": 63,
+        "recomputed_partitions": 3,
+        "refreshed_partitions": 2,
+        "added_partitions": 1,
+        "removed_partitions": 0
+      }
+    },
+    {
+      "id": "explicit-target-removal",
+      "mutation": "explicit_target_removal",
+      "mutation_definition_digest": "b3:32a9cd45e9f0a6c807f5880cef84fef051f98a1dee0e9e3bbc29780a41590a58",
+      "expected": {
+        "decision": "refresh",
+        "acquisition_retained_partitions": 63,
+        "retained_partitions": 63,
+        "recomputed_partitions": 1,
+        "refreshed_partitions": 1,
+        "added_partitions": 0,
+        "removed_partitions": 1
+      }
+    },
+    {
+      "id": "incomplete-delta",
+      "mutation": "incomplete_delta",
+      "mutation_definition_digest": "b3:3e6a1f0e62e5838d2609363679069d1dc3d6ab4910f2496a2cf35eb0bbd31d78",
+      "expected": {
+        "decision": "full_compute",
+        "reason": "incomplete_delta"
+      }
+    },
+    {
+      "id": "manifest-content-change",
+      "mutation": "manifest_content_change",
+      "mutation_definition_digest": "b3:6010751742b1d17767167a7f8f680fffa374b13e653794da18f9d2d5f503ad80",
+      "expected": {
+        "decision": "refresh",
+        "acquisition_retained_partitions": 63,
+        "retained_partitions": 63,
+        "recomputed_partitions": 2,
+        "refreshed_partitions": 2,
+        "added_partitions": 0,
+        "removed_partitions": 0
+      }
+    },
+    {
+      "id": "target-metadata-change",
+      "mutation": "target_metadata_change",
+      "mutation_definition_digest": "b3:1d41227a1b5a80b491a478286ff078c72056cd037f00988aa1f1b0a3b9b38d48",
+      "expected": {
+        "decision": "refresh",
+        "acquisition_retained_partitions": 63,
+        "retained_partitions": 63,
+        "recomputed_partitions": 2,
+        "refreshed_partitions": 2,
+        "added_partitions": 0,
+        "removed_partitions": 0
+      }
+    },
+    {
+      "id": "unmapped-repository-change",
+      "mutation": "unmapped_repository_change",
+      "mutation_definition_digest": "b3:a572c7a88c820da7698ce86f0e24aa21365af1a7958f3161aad6c91b327a9b40",
+      "expected": {
+        "decision": "full_compute",
+        "reason": "unmapped_repository_change"
+      }
+    },
+    {
+      "id": "workspace-manifest-change",
+      "mutation": "workspace_manifest_change",
+      "mutation_definition_digest": "b3:e519898c5a87e942508968b4720fd0b1635a4ba02a29d79cb1395918020f83ad",
+      "expected": {
+        "decision": "full_compute",
+        "reason": "workspace_change"
+      }
+    }
+  ],
+  "manifest_digest": "b3:95b2fd85c48e096371f1823658af098dfbd80ab2d254e4a346c4700609ba0d7d"
+}

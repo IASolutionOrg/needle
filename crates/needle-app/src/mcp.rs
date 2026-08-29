@@ -7,18 +7,23 @@ use change_schema::{
     McpVerifyChangeResponse,
 };
 use needle_core::{
-    CacheResolution, CanonicalHasher, Digest, MultiNeedPolicy, Need, NeedCoordination,
-    NeedDelivery, NeedStep, NeedStepRelation, NeedStepState, PredicateKind,
-    ReuseSufficiencyCertificateId, RoleProfileId, RoleProfileProvenance, VerificationStatus,
-    classify_need_step,
+    ActionContractId, ArtifactId, CacheResolution, CanonicalHasher, ChangeActionInput,
+    ChangeActionInvocation, CodexRole, Digest, Facet, MultiNeedPolicy, Need, NeedCoordination,
+    NeedDelivery, NeedExecution, NeedExecutionEnvelopeV1, NeedIr, NeedKey, NeedStep,
+    NeedStepRelation, NeedStepState, ObligationExpression, PATCH_PROPOSE_ACTION_CONTRACT,
+    PATCH_VERIFY_ACTION_CONTRACT, PatchActionInputRef, PredicateKind,
+    ReuseSufficiencyCertificateId, RoleProfileId, RoleProfileProvenance, SubjectExpression,
+    SubjectKind, TESTS_EXECUTE_ACTION_CONTRACT, WorkerConfig, classify_need_step,
 };
-use needle_platform_codex::{CodexPatchWorker, CodexVerifier, PatchContextItem};
+use needle_platform_codex::CodexChangeActionProvider;
 use needle_runtime::{
-    ResolveOutcome, ResolveRequest, artifact_and_certificate_are_fresh,
-    claim_validation_certificate_is_fresh,
+    ActionExecutionService, ChangeActionOutput, ResolveOutcome, ResolveRequest,
+    ShadowActionResolutionAuthority, ShadowActionResolutionKind, ShadowActionResolutionSummary,
+    capture_git_snapshot,
 };
 use schema::{
-    MAX_MCP_REQUEST_BYTES, McpNeedContextRequest, McpNeedContextResponse, McpResolution, McpStep,
+    MAX_MCP_REQUEST_BYTES, McpActionResolution, McpActionResolutionAuthority,
+    McpActionResolutionKind, McpNeedContextRequest, McpNeedContextResponse, McpResolution, McpStep,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, VecDeque};
@@ -409,6 +414,7 @@ impl BenchmarkMcpServer {
             resolution: McpResolution::Bypass {
                 reason: "deterministic benchmark fixture".to_owned(),
             },
+            action_resolutions: Vec::new(),
             reuse_unit: "none".to_owned(),
             claim_ids: Vec::new(),
             cache_hit: false,
@@ -866,138 +872,61 @@ impl ProductMcpServer {
             Ok(request) => request,
             Err(error) => return rpc_error(id, -32602, &error),
         };
-        let context = match self.change_context(&request) {
-            Ok(context) => context,
-            Err(error) => return rpc_error(id, -32602, &error),
+        let (_, snapshot) = match capture_git_snapshot(&self.repository_root) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error(id, &format!("cannot capture source: {error}")),
         };
-        let settings = match self.resolver.store().settings() {
-            Ok(settings) => settings,
-            Err(error) => return tool_error(id, &format!("cannot load worker settings: {error}")),
-        };
-        let worker_config = match self
-            .resolver
-            .store()
-            .resolve_session_worker_config(&self.session_id, settings.codex_executable.clone())
-        {
+        let request_digest = request.digest(snapshot.source_digest);
+        let operation_id =
+            mcp_action_operation_id("prepare_change", &self.session_id, &id, request_digest);
+        let envelope = NeedExecutionEnvelopeV1::new(
+            operation_id,
+            change_action_need(&request),
+            NeedExecution::Action {
+                action: ChangeActionInvocation {
+                    contract: ActionContractId::new(PATCH_PROPOSE_ACTION_CONTRACT)
+                        .expect("built-in patch contract"),
+                    input: ChangeActionInput::PatchPropose {
+                        change: request.clone(),
+                        prior_patch: None,
+                        repair_verification: None,
+                    },
+                },
+            },
+        );
+        let config = match self.action_worker_config(CodexRole::Implementer) {
             Ok(config) => config,
-            Err(error) => {
-                return tool_error(id, &format!("cannot resolve role-profile config: {error}"));
-            }
+            Err(error) => return tool_error(id, &error),
         };
-        let patcher = CodexPatchWorker::new(self.resolver.data_directory())
-            .with_cancellation(Arc::clone(&self.cancellation));
-        let outcome =
-            match patcher.prepare(&worker_config, &self.repository_root, &request, &context) {
-                Ok(outcome) => outcome,
-                Err(error) => return tool_error(id, &error),
-            };
-        let request_digest = outcome.request_digest;
-        let response = McpPrepareChangeResponse::from_outcome(
-            outcome,
+        let provider = CodexChangeActionProvider::new(
+            self.resolver.data_directory(),
+            &self.repository_root,
+            config,
+        )
+        .with_cancellation(Arc::clone(&self.cancellation));
+        let outcome = match ActionExecutionService::new(self.resolver.store().clone(), provider)
+            .execute_action(&envelope, snapshot.repository_id, snapshot.source_digest)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return tool_error(id, &error.to_string()),
+        };
+        let observed_repository_files =
+            outcome.artifact.dependency_manifest.dependencies.len().try_into().unwrap_or(u32::MAX);
+        let observation_gaps =
+            outcome.artifact.dependency_manifest.gaps.len().try_into().unwrap_or(u32::MAX);
+        let ChangeActionOutput::PatchProposal(patch) = outcome.output else {
+            return tool_error(id, "patch action returned a different output contract");
+        };
+        let response = McpPrepareChangeResponse::from_action(
+            patch,
             request.artifact_ids.len(),
             request.claim_ids.len(),
+            observed_repository_files,
+            observation_gaps,
         );
         let context = bounded_context(&response.context());
         let structured = serde_json::to_value(response).expect("prepare-change serialization");
         self.tool_success_value(id, &request_digest.to_hex(), request_digest, structured, context)
-    }
-
-    fn change_context(
-        &self,
-        request: &needle_core::ChangeRequest,
-    ) -> Result<Vec<PatchContextItem>, String> {
-        let (_, current_snapshot) = needle_runtime::capture_git_snapshot(&self.repository_root)
-            .map_err(|error| format!("cannot capture current change snapshot: {error}"))?;
-        let mut context = Vec::with_capacity(request.artifact_ids.len() + request.claim_ids.len());
-        for id in &request.artifact_ids {
-            let artifact = self
-                .resolver
-                .store()
-                .semantic_artifact(&id.to_string())
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("artifact `{id}` does not exist"))?;
-            let certificate = self
-                .resolver
-                .store()
-                .validation_certificate_for_artifact(&id.to_string())
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("artifact `{id}` has no validation certificate"))?;
-            if !artifact_and_certificate_are_fresh(&artifact, &certificate, &self.repository_root) {
-                return Err(format!("artifact `{id}` is stale or invalid"));
-            }
-            if artifact.contract.cache_scope == needle_core::CacheScope::SnapshotExact
-                && self
-                    .resolver
-                    .store()
-                    .semantic_artifact_source_digest(*id)
-                    .map_err(|error| error.to_string())?
-                    != Some(current_snapshot.source_digest)
-            {
-                return Err(format!("snapshot-exact artifact `{id}` belongs to another snapshot"));
-            }
-            for entry in &certificate.coverage.entries {
-                let subject = self
-                    .resolver
-                    .store()
-                    .subject(entry.obligation.subject)
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| format!("artifact `{id}` has an unknown subject"))?;
-                if subject.repository_lineage != self.repository_lineage {
-                    return Err(format!("artifact `{id}` belongs to another repository"));
-                }
-            }
-            let content = serde_json::to_string(&json!({
-                "artifact_id": id,
-                "kind": artifact.contract.kind,
-                "payload": artifact.payload
-            }))
-            .map_err(|error| error.to_string())?;
-            if content.len() > 8 * 1024 {
-                return Err(format!("artifact `{id}` exceeds the bounded patch context"));
-            }
-            context.push(PatchContextItem { label: format!("artifact:{id}"), content });
-        }
-        for id in &request.claim_ids {
-            let claim = self
-                .resolver
-                .store()
-                .semantic_claim(*id)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("claim `{id}` does not exist"))?;
-            let certificate = self
-                .resolver
-                .store()
-                .claim_validation_certificate_for_claim(*id)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("claim `{id}` has no validation certificate"))?;
-            if certificate.claim != *id
-                || !claim.is_canonical()
-                || !certificate.is_canonical()
-                || !claim_validation_certificate_is_fresh(&certificate, &self.repository_root)
-            {
-                return Err(format!("claim `{id}` is stale or invalid"));
-            }
-            let subject = self
-                .resolver
-                .store()
-                .subject(certificate.subject)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("claim `{id}` has an unknown subject"))?;
-            if subject.repository_lineage != self.repository_lineage {
-                return Err(format!("claim `{id}` belongs to another repository"));
-            }
-            let content = serde_json::to_string(&json!({
-                "claim_id": id,
-                "kind": claim.kind,
-                "payload": claim.payload
-            }))
-            .map_err(|error| error.to_string())?;
-            if content.len() > 8 * 1024 {
-                return Err(format!("claim `{id}` exceeds the bounded patch context"));
-            }
-            context.push(PatchContextItem { label: format!("claim:{id}"), content });
-        }
-        Ok(context)
     }
 
     fn verify_change_call(&self, id: Value, arguments: &Value) -> Value {
@@ -1009,78 +938,174 @@ impl ProductMcpServer {
             Err(error) => return rpc_error(id, -32602, &format!("invalid arguments: {error}")),
         };
         let request_digest = request.digest();
-        let settings = match self.resolver.store().settings() {
-            Ok(settings) => settings,
-            Err(error) => {
-                return tool_error(id, &format!("cannot load verifier settings: {error}"));
-            }
+        let prepared = match self.resolver.store().prepared_change(&request.change_id) {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return tool_error(id, "change is not prepared"),
+            Err(error) => return tool_error(id, &error.to_string()),
         };
-        let verifier = CodexVerifier::new(self.resolver.data_directory())
-            .with_cancellation(Arc::clone(&self.cancellation));
-        let worker_config = match self
+        let (_, snapshot) = match capture_git_snapshot(&self.repository_root) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return tool_error(id, &format!("cannot capture source: {error}")),
+        };
+        if prepared.repository_id != snapshot.repository_id
+            || prepared.source_snapshot != snapshot.source_digest
+            || prepared.patch.source_snapshot != snapshot.source_digest
+        {
+            return tool_error(id, "prepared change belongs to a different source snapshot");
+        }
+        let patch_contract =
+            ActionContractId::new(PATCH_PROPOSE_ACTION_CONTRACT).expect("built-in patch contract");
+        let patch_artifact = match self
             .resolver
             .store()
-            .resolve_session_worker_config(&self.session_id, settings.codex_executable.clone())
+            .opaque_action_artifact_by_payload(&patch_contract, prepared.patch.id.0)
         {
-            Ok(config) => config,
-            Err(error) => {
-                return tool_error(id, &format!("cannot resolve role-profile config: {error}"));
+            Ok(Some(artifact)) => ArtifactId::new(artifact.id),
+            Ok(None) => {
+                return tool_error(
+                    id,
+                    "prepared change has no certified action-native patch artifact",
+                );
             }
+            Err(error) => return tool_error(id, &error.to_string()),
         };
-        let first = match verifier.verify(&worker_config, &self.repository_root, &request.change_id)
+        let patch = PatchActionInputRef { artifact: patch_artifact, patch: prepared.patch.id };
+        let plans = match self
+            .resolver
+            .store()
+            .lifecycle_start_test_plan_candidates(snapshot.source_digest)
         {
-            Ok(outcome) => outcome,
+            Ok(plans) if plans.is_empty() => {
+                return tool_error(id, "verification requires a certified TestPlan");
+            }
+            Ok(plans) if plans.len() >= needle_core::MAX_EXECUTION_ARTIFACT_INPUTS => {
+                return tool_error(id, "certified TestPlans exceed the Verify input bound");
+            }
+            Ok(plans) => plans,
+            Err(error) => return tool_error(id, &error.to_string()),
+        };
+        let base_operation =
+            mcp_action_operation_id("verify_change", &self.session_id, &id, request_digest);
+        let need = change_action_need(&prepared.request);
+        let test_config = match self.action_worker_config(CodexRole::TestRunner) {
+            Ok(config) => config,
             Err(error) => return tool_error(id, &error),
         };
-        let mut outcome = first;
-        let mut repair_attempted = false;
-        let mut repair_performed = false;
-        let mut verification_attempts = 1_u8;
-        if outcome.artifact.verdict == VerificationStatus::Repairable {
-            repair_attempted = true;
-            let patcher = CodexPatchWorker::new(self.resolver.data_directory())
-                .with_cancellation(Arc::clone(&self.cancellation));
-            match patcher.repair(&worker_config, &self.repository_root, &request.change_id) {
-                Ok(_) => {
-                    repair_performed = true;
-                    verification_attempts = 2;
-                    outcome = match verifier.verify(
-                        &worker_config,
-                        &self.repository_root,
-                        &request.change_id,
-                    ) {
-                        Ok(outcome) => outcome,
-                        Err(error) => match verifier.record_inconclusive_with_provenance(
-                            &request.change_id,
-                            &format!("verification after the one-shot repair failed: {error}"),
-                            worker_config.role_profile_provenance.as_ref(),
-                        ) {
-                            Ok(outcome) => outcome,
-                            Err(record_error) => return tool_error(id, &record_error),
+        let test_provider = CodexChangeActionProvider::new(
+            self.resolver.data_directory(),
+            &self.repository_root,
+            test_config,
+        )
+        .with_cancellation(Arc::clone(&self.cancellation));
+        let test_service =
+            ActionExecutionService::new(self.resolver.store().clone(), test_provider);
+        let mut evidence_artifacts = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let operation_id = mcp_child_action_operation_id(
+                base_operation,
+                TESTS_EXECUTE_ACTION_CONTRACT,
+                plan.artifact_id.digest(),
+            );
+            let envelope = NeedExecutionEnvelopeV1::new(
+                operation_id,
+                need.clone(),
+                NeedExecution::Action {
+                    action: ChangeActionInvocation {
+                        contract: ActionContractId::new(TESTS_EXECUTE_ACTION_CONTRACT)
+                            .expect("built-in test contract"),
+                        input: ChangeActionInput::TestsExecute {
+                            change_id: request.change_id.clone(),
+                            requirements_digest: prepared.request_digest,
+                            patch,
+                            test_plan_artifact: plan.artifact_id,
                         },
-                    };
-                }
-                Err(error) => {
-                    outcome = match verifier.record_inconclusive_with_provenance(
-                        &request.change_id,
-                        &format!("one-shot repair failed: {error}"),
-                        worker_config.role_profile_provenance.as_ref(),
-                    ) {
-                        Ok(outcome) => outcome,
-                        Err(record_error) => return tool_error(id, &record_error),
-                    };
-                }
+                    },
+                },
+            );
+            let result = match test_service.execute_action(
+                &envelope,
+                snapshot.repository_id,
+                snapshot.source_digest,
+            ) {
+                Ok(result) => result,
+                Err(error) => return tool_error(id, &error.to_string()),
+            };
+            if !matches!(result.output, ChangeActionOutput::TestExecution(_)) {
+                return tool_error(id, "test action returned a different output contract");
             }
+            evidence_artifacts.push(ArtifactId::new(result.artifact.id));
         }
-        let response = McpVerifyChangeResponse::from_outcome(
-            outcome,
-            repair_attempted,
-            repair_performed,
-            verification_attempts,
+        evidence_artifacts.sort_unstable();
+        let verify_operation = mcp_child_action_operation_id(
+            base_operation,
+            PATCH_VERIFY_ACTION_CONTRACT,
+            prepared.request_digest,
         );
+        let envelope = NeedExecutionEnvelopeV1::new(
+            verify_operation,
+            need,
+            NeedExecution::Action {
+                action: ChangeActionInvocation {
+                    contract: ActionContractId::new(PATCH_VERIFY_ACTION_CONTRACT)
+                        .expect("built-in verify contract"),
+                    input: ChangeActionInput::PatchVerify {
+                        change_id: request.change_id.clone(),
+                        requirements_digest: prepared.request_digest,
+                        patch,
+                        test_evidence_artifacts: evidence_artifacts,
+                    },
+                },
+            },
+        );
+        let verify_config = match self.action_worker_config(CodexRole::Verifier) {
+            Ok(config) => config,
+            Err(error) => return tool_error(id, &error),
+        };
+        let verify_provider = CodexChangeActionProvider::new(
+            self.resolver.data_directory(),
+            &self.repository_root,
+            verify_config,
+        )
+        .with_cancellation(Arc::clone(&self.cancellation));
+        let outcome =
+            match ActionExecutionService::new(self.resolver.store().clone(), verify_provider)
+                .execute_action(&envelope, snapshot.repository_id, snapshot.source_digest)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => return tool_error(id, &error.to_string()),
+            };
+        let verifier_started = !outcome.idempotent_replay;
+        let ChangeActionOutput::PatchVerification(verification) = outcome.output else {
+            return tool_error(id, "verify action returned a different output contract");
+        };
+        let response =
+            McpVerifyChangeResponse::from_action(verification, verifier_started, false, false, 1);
         let context = bounded_context(&response.context());
         let structured = serde_json::to_value(response).expect("verify-change serialization");
         self.tool_success_value(id, request.change_id.as_str(), request_digest, structured, context)
+    }
+
+    fn action_worker_config(&self, role: CodexRole) -> Result<WorkerConfig, String> {
+        let active = self
+            .resolver
+            .store()
+            .active_lifecycle_role_profiles()
+            .map_err(|error| error.to_string())?;
+        let mut matches = active.into_iter().filter(|profile| profile.definition.role == role);
+        let profile =
+            matches.next().ok_or_else(|| format!("no active {role:?} profile is configured"))?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "multiple active {role:?} profiles are ambiguous for action execution"
+            ));
+        }
+        let provenance =
+            RoleProfileProvenance::from_revision(&profile).map_err(|error| error.to_string())?;
+        let settings = self.resolver.store().settings().map_err(|error| error.to_string())?;
+        self.resolver
+            .store()
+            .worker_config_for_provenance(&provenance, settings.codex_executable)
+            .map_err(|error| error.to_string())
     }
 
     fn cancelled_failure(
@@ -1246,6 +1271,7 @@ impl ProductMcpServer {
                 .map(|obligation| obligation.predicate.as_str().replace('-', "_"))
                 .collect(),
             resolution: McpResolution::Bypass { reason: reason.to_owned() },
+            action_resolutions: Vec::new(),
             reuse_unit: "none".to_owned(),
             claim_ids: Vec::new(),
             cache_hit: false,
@@ -1340,6 +1366,11 @@ fn response_from_outcome(
         satisfied: if delivered { capabilities.clone() } else { Vec::new() },
         missing: if delivered { Vec::new() } else { capabilities },
         resolution: McpResolution::from(&outcome.cache_resolution),
+        action_resolutions: outcome
+            .action_resolutions
+            .iter()
+            .map(McpActionResolution::from)
+            .collect(),
         reuse_unit: reuse_unit.to_owned(),
         claim_ids,
         cache_hit: outcome.cache_hit,
@@ -1347,6 +1378,36 @@ fn response_from_outcome(
         calibration: outcome.calibration,
         result_digest: outcome.result_digest.to_string(),
         context,
+    }
+}
+
+impl From<&ShadowActionResolutionSummary> for McpActionResolution {
+    fn from(value: &ShadowActionResolutionSummary) -> Self {
+        Self {
+            authority: match value.authority {
+                ShadowActionResolutionAuthority::Shadow => McpActionResolutionAuthority::Shadow,
+            },
+            request_id: value.request.to_string(),
+            action_contract: value.action_contract.to_string(),
+            predicate: value.predicate.as_str().to_owned(),
+            kind: match value.resolution {
+                ShadowActionResolutionKind::Exact => McpActionResolutionKind::Exact,
+                ShadowActionResolutionKind::Coverage => McpActionResolutionKind::Coverage,
+                ShadowActionResolutionKind::Composite => McpActionResolutionKind::Composite,
+                ShadowActionResolutionKind::Partial => McpActionResolutionKind::Partial,
+            },
+            artifact_ids: value.artifacts.iter().map(ToString::to_string).collect(),
+            validation_certificate_ids: value
+                .validation_certificates
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            selected_plan_id: value.selected_plan.to_string(),
+            sufficiency_certificate_id: value.sufficiency_certificate.map(|id| id.to_string()),
+            covered_mask: value.covered_mask,
+            missing_mask: value.missing_mask,
+            definition_digest: value.definition_digest.to_string(),
+        }
     }
 }
 
@@ -1524,6 +1585,51 @@ fn need_step_id(session_id: &str, ordinal: u8, turn_id: &str, request_digest: Di
     hasher.finish()
 }
 
+fn change_action_need(request: &needle_core::ChangeRequest) -> NeedIr {
+    NeedIr {
+        route_hint: Some(
+            NeedKey::new("locate.implementation").expect("built-in change action route"),
+        ),
+        subjects: vec![SubjectExpression {
+            kind: SubjectKind::Behavior,
+            canonical_name: "change-request".to_owned(),
+        }],
+        required: vec![ObligationExpression {
+            predicate: PredicateKind::ImplementationLocation,
+            facets: vec![Facet { key: "selection".to_owned(), value: "primary".to_owned() }],
+        }],
+        preferred: Vec::new(),
+        semantic_constraints: request.constraints.clone(),
+        world: Vec::new(),
+        input_artifacts: Vec::new(),
+        projection: Vec::new(),
+        body: request.task.clone(),
+        format_revision: needle_core::NEED_IR_FORMAT_REVISION,
+    }
+}
+
+fn mcp_action_operation_id(
+    tool: &str,
+    session_id: &str,
+    rpc_id: &Value,
+    request_digest: Digest,
+) -> Digest {
+    let mut hasher = CanonicalHasher::new(b"needle-mcp-action-operation-v1");
+    hasher.field_str(tool);
+    hasher.field_str(session_id);
+    hasher.field_str(&rpc_id.to_string());
+    hasher.field_digest(request_digest);
+    hasher.finish()
+}
+
+fn mcp_child_action_operation_id(parent: Digest, contract: &str, discriminator: Digest) -> Digest {
+    let mut hasher = CanonicalHasher::new(b"needle-mcp-child-action-operation-v1");
+    hasher.field_digest(parent);
+    hasher.field_str(contract);
+    hasher.field_digest(discriminator);
+    hasher.finish()
+}
+
 fn bounded_context(value: &str) -> String {
     if value.chars().count() <= MAX_CONTEXT_CHARS {
         return value.to_owned();
@@ -1537,6 +1643,7 @@ fn transport_definition_digest(routes: &[String], changes_enabled: bool) -> Dige
     hasher.field_str(LEGACY_PROTOCOL_VERSION);
     hasher.field_str("need_context");
     hasher.field_str("json-claim-reuse-v2");
+    hasher.field_str("action-resolution-shadow-v1");
     hasher.field_u8(u8::from(changes_enabled));
     if changes_enabled {
         hasher.field_str("prepare_change");
@@ -1621,10 +1728,11 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 mod tests {
     use super::*;
     use needle_core::{
+        ActionContractId, ArtifactId, ArtifactRequestId, ArtifactValidationCertificateId,
         CodexHost, CodexRole, CommandPolicy, EvidenceFailurePolicy, FallbackPolicy,
-        FilesystemPolicy, MultiNeedPolicy, NetworkPolicy, RepairPolicy, RoleProfileBudget,
-        RoleProfileDefinition, RoleProfileDefinitionInput, RoleProfileId, ServiceTier, TestPolicy,
-        ToolPolicy,
+        FilesystemPolicy, MultiNeedPolicy, NetworkPolicy, PredicateKind, RepairPolicy,
+        RoleProfileBudget, RoleProfileDefinition, RoleProfileDefinitionInput, RoleProfileId,
+        SelectedPlanId, ServiceTier, TestPolicy, ToolPolicy,
     };
     use needle_runtime::{RuntimeSettings, RuntimeStore};
     use std::process::Command;
@@ -1838,7 +1946,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_hit_response_exposes_claim_reuse_without_worker_output() {
+    fn response_preserves_claim_audit_and_projects_shadow_action_resolutions() {
         let request: McpNeedContextRequest = serde_json::from_value(json!({
             "route": "locate.implementation",
             "subject": {"kind": "symbol", "name": "answer"},
@@ -1881,6 +1989,7 @@ mod tests {
             calibration: false,
             result_digest: Digest::blake3(b"result"),
             semantic_artifact_ids: Vec::new(),
+            action_resolutions: Vec::new(),
             compiled_need: Some(need.clone()),
         };
         let response = response_from_outcome(
@@ -1894,6 +2003,7 @@ mod tests {
         assert_eq!(response.status, "hit");
         assert_eq!(response.reuse_unit, "claim");
         assert_eq!(response.claim_ids, vec![claim.to_string()]);
+        assert!(response.action_resolutions.is_empty());
         assert!(!response.worker_spawned);
         assert_eq!(response.context, "bounded claim context");
 
@@ -1916,6 +2026,54 @@ mod tests {
         assert_eq!(partial.reuse_unit, "claim");
         assert_eq!(partial.claim_ids, vec![claim.to_string()]);
         assert!(partial.worker_spawned);
+
+        let request_id = ArtifactRequestId::new(Digest::blake3(b"action-request"));
+        let action_artifact = ArtifactId::new(Digest::blake3(b"action-artifact"));
+        outcome.cache_resolution = CacheResolution::ExactHit {
+            artifact_id: action_artifact.digest(),
+            sufficiency_certificate_id: None,
+            selected_plan_id: Some(SelectedPlanId(Digest::blake3(b"action-plan"))),
+            resolution_format_revision: Some(1),
+        };
+        outcome.action_resolutions = vec![ShadowActionResolutionSummary {
+            format_revision: needle_runtime::SHADOW_ACTION_RESOLUTION_FORMAT_REVISION,
+            authority: ShadowActionResolutionAuthority::Shadow,
+            request: request_id,
+            action_contract: ActionContractId::new("needle.location.resolve").unwrap(),
+            action_semantic_definition_digest: Digest::blake3(b"action-semantic"),
+            action_validation_definition_digest: Digest::blake3(b"action-validation"),
+            output_contract_definition_digest: Digest::blake3(b"output-contract"),
+            validator_definition_digest: Digest::blake3(b"validator"),
+            predicate: PredicateKind::ImplementationLocation,
+            repository_lineage: Digest::blake3(b"repository"),
+            semantic_world_digest: Digest::blake3(b"world"),
+            resolution: ShadowActionResolutionKind::Exact,
+            artifacts: vec![action_artifact],
+            artifact_matched_requests: vec![request_id],
+            artifact_origin_requests: vec![request_id],
+            validation_certificates: vec![ArtifactValidationCertificateId::new(Digest::blake3(
+                b"validation-certificate",
+            ))],
+            selected_plan: SelectedPlanId(Digest::blake3(b"action-plan")),
+            sufficiency_certificate: None,
+            covered_mask: 1,
+            missing_mask: 0,
+            definition_digest: Digest::blake3(b"summary"),
+        }];
+        outcome.worker_spawned = false;
+        let action_response = response_from_outcome(
+            &request,
+            &need,
+            3,
+            NeedStepRelation::Repeat,
+            &outcome,
+            outcome.rendered.clone(),
+        );
+        let action_json = serde_json::to_value(&action_response.action_resolutions).unwrap();
+        assert_eq!(action_json[0]["authority"], "shadow");
+        assert_eq!(action_json[0]["kind"], "exact");
+        assert_eq!(action_json[0]["action_contract"], "needle.location.resolve");
+        assert_eq!(action_json[0]["artifact_ids"], json!([action_artifact.to_string()]));
     }
 
     #[test]

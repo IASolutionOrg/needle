@@ -1,0 +1,99 @@
+{
+  "format_revision": 1,
+  "schema": "needle.derived-action-gate-a3-manifest/1",
+  "evidence_class": "accepted_shadow",
+  "repository_sha": "485c2b7eed2702c4a109be3cf42bb4be27fe16bd",
+  "tasks": [
+    {
+      "id": "architecture-assemble",
+      "action": "architecture_brief",
+      "scenario": "assemble",
+      "semantic_request_digest": "b3:e6e84eac88ba8e83849712163cd8fa3ef340692fcf808e15fb536afba79bb835",
+      "fixture_digest": "b3:497ad33193d93906cb3002a0df999d607856a4ac144d54adb17ef9c5f00f653f",
+      "oracle_commitment": "b3:38d1960e87fabbc0719df71683709e78de5085428122e54e8cd06afb06f6730f",
+      "execution_profile_digest": "b3:3aaa9f111ed68f73ac6b07b39cd22c72395e8ca28c33ed1b1b30e16abe663eb7",
+      "action_definition_digest": "b3:453dbcd7cd6cc1fe7c1f4b6786030371d71431fb6e0d7664cf8eea697cd88955",
+      "validator_definition_digest": "b3:462f8d352d01073013784451e0b4856648f93221fdb3b2f620652c20b925ae2f",
+      "partition_policy_digest": "b3:76509afb3ab0805e71bff3e24f0b57943f5f584d706eab7bb17a543467f0b3cb",
+      "pair_seeds": [
+        7
+      ]
+    },
+    {
+      "id": "architecture-exact",
+      "action": "architecture_brief",
+      "scenario": "exact",
+      "semantic_request_digest": "b3:e6e84eac88ba8e83849712163cd8fa3ef340692fcf808e15fb536afba79bb835",
+      "fixture_digest": "b3:5a6a9cb2f85fcab751613d6f0aca8c34eb05f9a3de11577c698cf222f2c903b9",
+      "oracle_commitment": "b3:36bba2c5fcd15ebf6b45d0d215a44b6e6c939498b7b1b426e4d49a7b5195fd08",
+      "execution_profile_digest": "b3:3aaa9f111ed68f73ac6b07b39cd22c72395e8ca28c33ed1b1b30e16abe663eb7",
+      "action_definition_digest": "b3:453dbcd7cd6cc1fe7c1f4b6786030371d71431fb6e0d7664cf8eea697cd88955",
+      "validator_definition_digest": "b3:462f8d352d01073013784451e0b4856648f93221fdb3b2f620652c20b925ae2f",
+      "partition_policy_digest": "b3:76509afb3ab0805e71bff3e24f0b57943f5f584d706eab7bb17a543467f0b3cb",
+      "pair_seeds": [
+        7
+      ]
+    },
+    {
+      "id": "architecture-project",
+      "action": "architecture_brief",
+      "scenario": "project",
+      "semantic_request_digest": "b3:95b2914e66417b444f57fe8ab14d67cf4c37d445a3046b7eacc5affc8c795a05",
+      "fixture_digest": "b3:5ff008b8c959fc68f93b49dee68222064dd7d36c9a3814bff22a0a25edef921f",
+      "oracle_commitment": "b3:f248bb691668a076294ba94c5dec09015248ea9ed8009d3c1ba122fb10310473",
+      "execution_profile_digest": "b3:3aaa9f111ed68f73ac6b07b39cd22c72395e8ca28c33ed1b1b30e16abe663eb7",
+      "action_definition_digest": "b3:453dbcd7cd6cc1fe7c1f4b6786030371d71431fb6e0d7664cf8eea697cd88955",
+      "validator_definition_digest": "b3:462f8d352d01073013784451e0b4856648f93221fdb3b2f620652c20b925ae2f",
+      "partition_policy_digest": "b3:76509afb3ab0805e71bff3e24f0b57943f5f584d706eab7bb17a543467f0b3cb",
+      "pair_seeds": [
+        7
+      ]
+    },
+    {
+      "id": "change-impact-assemble",
+      "action": "change_impact",
+      "scenario": "assemble",
+      "semantic_request_digest": "b3:ce895b2c38a05fb65428af26babb55a6e94e0d2b69878266c5c601b18cd15061",
+      "fixture_digest": "b3:734d14976001a9abc4320a79bdd78471c11ac2b16c14f715c0d3d7046cd34624",
+      "oracle_commitment": "b3:90265ec646d2003567085dbd3389d98f795571d40968cbe88b68caebc0380c4f",
+      "execution_profile_digest": "b3:3aaa9f111ed68f73ac6b07b39cd22c72395e8ca28c33ed1b1b30e16abe663eb7",
+      "action_definition_digest": "b3:1680e1627121d4ac0954a5d82acfb8f6bc6cba94ac3649b07755cd5cbfad575a",
+      "validator_definition_digest": "b3:9b10f46ae81176944a00341e8ee06e2574421657c8db93d922955e7cfd9b7353",
+      "partition_policy_digest": "b3:abacf1e262e216f98e9022b08296afb4302798cc3fa605391826686a2d5e4248",
+      "pair_seeds": [
+        7
+      ]
+    },
+    {
+      "id": "change-impact-exact",
+      "action": "change_impact",
+      "scenario": "exact",
+      "semantic_request_digest": "b3:ce895b2c38a05fb65428af26babb55a6e94e0d2b69878266c5c601b18cd15061",
+      "fixture_digest": "b3:2066a2644d556a34241323dfe2740e266ae6efebaddf683109b64494471f6db3",
+      "oracle_commitment": "b3:30bedb2e77adf6f2358e55a67e02c2fe0dd7e19eb80702c400579b828982ddbb",
+      "execution_profile_digest": "b3:3aaa9f111ed68f73ac6b07b39cd22c72395e8ca28c33ed1b1b30e16abe663eb7",
+      "action_definition_digest": "b3:1680e1627121d4ac0954a5d82acfb8f6bc6cba94ac3649b07755cd5cbfad575a",
+      "validator_definition_digest": "b3:9b10f46ae81176944a00341e8ee06e2574421657c8db93d922955e7cfd9b7353",
+      "partition_policy_digest": "b3:abacf1e262e216f98e9022b08296afb4302798cc3fa605391826686a2d5e4248",
+      "pair_seeds": [
+        7
+      ]
+    },
+    {
+      "id": "change-impact-project",
+      "action": "change_impact",
+      "scenario": "project",
+      "semantic_request_digest": "b3:fc9a3cd331dc8143573403f482ef6b7ecae481fd0e51fb9f4ceee3a62de5d51f",
+      "fixture_digest": "b3:ffce4e9ddf761d2f7b3e89516559ae602f2c4d243c7e7919c50fd854cc1236b0",
+      "oracle_commitment": "b3:0c7baa8115ae64612a3d2574c40d518c356c8d80c4c4dbc21b65ac394ab9c2f4",
+      "execution_profile_digest": "b3:3aaa9f111ed68f73ac6b07b39cd22c72395e8ca28c33ed1b1b30e16abe663eb7",
+      "action_definition_digest": "b3:1680e1627121d4ac0954a5d82acfb8f6bc6cba94ac3649b07755cd5cbfad575a",
+      "validator_definition_digest": "b3:9b10f46ae81176944a00341e8ee06e2574421657c8db93d922955e7cfd9b7353",
+      "partition_policy_digest": "b3:abacf1e262e216f98e9022b08296afb4302798cc3fa605391826686a2d5e4248",
+      "pair_seeds": [
+        7
+      ]
+    }
+  ],
+  "manifest_digest": "b3:8839616ca0c9c42efe707ebd94e13a94f824cd6e8a9b103ee53f01d1d7ab4222"
+}

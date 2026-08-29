@@ -1,15 +1,17 @@
 use crate::store::now_ms;
 use crate::{
-    ClaimAdvisoryPlan, ClaimProofError, ClaimProofMaterial, ProofAccountingRecord, ProofCandidate,
-    ProofError, ProofPlan, ProofPlanner, ProofResolutionKind, RuntimeStore, SemanticCostEstimates,
-    StoreError, artifact_and_certificate_are_fresh, build_claim_component_certificate,
-    replay_claim_set_certificate,
+    ArtifactGraphValidity, ClaimAdvisoryPlan, ClaimProofError, ClaimProofMaterial,
+    ProofAccountingRecord, ProofCandidate, ProofError, ProofPlan, ProofPlanner,
+    ProofResolutionKind, RuntimeStore, SemanticCostEstimates, StoreError,
+    build_claim_component_certificate, replay_claim_set_certificate,
+    reuse_descriptor::derive_shadow_reuse_descriptor_from_validated_pair,
 };
 use needle_core::{
-    Artifact, ArtifactValidationCertificate, CacheResolution, CacheScope, CapabilityMode,
-    ClaimSetCertificate, MAX_DERIVATION_DEPTH, Need, NeedKey, PredicateKind,
-    ReuseSufficiencyCertificate, ReuseUnit, SelectedPlan, built_in_capability_classes,
-    built_in_claim_capability_classes,
+    ActionRequest, Artifact, ArtifactValidationCertificate, CacheResolution, CacheScope,
+    CapabilityMode, ClaimSetCertificate, FastValidityResult, Need, NeedKey,
+    OperationalValidityMemo, PredicateKind, RepositoryContextId, RepositoryGeneration,
+    ReuseDescriptor, ReuseSufficiencyCertificate, ReuseUnit, SelectedPlan,
+    built_in_capability_classes, built_in_claim_capability_classes,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -32,6 +34,9 @@ pub struct SemanticReuseDecision {
     pub claim_certificate: Option<ClaimSetCertificate>,
     pub claim_material: Option<ClaimProofMaterial>,
     pub artifacts: Vec<Artifact>,
+    /// Bounded Shadow projections for the selected artifact candidates. Missing
+    /// material never changes the legacy resolver decision.
+    pub action_descriptors: Option<Vec<ReuseDescriptor>>,
     pub authoritative: bool,
     pub calibration_eligible: bool,
     pub stale_candidates: usize,
@@ -54,6 +59,27 @@ struct ClaimSelection {
     advisory: ClaimAdvisoryPlan,
     material: ClaimProofMaterial,
     candidates: Vec<ProofCandidate>,
+}
+
+#[derive(Clone, Copy)]
+struct RequestIdentityLookup<'a> {
+    legacy_exact_request_ids: &'a [needle_core::Digest],
+    action_requests: &'a [ActionRequest],
+    allow_claim_reuse: bool,
+}
+
+struct ValidatedArtifactCandidate {
+    artifact: Artifact,
+    certificate: ArtifactValidationCertificate,
+    legacy_exact_request: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolverGenerationGuard {
+    repository_lineage: needle_core::Digest,
+    repository_context: RepositoryContextId,
+    generation: RepositoryGeneration,
+    fast_path_eligible: bool,
 }
 
 impl SemanticResolver {
@@ -95,6 +121,103 @@ impl SemanticResolver {
         costs: SemanticCostEstimates,
         exact_request_ids: &[needle_core::Digest],
     ) -> Result<SemanticReuseDecision, SemanticResolverError> {
+        self.resolve_for_route_with_actions(
+            need,
+            route_key,
+            repository_root,
+            source_snapshot_digest,
+            costs,
+            RequestIdentityLookup {
+                legacy_exact_request_ids: exact_request_ids,
+                action_requests: &[],
+                allow_claim_reuse: true,
+            },
+        )
+    }
+
+    pub(crate) fn resolve_for_route_actions(
+        &self,
+        need: &Need,
+        route_key: &NeedKey,
+        repository_root: &Path,
+        source_snapshot_digest: needle_core::Digest,
+        costs: SemanticCostEstimates,
+        action_requests: &[ActionRequest],
+    ) -> Result<SemanticReuseDecision, SemanticResolverError> {
+        self.resolve_for_route_with_actions(
+            need,
+            route_key,
+            repository_root,
+            source_snapshot_digest,
+            costs,
+            RequestIdentityLookup {
+                legacy_exact_request_ids: &[],
+                action_requests,
+                allow_claim_reuse: true,
+            },
+        )
+    }
+
+    pub(crate) fn resolve_for_route_actions_artifact_only(
+        &self,
+        need: &Need,
+        route_key: &NeedKey,
+        repository_root: &Path,
+        source_snapshot_digest: needle_core::Digest,
+        action_requests: &[ActionRequest],
+    ) -> Result<SemanticReuseDecision, SemanticResolverError> {
+        self.resolve_for_route_with_actions(
+            need,
+            route_key,
+            repository_root,
+            source_snapshot_digest,
+            SemanticCostEstimates::default(),
+            RequestIdentityLookup {
+                legacy_exact_request_ids: &[],
+                action_requests,
+                allow_claim_reuse: false,
+            },
+        )
+    }
+
+    fn resolve_for_route_with_actions(
+        &self,
+        need: &Need,
+        route_key: &NeedKey,
+        repository_root: &Path,
+        source_snapshot_digest: needle_core::Digest,
+        costs: SemanticCostEstimates,
+        identity_lookup: RequestIdentityLookup<'_>,
+    ) -> Result<SemanticReuseDecision, SemanticResolverError> {
+        let action_requests = identity_lookup.action_requests;
+        let allow_claim_reuse = identity_lookup.allow_claim_reuse;
+        if action_requests.len() > crate::BUILT_IN_ACTION_COUNT {
+            return Err(StoreError::ArtifactIdentity(
+                "action request lookup exceeds the built-in action bound".to_owned(),
+            )
+            .into());
+        }
+        let mut action_contracts = BTreeSet::new();
+        for request in action_requests {
+            let Some(action) = crate::built_in_action_contracts()
+                .iter()
+                .find(|action| action.contract.id == request.contract)
+            else {
+                return Err(StoreError::ArtifactIdentity(
+                    "action request lookup references an unknown contract".to_owned(),
+                )
+                .into());
+            };
+            request
+                .validate(&action.contract)
+                .map_err(|error| StoreError::ArtifactIdentity(error.to_string()))?;
+            if !action_contracts.insert(request.contract.clone()) {
+                return Err(StoreError::ArtifactIdentity(
+                    "action request lookup contains duplicate contracts".to_owned(),
+                )
+                .into());
+            }
+        }
         let expected_fresh_microusd = costs.fresh_microusd;
         let expected_reuse_microusd = costs.artifact_reuse_microusd;
         if need.residual.as_ref().is_some_and(|residual| residual.mandatory) {
@@ -110,6 +233,7 @@ impl SemanticResolver {
                 claim_certificate: None,
                 claim_material: None,
                 artifacts: Vec::new(),
+                action_descriptors: None,
                 authoritative: false,
                 calibration_eligible: false,
                 stale_candidates: 0,
@@ -127,6 +251,7 @@ impl SemanticResolver {
                 claim_certificate: None,
                 claim_material: None,
                 artifacts: Vec::new(),
+                action_descriptors: None,
                 authoritative: false,
                 calibration_eligible: false,
                 stale_candidates: 0,
@@ -134,30 +259,80 @@ impl SemanticResolver {
         }
 
         let lookup_started = Instant::now();
-        let stored =
-            self.store.semantic_candidates(need, exact_request_ids, source_snapshot_digest)?;
+        let generation_guard = if action_requests.is_empty() {
+            None
+        } else {
+            resolver_generation_guard(&self.store, need, repository_root, source_snapshot_digest)?
+        };
+        let stored = self.store.semantic_candidates(
+            need,
+            identity_lookup.legacy_exact_request_ids,
+            source_snapshot_digest,
+        )?;
+        let stored_candidate_count = stored.len();
         let lookup_micros = elapsed_micros(lookup_started);
         let validation_started = Instant::now();
-        let mut artifacts = Vec::new();
-        let mut certificates = Vec::new();
-        let mut candidates = Vec::new();
+        let mut validated_candidates = Vec::with_capacity(stored_candidate_count);
         let mut stale_candidates = 0;
         let mut first_stale = None;
-        for (artifact, certificate, exact_request, same_source) in stored {
-            if (artifact.contract.cache_scope == CacheScope::SnapshotExact && !same_source)
-                || certificate.coverage.world != need.world
-                || !artifact_and_certificate_are_fresh(&artifact, &certificate, repository_root)
-                || !certificate_inputs_are_fresh(
-                    &self.store,
-                    &certificate,
-                    repository_root,
-                    source_snapshot_digest,
-                    0,
-                )?
-            {
+        for (artifact, certificate, legacy_exact_request, same_source) in stored {
+            if !artifact_candidate_is_fresh(
+                &self.store,
+                need,
+                &artifact,
+                &certificate,
+                same_source,
+                repository_root,
+                source_snapshot_digest,
+                generation_guard.as_ref(),
+            )? {
                 stale_candidates += 1;
                 first_stale.get_or_insert(artifact.id);
                 continue;
+            }
+            validated_candidates.push(ValidatedArtifactCandidate {
+                artifact,
+                certificate,
+                legacy_exact_request,
+            });
+        }
+        if !generation_guard_is_current(&self.store, generation_guard.as_ref())? {
+            return Ok(generation_changed_decision(stored_candidate_count));
+        }
+
+        let mut artifacts = Vec::new();
+        let mut certificates = Vec::new();
+        let mut descriptors = Vec::new();
+        let mut candidates = Vec::new();
+        for ValidatedArtifactCandidate { artifact, certificate, legacy_exact_request } in
+            validated_candidates
+        {
+            let mut descriptor = (!action_requests.is_empty())
+                .then(|| {
+                    derive_shadow_reuse_descriptor_from_validated_pair(&artifact, &certificate).ok()
+                })
+                .flatten();
+            let mut action_exact_request = false;
+            if let Some(current_descriptor) = descriptor.take() {
+                let mut bound_descriptor = current_descriptor;
+                let descriptor_contract = bound_descriptor.action_contract.clone();
+                for request in
+                    action_requests.iter().filter(|request| request.contract == descriptor_contract)
+                {
+                    if let Some(binding) = self.store.match_or_map_validated_action_request(
+                        request,
+                        &artifact,
+                        &certificate,
+                        &bound_descriptor,
+                    )? {
+                        bound_descriptor = bound_descriptor
+                            .bind_request(binding.matched_request, binding.origin_request)
+                            .map_err(|error| StoreError::ArtifactIdentity(error.to_string()))?;
+                        action_exact_request = true;
+                        break;
+                    }
+                }
+                descriptor = Some(bound_descriptor);
             }
             candidates.push(ProofCandidate {
                 artifact: certificate.artifact,
@@ -168,7 +343,7 @@ impl SemanticResolver {
                     .iter()
                     .map(|entry| entry.obligation.clone())
                     .collect(),
-                exact_request,
+                exact_request: legacy_exact_request || action_exact_request,
                 expected_reuse_microusd: 0,
                 claim_ids: Vec::new(),
                 claim_validation_certificate_ids: Vec::new(),
@@ -176,6 +351,7 @@ impl SemanticResolver {
             });
             artifacts.push(artifact);
             certificates.push(certificate);
+            descriptors.push(descriptor);
         }
         let artifact_candidates_cover_need = !candidates.is_empty()
             && need.required.iter().all(|requested| {
@@ -183,7 +359,7 @@ impl SemanticResolver {
                     candidate.coverage.iter().any(|provided| provided.satisfies(requested))
                 })
             });
-        let mut claim_selection = if artifact_candidates_cover_need {
+        let mut claim_selection = if artifact_candidates_cover_need || !allow_claim_reuse {
             None
         } else {
             self.claim_advisory(
@@ -195,6 +371,9 @@ impl SemanticResolver {
                 costs,
             )
         };
+        if !generation_guard_is_current(&self.store, generation_guard.as_ref())? {
+            return Ok(generation_changed_decision(stored_candidate_count));
+        }
         let validation_micros = elapsed_micros(validation_started);
         let mut validated_claim_resolution = None;
         let mut claim_calibration_eligible = false;
@@ -245,6 +424,7 @@ impl SemanticResolver {
                     claim_certificate: Some(selection.advisory.certificate.clone()),
                     claim_material: Some(selection.material.clone()),
                     artifacts: selected_artifacts,
+                    action_descriptors: None,
                     authoritative: true,
                     calibration_eligible: true,
                     stale_candidates,
@@ -291,6 +471,7 @@ impl SemanticResolver {
                 claim_certificate,
                 claim_material,
                 artifacts,
+                action_descriptors: None,
                 authoritative: false,
                 calibration_eligible: claim_calibration_eligible,
                 stale_candidates,
@@ -352,14 +533,8 @@ impl SemanticResolver {
             stale_candidates: stale_candidates as u64,
             created_unix_ms: now_ms(),
         })?;
-        let selected = proof
-            .selected
-            .artifact_ids
-            .iter()
-            .filter_map(|selected| {
-                artifacts.iter().find(|artifact| artifact.id == selected.digest()).cloned()
-            })
-            .collect();
+        let (selected, action_descriptors) =
+            selected_artifact_material(&proof.selected, &artifacts, &certificates, &descriptors);
         Ok(SemanticReuseDecision {
             resolution,
             validated_resolution,
@@ -369,6 +544,7 @@ impl SemanticResolver {
             claim_certificate,
             claim_material,
             artifacts: selected,
+            action_descriptors,
             authoritative,
             calibration_eligible,
             stale_candidates,
@@ -395,40 +571,38 @@ impl SemanticResolver {
         let mut candidates = artifact_candidates.to_vec();
         let artifact_candidate_count = candidates.len();
         for artifact in origins {
-            let origin_is_eligible =
-                self.store.semantic_artifact(&artifact.to_string()).and_then(|stored| {
-                    let Some(stored) = stored else {
-                        return Ok(false);
-                    };
-                    let Some(certificate) =
-                        self.store.validation_certificate_for_artifact(&artifact.to_string())?
-                    else {
-                        return Ok(false);
-                    };
-                    Ok(stored.contract.cache_scope == CacheScope::WorktreeSemantic
-                        && certificate.coverage.world == need.world
-                        && certificate_inputs_are_fresh(
-                            &self.store,
-                            &certificate,
-                            repository_root,
-                            source_snapshot_digest,
-                            0,
-                        )?)
-                });
-            match origin_is_eligible {
-                Ok(true) => {}
-                Ok(false) => continue,
+            let stored = match self.store.semantic_artifact(&artifact.to_string()) {
+                Ok(Some(stored)) if stored.contract.cache_scope == CacheScope::WorktreeSemantic => {
+                    stored
+                }
+                Ok(_) => continue,
                 Err(error) => {
                     eprintln!(
-                        "needle: claim advisory origin validation remained Shadow-only ({error})"
+                        "needle: claim advisory origin lookup remained Shadow-only ({error})"
                     );
                     continue;
                 }
-            }
+            };
             let material = match self.store.claim_proof_material_for_artifacts(&[artifact]) {
                 Ok(material) => filter_claim_material_for_need(material, need),
                 Err(error) => {
                     eprintln!("needle: claim advisory material remained Shadow-only ({error})");
+                    continue;
+                }
+            };
+            let material = match filter_claim_material_for_fresh_origin_inputs(
+                &self.store,
+                material,
+                &stored,
+                need,
+                repository_root,
+                source_snapshot_digest,
+            ) {
+                Ok(material) => material,
+                Err(error) => {
+                    eprintln!(
+                        "needle: claim advisory input closure remained Shadow-only ({error})"
+                    );
                     continue;
                 }
             };
@@ -764,44 +938,220 @@ fn filter_claim_material_for_need(
     material
 }
 
-fn certificate_inputs_are_fresh(
+fn filter_claim_material_for_fresh_origin_inputs(
     store: &RuntimeStore,
-    certificate: &ArtifactValidationCertificate,
+    mut material: ClaimProofMaterial,
+    artifact: &Artifact,
+    need: &Need,
     repository_root: &Path,
     source_snapshot_digest: needle_core::Digest,
-    depth: usize,
-) -> Result<bool, StoreError> {
-    if certificate.input_artifacts.is_empty() {
-        return Ok(true);
-    }
-    if depth >= MAX_DERIVATION_DEPTH {
-        return Ok(false);
-    }
-    for input in &certificate.input_artifacts {
-        let Some(artifact) = store.semantic_artifact(&input.to_string())? else {
-            return Ok(false);
-        };
-        let Some(input_certificate) =
-            store.validation_certificate_for_artifact(&input.to_string())?
+) -> Result<ClaimProofMaterial, StoreError> {
+    let artifact_id = needle_core::ArtifactId::new(artifact.id);
+    let mut checked = BTreeSet::new();
+    let mut fresh = BTreeSet::new();
+    for candidate in &material.certificates {
+        if candidate.origin_artifact != artifact_id
+            || !checked.insert(candidate.origin_validation_certificate)
+        {
+            continue;
+        }
+        let Some(certificate) =
+            store.validation_certificate(&candidate.origin_validation_certificate.to_string())?
         else {
-            return Ok(false);
+            continue;
         };
-        if (artifact.contract.cache_scope == CacheScope::SnapshotExact
-            && !store.semantic_artifact_has_source(&input.to_string(), source_snapshot_digest)?)
-            || input_certificate.coverage.world != certificate.coverage.world
-            || !artifact_and_certificate_are_fresh(&artifact, &input_certificate, repository_root)
-            || !certificate_inputs_are_fresh(
-                store,
-                &input_certificate,
+        if certificate.id != candidate.origin_validation_certificate
+            || certificate.artifact != artifact_id
+            || certificate.coverage.world != need.world
+        {
+            continue;
+        }
+        if matches!(
+            store.validate_artifact_input_graph(
+                artifact,
+                &certificate,
                 repository_root,
                 source_snapshot_digest,
-                depth + 1,
-            )?
-        {
-            return Ok(false);
+            )?,
+            ArtifactGraphValidity::Fresh { .. }
+        ) {
+            fresh.insert(candidate.origin_validation_certificate);
         }
     }
-    Ok(true)
+    material
+        .certificates
+        .retain(|candidate| fresh.contains(&candidate.origin_validation_certificate));
+    Ok(filter_claim_material_for_need(material, need))
+}
+
+fn resolver_generation_guard(
+    store: &RuntimeStore,
+    need: &Need,
+    repository_root: &Path,
+    source_snapshot_digest: needle_core::Digest,
+) -> Result<Option<ResolverGenerationGuard>, StoreError> {
+    let Ok(canonical_root) = std::fs::canonicalize(repository_root) else {
+        return Ok(None);
+    };
+    let repository_lineage = need.world.repository_lineage;
+    let repository_context =
+        crate::repository_observer::repository_context_id(repository_lineage, &canonical_root);
+    let Some(generation) =
+        store.current_repository_generation(repository_lineage, repository_context)?
+    else {
+        return Ok(None);
+    };
+    let fast_path_eligible =
+        generation.reconciled && generation.source_context_digest == source_snapshot_digest;
+    Ok(Some(ResolverGenerationGuard {
+        repository_lineage,
+        repository_context,
+        generation,
+        fast_path_eligible,
+    }))
+}
+
+fn generation_guard_is_current(
+    store: &RuntimeStore,
+    guard: Option<&ResolverGenerationGuard>,
+) -> Result<bool, StoreError> {
+    let Some(guard) = guard else {
+        return Ok(true);
+    };
+    Ok(store.current_repository_generation(guard.repository_lineage, guard.repository_context)?
+        == Some(guard.generation.clone()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn artifact_candidate_is_fresh(
+    store: &RuntimeStore,
+    need: &Need,
+    artifact: &Artifact,
+    certificate: &ArtifactValidationCertificate,
+    same_source: bool,
+    repository_root: &Path,
+    source_snapshot_digest: needle_core::Digest,
+    generation_guard: Option<&ResolverGenerationGuard>,
+) -> Result<bool, StoreError> {
+    if (artifact.contract.cache_scope == CacheScope::SnapshotExact && !same_source)
+        || certificate.coverage.world != need.world
+    {
+        return Ok(false);
+    }
+
+    if let Some(guard) = generation_guard.filter(|guard| guard.fast_path_eligible)
+        && let Some(stamp) = store
+            .dependency_stamp_for_certificate_context(certificate.id, guard.repository_context)?
+    {
+        match store.evaluate_dependency_stamp(stamp.id) {
+            Ok(result) => {
+                let memo = match &result {
+                    FastValidityResult::Current { memo }
+                    | FastValidityResult::UnaffectedByDelta { memo, .. } => Some(memo),
+                    FastValidityResult::RequiresRevalidation { .. } => None,
+                };
+                if memo.is_some_and(|memo| {
+                    fast_memo_matches_candidate(memo, guard, artifact, certificate)
+                }) {
+                    return Ok(true);
+                }
+            }
+            Err(
+                StoreError::DependencyValidityConflict(_)
+                | StoreError::DependencyValidityCorruption(_),
+            ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    match store.validate_artifact_graph(
+        artifact,
+        certificate,
+        repository_root,
+        source_snapshot_digest,
+    ) {
+        Ok(ArtifactGraphValidity::Fresh { .. }) => Ok(true),
+        Ok(ArtifactGraphValidity::RequiresRevalidation { .. })
+        | Err(
+            StoreError::DependencyValidityConflict(_) | StoreError::DependencyValidityCorruption(_),
+        ) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn fast_memo_matches_candidate(
+    memo: &OperationalValidityMemo,
+    guard: &ResolverGenerationGuard,
+    artifact: &Artifact,
+    certificate: &ArtifactValidationCertificate,
+) -> bool {
+    memo.artifact.digest() == artifact.id
+        && memo.validation_certificate == certificate.id
+        && memo.repository_lineage == guard.repository_lineage
+        && memo.repository_context == guard.repository_context
+        && memo.validated_through_generation == guard.generation.generation
+        && memo.validated_through_generation_digest == guard.generation.digest
+}
+
+fn generation_changed_decision(stale_candidates: usize) -> SemanticReuseDecision {
+    SemanticReuseDecision {
+        resolution: CacheResolution::Bypass {
+            reason: "repository generation changed during semantic reuse validation".to_owned(),
+        },
+        validated_resolution: None,
+        plan: None,
+        certificate: None,
+        claim_advisory: None,
+        claim_certificate: None,
+        claim_material: None,
+        artifacts: Vec::new(),
+        action_descriptors: None,
+        authoritative: false,
+        calibration_eligible: false,
+        stale_candidates,
+    }
+}
+
+fn selected_artifact_material(
+    plan: &SelectedPlan,
+    artifacts: &[Artifact],
+    certificates: &[ArtifactValidationCertificate],
+    candidate_descriptors: &[Option<ReuseDescriptor>],
+) -> (Vec<Artifact>, Option<Vec<ReuseDescriptor>>) {
+    let mut selected_artifacts = Vec::with_capacity(plan.artifact_ids.len());
+    let mut descriptors = Vec::with_capacity(plan.artifact_ids.len());
+    let mut complete = true;
+    for selected in &plan.artifact_ids {
+        let Some((index, artifact)) =
+            artifacts.iter().enumerate().find(|(_, artifact)| artifact.id == selected.digest())
+        else {
+            complete = false;
+            continue;
+        };
+        selected_artifacts.push(artifact.clone());
+        let descriptor = candidate_descriptors
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|descriptor| descriptor.artifact == *selected)
+            .cloned()
+            .or_else(|| {
+                certificates
+                    .get(index)
+                    .filter(|certificate| certificate.artifact == *selected)
+                    .and_then(|certificate| {
+                        derive_shadow_reuse_descriptor_from_validated_pair(artifact, certificate)
+                            .ok()
+                    })
+            });
+        let Some(descriptor) = descriptor else {
+            complete = false;
+            continue;
+        };
+        descriptors.push(descriptor);
+    }
+    let action_descriptors =
+        (complete && descriptors.len() == plan.artifact_ids.len()).then_some(descriptors);
+    (selected_artifacts, action_descriptors)
 }
 
 fn elapsed_micros(started: Instant) -> u64 {
@@ -907,6 +1257,9 @@ fn missing_predicates(plan: &SelectedPlan) -> Vec<String> {
 mod claim_authority_tests;
 
 #[cfg(test)]
+mod latency_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -914,10 +1267,12 @@ mod tests {
         validate_semantic_artifact_with_trace, validate_semantic_test_plan_with_evidence,
     };
     use needle_core::{
-        ArtifactRequest, CapabilityMode, CommandExecutionEvidence, Digest, EvidenceFailurePolicy,
-        FlowStepRole, NeedIr, SemanticFlowStep, SemanticLocation, SemanticWorkerArtifact, TestPlan,
-        built_in_route_contracts, need_fragment,
+        ActionRequest, ArtifactRequest, CapabilityMode, CommandExecutionEvidence, Digest,
+        EvidenceFailurePolicy, FlowStepRole, NeedIr, RepositoryGeneration, SemanticFlowStep,
+        SemanticLocation, SemanticWorkerArtifact, TestPlan, built_in_route_contracts,
+        need_fragment,
     };
+    use rusqlite::Connection;
     use std::fs;
 
     #[test]
@@ -946,6 +1301,419 @@ mod tests {
             certificate: None,
         };
         assert!(!economics_allow(&proof));
+    }
+
+    #[test]
+    fn generation_guard_rejects_an_advanced_repository_head() {
+        let root = std::env::temp_dir().join(format!(
+            "needle-generation-guard-{}-{}",
+            std::process::id(),
+            Digest::blake3(format!("{:?}", Instant::now())).to_hex()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let store = RuntimeStore::new(root.join("needle.sqlite3"));
+        store.initialize().unwrap();
+        let repository_lineage = Digest::blake3(b"guard-repository");
+        let repository_context = needle_core::RepositoryContextId::new(Digest::blake3(b"guard"));
+        let generation = RepositoryGeneration::new(
+            repository_lineage,
+            repository_context,
+            0,
+            Digest::blake3(b"source-0"),
+            None,
+            true,
+        );
+        store.initialize_repository_generation(&generation).unwrap();
+        let guard = ResolverGenerationGuard {
+            repository_lineage,
+            repository_context,
+            generation,
+            fast_path_eligible: true,
+        };
+        assert!(generation_guard_is_current(&store, Some(&guard)).unwrap());
+
+        let next = RepositoryGeneration::new(
+            repository_lineage,
+            repository_context,
+            1,
+            Digest::blake3(b"source-1"),
+            None,
+            true,
+        );
+        let delta = needle_core::StateDelta::new(
+            repository_lineage,
+            repository_context,
+            0,
+            1,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        store.advance_repository_generation(&next, &delta).unwrap();
+        assert!(!generation_guard_is_current(&store, Some(&guard)).unwrap());
+
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_shadow_material_does_not_remove_a_selected_artifact() {
+        let artifact_id = needle_core::ArtifactId::new(Digest::blake3(b"selected-artifact"));
+        let artifact = Artifact {
+            id: artifact_id.digest(),
+            request_id: Digest::blake3(b"request"),
+            contract: needle_core::ArtifactContract::semantic(
+                "needle.semantic.code-location",
+                2,
+                needle_core::ArtifactKind::code_location(),
+                CacheScope::WorktreeSemantic,
+            ),
+            payload: serde_json::json!({}),
+            dependency_manifest: needle_core::DependencyManifest {
+                scope: CacheScope::WorktreeSemantic,
+                observed_files_complete: false,
+                dependencies: Vec::new(),
+                gaps: Vec::new(),
+            },
+            validations: Vec::new(),
+            created_unix_ms: 1,
+        };
+        let plan = SelectedPlan {
+            id: needle_core::SelectedPlanId(Digest::blake3(b"plan")),
+            need: needle_core::NeedId(Digest::blake3(b"need")),
+            artifact_ids: vec![artifact_id],
+            claim_ids: Vec::new(),
+            claim_validation_certificate_ids: Vec::new(),
+            claim_set_certificate_ids: Vec::new(),
+            covered_mask: 1,
+            missing_mask: 0,
+            economics: needle_core::PlanEconomics {
+                expected_fresh_microusd: None,
+                expected_selected_microusd: None,
+                proof_overhead_micros: 0,
+                expected_net_microusd: None,
+            },
+            proof_budget: Default::default(),
+            decision_reason: "test".to_owned(),
+        };
+
+        let (selected, descriptors) =
+            selected_artifact_material(&plan, std::slice::from_ref(&artifact), &[], &[]);
+
+        assert_eq!(selected, vec![artifact]);
+        assert!(descriptors.is_none());
+    }
+
+    #[test]
+    fn fresh_legacy_artifact_is_lazily_mapped_to_action_identity_and_survives_reopen() {
+        let root = std::env::temp_dir().join(format!(
+            "needle-action-mapping-{}-{}",
+            std::process::id(),
+            Digest::blake3(format!("{:?}", Instant::now())).to_hex()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let database = root.join("needle.sqlite3");
+        let store = RuntimeStore::new(&database);
+        store.initialize().unwrap();
+
+        let ir = NeedIr::parse(
+            "@@need\n\
+             @route locate.implementation\n\
+             @subject symbol:\"answer\"\n\
+             @require implementation-location selection=primary granularity=exact-location polarity=positive\n\
+             @world source=current features=default\n\
+             \n\
+             Locate the implementation.\n\
+             @@end",
+        )
+        .unwrap()
+        .unwrap();
+        let route = built_in_route_contracts()
+            .into_iter()
+            .find(|route| route.route.as_str() == "locate.implementation")
+            .unwrap();
+        let need = needle_core::compile_need(&ir, Digest::blake3(b"repo"), &route).unwrap();
+        let fragment = need_fragment(&need, need.required.clone(), Vec::new());
+        store
+            .record_need_shadow(NeedShadowWrite {
+                session_id: "legacy-map-session",
+                turn_id: "legacy-map-turn",
+                transport_digest: ir.transport_digest(),
+                parser_definition_digest: Digest::blake3(b"parser"),
+                prompt_profile_digest: Digest::blake3(b"profile"),
+                need_ir: &ir,
+                need: &need,
+                fragments: std::slice::from_ref(&fragment),
+            })
+            .unwrap();
+
+        let legacy_request = ArtifactRequest {
+            contract_id: "needle.semantic.code-location".to_owned(),
+            contract_revision: 2,
+            repository_id: need.world.repository_lineage,
+            source_snapshot_digest: Digest::blake3(b"legacy-source"),
+            route_key: route.route.clone(),
+            normalized_request: "legacy wording".to_owned(),
+            semantic_fragment_id: Some(fragment.id),
+            input_artifact_ids: Vec::new(),
+        };
+        let worker_artifact = SemanticWorkerArtifact::CodeLocation {
+            locations: vec![SemanticLocation {
+                role: needle_core::LocationRole::Primary,
+                path: "src/lib.rs".to_owned(),
+                symbol: Some("answer".to_owned()),
+                byte_start: None,
+                byte_end: None,
+            }],
+            gaps: Vec::new(),
+        };
+        let validated = validate_semantic_artifact(
+            &fragment,
+            &worker_artifact,
+            &root,
+            legacy_request.semantic_id().digest(),
+        )
+        .unwrap();
+        assert_eq!(validated.artifact.contract.cache_scope, CacheScope::WorktreeSemantic);
+        store
+            .publish_semantic_artifact(
+                &legacy_request,
+                &need,
+                &validated.artifact,
+                &validated.certificate,
+            )
+            .unwrap();
+
+        let action =
+            crate::built_in_action_for_artifact_kind(&needle_core::ArtifactKind::code_location())
+                .unwrap();
+        let action_request = ActionRequest::new(
+            &action.contract,
+            ArtifactRequest {
+                source_snapshot_digest: Digest::blake3(b"current-source"),
+                normalized_request: "completely different wording".to_owned(),
+                ..legacy_request.clone()
+            },
+            action.contract.default_dispatch_policy,
+            route.route.clone(),
+            need.id,
+        )
+        .unwrap();
+        assert_ne!(action_request.semantic_id(), legacy_request.semantic_id());
+
+        let resolve = |store: RuntimeStore, request: &ActionRequest| {
+            SemanticResolver::new(store)
+                .resolve_for_route_actions(
+                    &need,
+                    &route.route,
+                    &root,
+                    request.artifact_request.source_snapshot_digest,
+                    SemanticCostEstimates {
+                        fresh_microusd: Some(100),
+                        artifact_reuse_microusd: Some(1),
+                        claim_reuse_microusd: None,
+                        claim_partial_reuse_microusd: None,
+                    },
+                    std::slice::from_ref(request),
+                )
+                .unwrap()
+        };
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 43 }\n").unwrap();
+        let stale = resolve(store.clone(), &action_request);
+        assert!(matches!(stale.resolution, CacheResolution::Stale { .. }));
+        assert_eq!(store.action_request_identity_mapping_count().unwrap(), 0);
+        assert_eq!(store.action_request_observation_count().unwrap(), 0);
+
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let first = resolve(store.clone(), &action_request);
+        assert_eq!(store.action_request_identity_mapping_count().unwrap(), 1);
+        assert_eq!(store.action_request_observation_count().unwrap(), 1);
+        let mut next_snapshot_request = action_request.clone();
+        next_snapshot_request.artifact_request.source_snapshot_digest =
+            Digest::blake3(b"next-current-source");
+        assert_eq!(next_snapshot_request.semantic_id(), action_request.semantic_id());
+        let next_snapshot = resolve(store.clone(), &next_snapshot_request);
+        assert_eq!(store.action_request_observation_count().unwrap(), 2);
+        assert!(
+            store
+                .semantic_artifact_has_source(
+                    &validated.artifact.id.to_string(),
+                    next_snapshot_request.artifact_request.source_snapshot_digest,
+                )
+                .unwrap()
+        );
+        drop(store);
+        let reopened = RuntimeStore::new(&database);
+        reopened.initialize().unwrap();
+        assert_eq!(reopened.action_request_identity_mapping_count().unwrap(), 1);
+        let second = resolve(reopened, &next_snapshot_request);
+        for decision in [first, next_snapshot, second] {
+            let descriptor = &decision.action_descriptors.as_ref().unwrap()[0];
+            assert_eq!(descriptor.exact_request, action_request.semantic_id());
+            assert_eq!(descriptor.origin_request, legacy_request.semantic_id());
+            assert!(descriptor.is_canonical());
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn action_resolver_consumes_matching_generation_stamp_and_falls_back_on_mismatch() {
+        let root = std::env::temp_dir().join(format!(
+            "needle-action-fast-validity-{}-{}",
+            std::process::id(),
+            Digest::blake3(format!("{:?}", Instant::now())).to_hex()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let database = root.join("needle.sqlite3");
+        let store = RuntimeStore::new(&database);
+        store.initialize().unwrap();
+
+        let ir = NeedIr::parse(
+            "@@need\n\
+             @route locate.implementation\n\
+             @subject symbol:\"answer\"\n\
+             @require implementation-location selection=primary granularity=exact-location polarity=positive\n\
+             @world source=current features=default\n\
+             \n\
+             Locate the implementation.\n\
+             @@end",
+        )
+        .unwrap()
+        .unwrap();
+        let route = built_in_route_contracts()
+            .into_iter()
+            .find(|route| route.route.as_str() == "locate.implementation")
+            .unwrap();
+        let repository_lineage = Digest::blake3(b"fast-validity-repository");
+        let source_snapshot_digest = Digest::blake3(b"fast-validity-source");
+        let need = needle_core::compile_need(&ir, repository_lineage, &route).unwrap();
+        let fragment = need_fragment(&need, need.required.clone(), Vec::new());
+        store
+            .record_need_shadow(NeedShadowWrite {
+                session_id: "fast-validity-session",
+                turn_id: "fast-validity-turn",
+                transport_digest: ir.transport_digest(),
+                parser_definition_digest: Digest::blake3(b"parser"),
+                prompt_profile_digest: Digest::blake3(b"profile"),
+                need_ir: &ir,
+                need: &need,
+                fragments: std::slice::from_ref(&fragment),
+            })
+            .unwrap();
+
+        let action =
+            crate::built_in_action_for_artifact_kind(&needle_core::ArtifactKind::code_location())
+                .unwrap();
+        let request = ActionRequest::new(
+            &action.contract,
+            ArtifactRequest {
+                contract_id: action.output_contract_id.to_owned(),
+                contract_revision: action.output_contract_revision,
+                repository_id: repository_lineage,
+                source_snapshot_digest,
+                route_key: route.route.clone(),
+                normalized_request: "locate answer".to_owned(),
+                semantic_fragment_id: Some(fragment.id),
+                input_artifact_ids: Vec::new(),
+            },
+            action.contract.default_dispatch_policy,
+            route.route.clone(),
+            need.id,
+        )
+        .unwrap();
+        let validated = validate_semantic_artifact(
+            &fragment,
+            &SemanticWorkerArtifact::CodeLocation {
+                locations: vec![SemanticLocation {
+                    role: needle_core::LocationRole::Primary,
+                    path: "src/lib.rs".to_owned(),
+                    symbol: Some("answer".to_owned()),
+                    byte_start: None,
+                    byte_end: None,
+                }],
+                gaps: Vec::new(),
+            },
+            &root,
+            request.semantic_id().digest(),
+        )
+        .unwrap();
+        store
+            .publish_action_artifact(&request, &validated.artifact, &validated.certificate)
+            .unwrap();
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let repository_context =
+            crate::repository_observer::repository_context_id(repository_lineage, &canonical_root);
+        store
+            .initialize_repository_generation(&RepositoryGeneration::new(
+                repository_lineage,
+                repository_context,
+                0,
+                source_snapshot_digest,
+                None,
+                true,
+            ))
+            .unwrap();
+        store
+            .record_dependency_stamp(
+                needle_core::ArtifactId::new(validated.artifact.id),
+                validated.certificate.id,
+                repository_context,
+            )
+            .unwrap();
+
+        let resolve = |request: &ActionRequest| {
+            SemanticResolver::new(store.clone())
+                .resolve_for_route_actions(
+                    &need,
+                    &route.route,
+                    &root,
+                    request.artifact_request.source_snapshot_digest,
+                    SemanticCostEstimates {
+                        fresh_microusd: Some(100),
+                        artifact_reuse_microusd: Some(1),
+                        claim_reuse_microusd: None,
+                        claim_partial_reuse_microusd: None,
+                    },
+                    std::slice::from_ref(request),
+                )
+                .unwrap()
+        };
+        let fast = resolve(&request);
+        assert_eq!(fast.stale_candidates, 0);
+        assert_eq!(
+            fast.action_descriptors.as_ref().unwrap()[0].exact_request,
+            request.semantic_id()
+        );
+        let memo_count: u64 = Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM operational_validity_memos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(memo_count, 1);
+
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 7 }\n").unwrap();
+        let mut mismatched = request.clone();
+        mismatched.artifact_request.source_snapshot_digest = Digest::blake3(b"newer-source");
+        let stale = resolve(&mismatched);
+        assert!(matches!(stale.resolution, CacheResolution::Stale { .. }));
+        assert_eq!(stale.stale_candidates, 1);
+        assert_eq!(
+            Connection::open(&database)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM operational_validity_memos", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            memo_count
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2026,16 +2794,17 @@ mod tests {
                 &validated_derived.certificate,
             )
             .unwrap();
-        assert!(
-            certificate_inputs_are_fresh(
-                &store,
-                &validated_derived.certificate,
-                &root,
-                source_snapshot_digest,
-                0,
-            )
-            .unwrap()
-        );
+        assert!(matches!(
+            store
+                .validate_artifact_input_graph(
+                    &validated_derived.artifact,
+                    &validated_derived.certificate,
+                    &root,
+                    source_snapshot_digest,
+                )
+                .unwrap(),
+            ArtifactGraphValidity::Fresh { .. }
+        ));
 
         store
             .record_contradiction(
@@ -2061,16 +2830,17 @@ mod tests {
             )
             .unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 7 }\n").unwrap();
-        assert!(
-            !certificate_inputs_are_fresh(
-                &store,
-                &validated_derived.certificate,
-                &root,
-                source_snapshot_digest,
-                0,
-            )
-            .unwrap()
-        );
+        assert!(matches!(
+            store
+                .validate_artifact_input_graph(
+                    &validated_derived.artifact,
+                    &validated_derived.certificate,
+                    &root,
+                    source_snapshot_digest,
+                )
+                .unwrap(),
+            ArtifactGraphValidity::RequiresRevalidation { .. }
+        ));
         let stale = resolver
             .resolve(&need, &root, source_snapshot_digest, Some(100), Some(1), &[])
             .unwrap();

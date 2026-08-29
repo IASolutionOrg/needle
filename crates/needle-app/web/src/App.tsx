@@ -8,6 +8,7 @@ const OverviewPage = lazy(() => import("@/pages/overview-page"))
 const ApprovalInboxPage = lazy(() => import("@/pages/approval-inbox-page"))
 const ResourcePage = lazy(() => import("@/pages/resource-page"))
 const ChangesPage = lazy(() => import("@/pages/changes-page"))
+const LifecyclesPage = lazy(() => import("@/pages/lifecycles-page"))
 const SemanticResourcePage = lazy(
   () => import("@/pages/semantic-resource-page")
 )
@@ -33,11 +34,28 @@ export default function App() {
             <Route path="/approvals" element={<ApprovalInboxPage />} />
             <Route path="/changes" element={<ChangesPage />} />
             <Route path="/changes/:id" element={<ChangesPage />} />
-            <Route path="/needs" element={<SemanticResourcePage resource="needs" />} />
-            <Route path="/subjects" element={<SemanticResourcePage resource="subjects" />} />
-            <Route path="/contracts" element={<SemanticResourcePage resource="contracts" />} />
-            <Route path="/plans" element={<SemanticResourcePage resource="plans" />} />
-            <Route path="/proofs" element={<SemanticResourcePage resource="proofs" />} />
+            <Route path="/lifecycles" element={<LifecyclesPage />} />
+            <Route path="/lifecycles/:id" element={<LifecyclesPage />} />
+            <Route
+              path="/needs"
+              element={<SemanticResourcePage resource="needs" />}
+            />
+            <Route
+              path="/subjects"
+              element={<SemanticResourcePage resource="subjects" />}
+            />
+            <Route
+              path="/contracts"
+              element={<SemanticResourcePage resource="contracts" />}
+            />
+            <Route
+              path="/plans"
+              element={<SemanticResourcePage resource="plans" />}
+            />
+            <Route
+              path="/proofs"
+              element={<SemanticResourcePage resource="proofs" />}
+            />
             <Route
               path="/capabilities"
               element={<SemanticResourcePage resource="capabilities" />}

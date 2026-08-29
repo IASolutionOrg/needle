@@ -365,6 +365,56 @@ impl RuntimeStore {
         ids.into_iter().map(|id| load_state(&connection, &id)).collect()
     }
 
+    /// Return the exact active profile revisions available to a lifecycle
+    /// start operation, ordered by profile identity.
+    ///
+    /// Unlike authoring APIs this read path deliberately does not initialize
+    /// the store. The resident application has already initialized it, and a
+    /// preflight GET must remain free of filesystem or schema mutations.
+    pub fn active_lifecycle_role_profiles(&self) -> Result<Vec<RoleProfileRevision>, StoreError> {
+        const MAX_ACTIVE_LIFECYCLE_PROFILES: usize = 100;
+
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT profile_id FROM role_profile_state
+             WHERE active_revision IS NOT NULL
+             ORDER BY profile_id ASC LIMIT ?1",
+        )?;
+        let ids = statement
+            .query_map([(MAX_ACTIVE_LIFECYCLE_PROFILES + 1) as u64], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if ids.len() > MAX_ACTIVE_LIFECYCLE_PROFILES {
+            return Err(StoreError::RoleProfileValidation(
+                "active lifecycle role-profile count exceeds 100".to_owned(),
+            ));
+        }
+        ids.into_iter()
+            .map(|id| {
+                let state = load_state(&connection, &id)?;
+                let revision = state.active_revision.ok_or_else(|| {
+                    StoreError::RoleProfileCorruption(
+                        "active lifecycle query returned an inactive profile".to_owned(),
+                    )
+                })?;
+                let (definition, created, activated) = load_revision(&connection, &id, revision)?;
+                if activated.is_none() {
+                    return Err(StoreError::RoleProfileCorruption(
+                        "active lifecycle profile has no activation metadata".to_owned(),
+                    ));
+                }
+                revision_with_state(
+                    needle_core::RoleProfileId::new(id).map_err(validation_error)?,
+                    revision,
+                    definition,
+                    RoleProfileState::Active,
+                    created,
+                    activated,
+                )
+            })
+            .collect()
+    }
+
     pub fn read_active_role_profile(
         &self,
         profile_id: &needle_core::RoleProfileId,

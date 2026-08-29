@@ -1,6 +1,9 @@
-use crate::{ArtifactId, CanonicalHasher, ClaimId, Digest, TestPlan};
+use crate::{ArtifactId, ArtifactRequestId, CanonicalHasher, ClaimId, Digest, TestPlan};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
+use std::path::{Component, Path};
+use thiserror::Error;
 
 pub const MAX_VERIFICATION_FAILURE_REASON_BYTES: usize = 2 * 1024;
 
@@ -9,6 +12,8 @@ pub const MAX_ACCEPTANCE_CRITERIA: usize = 8;
 pub const MAX_ALLOWED_PATHS: usize = 16;
 pub const MAX_CHANGE_ARTIFACTS: usize = 16;
 pub const MAX_CHANGE_CLAIMS: usize = 32;
+pub const MAX_CHANGE_CONSTRAINTS: usize = 16;
+pub const MAX_CHANGE_ITEM_BYTES: usize = 4 * 1024;
 pub const MAX_PATCH_FILES: usize = 16;
 pub const MAX_PATCH_DIFF_BYTES: usize = 512 * 1024;
 pub const MAX_PATCH_FINAL_BYTES: usize = 1024 * 1024;
@@ -115,6 +120,47 @@ pub struct ChangeRequest {
 }
 
 impl ChangeRequest {
+    /// Validates transport-independent request shape. Provider-specific write
+    /// restrictions (for example protected metadata directories) remain in the
+    /// write-capable adapter.
+    pub fn validate_for_execution(&self) -> Result<(), ChangeRequestValidationError> {
+        if self.task.trim().is_empty() || self.task.len() > MAX_CHANGE_TASK_BYTES {
+            return Err(ChangeRequestValidationError::Task);
+        }
+        if self.acceptance_criteria.is_empty()
+            || self.acceptance_criteria.len() > MAX_ACCEPTANCE_CRITERIA
+            || self.acceptance_criteria.iter().any(|criterion| {
+                criterion.trim().is_empty() || criterion.len() > MAX_CHANGE_ITEM_BYTES
+            })
+        {
+            return Err(ChangeRequestValidationError::AcceptanceCriteria);
+        }
+        if self.allowed_paths.is_empty() || self.allowed_paths.len() > MAX_ALLOWED_PATHS {
+            return Err(ChangeRequestValidationError::AllowedPaths);
+        }
+        let mut paths = BTreeSet::new();
+        for allowed in &self.allowed_paths {
+            if !safe_relative_change_path(&allowed.path) || !paths.insert(allowed.path.as_str()) {
+                return Err(ChangeRequestValidationError::AllowedPaths);
+            }
+        }
+        if self.artifact_ids.len() > MAX_CHANGE_ARTIFACTS
+            || self.claim_ids.len() > MAX_CHANGE_CLAIMS
+            || self.constraints.len() > MAX_CHANGE_CONSTRAINTS
+        {
+            return Err(ChangeRequestValidationError::ContextBounds);
+        }
+        if self.constraints.iter().any(|constraint| {
+            constraint.trim().is_empty() || constraint.len() > MAX_CHANGE_ITEM_BYTES
+        }) {
+            return Err(ChangeRequestValidationError::Constraints);
+        }
+        if contains_duplicates(&self.artifact_ids) || contains_duplicates(&self.claim_ids) {
+            return Err(ChangeRequestValidationError::DuplicateContext);
+        }
+        Ok(())
+    }
+
     pub fn digest(&self, source_snapshot: Digest) -> Digest {
         let mut hasher = CanonicalHasher::new(b"needle-change-request");
         hasher.field_digest(source_snapshot);
@@ -161,6 +207,36 @@ impl ChangeRequest {
         }
         hasher.finish()
     }
+}
+
+fn contains_duplicates<T: Ord + Copy>(values: &[T]) -> bool {
+    let mut seen = BTreeSet::new();
+    values.iter().copied().any(|value| !seen.insert(value))
+}
+
+fn safe_relative_change_path(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_CHANGE_ITEM_BYTES || value.contains('\\') {
+        return false;
+    }
+    let path = Path::new(value);
+    !path.is_absolute()
+        && path.components().all(|component| matches!(component, Component::Normal(_)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ChangeRequestValidationError {
+    #[error("change task must contain between 1 and {MAX_CHANGE_TASK_BYTES} bytes")]
+    Task,
+    #[error("change acceptance criteria are missing, empty, or out of bounds")]
+    AcceptanceCriteria,
+    #[error("change allowed paths are missing, duplicated, unsafe, or out of bounds")]
+    AllowedPaths,
+    #[error("change artifact, claim, or constraint collections exceed their bounds")]
+    ContextBounds,
+    #[error("change constraints are empty or out of bounds")]
+    Constraints,
+    #[error("change artifact and claim inputs must be unique")]
+    DuplicateContext,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -246,6 +322,41 @@ impl PatchArtifact {
         }
         PatchId(hasher.finish())
     }
+
+    pub fn is_canonical(&self) -> bool {
+        if self.source_snapshot == Digest([0; 32])
+            || self.files.is_empty()
+            || self.files.len() > MAX_PATCH_FILES
+            || self.summary.trim().is_empty()
+            || self.summary.len() > MAX_CHANGE_TASK_BYTES
+            || self.acceptance_coverage.is_empty()
+            || self.acceptance_coverage.len() > MAX_ACCEPTANCE_CRITERIA
+            || self.residual_risks.len() > MAX_CHANGE_CONSTRAINTS
+            || self.discrepancies.len() > MAX_CHANGE_CONSTRAINTS
+            || self.acceptance_coverage.iter().any(|coverage| {
+                coverage.criterion.trim().is_empty()
+                    || coverage.criterion.len() > MAX_CHANGE_ITEM_BYTES
+                    || coverage.evidence.len() > MAX_CHANGE_ITEM_BYTES
+            })
+            || self
+                .residual_risks
+                .iter()
+                .chain(&self.discrepancies)
+                .any(|value| value.trim().is_empty() || value.len() > MAX_CHANGE_ITEM_BYTES)
+        {
+            return false;
+        }
+        let mut paths = BTreeSet::new();
+        if self.files.iter().any(|file| {
+            !safe_relative_change_path(&file.path)
+                || !paths.insert(file.path.as_str())
+                || file.before_bytes > MAX_PATCH_FINAL_BYTES as u64
+                || file.after_bytes > MAX_PATCH_FINAL_BYTES as u64
+        }) {
+            return false;
+        }
+        self.id == Self::compute_id(self.source_snapshot, &self.files)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -274,6 +385,12 @@ pub struct VerificationArtifact {
     pub id: VerificationArtifactId,
     pub change_id: ChangeId,
     pub patch_id: PatchId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_request: Option<ArtifactRequestId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirements_digest: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_test_evidence_artifacts: Vec<ArtifactId>,
     pub verdict: VerificationStatus,
     pub acceptance_coverage: Vec<AcceptanceCoverage>,
     pub findings: Vec<String>,
@@ -317,6 +434,41 @@ pub struct VerificationTestProjection<'a> {
 }
 
 impl VerificationArtifact {
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_action_id_with_plan_results(
+        action_request: ArtifactRequestId,
+        requirements_digest: Digest,
+        input_test_evidence_artifacts: &[ArtifactId],
+        change_id: &ChangeId,
+        patch_id: PatchId,
+        verdict: VerificationStatus,
+        acceptance_coverage: &[AcceptanceCoverage],
+        findings: &[String],
+        test_projection: VerificationTestProjection<'_>,
+        verifier_definition: Digest,
+    ) -> VerificationArtifactId {
+        let base = Self::compute_id_with_plan_results(
+            change_id,
+            patch_id,
+            verdict,
+            acceptance_coverage,
+            findings,
+            test_projection,
+            verifier_definition,
+        );
+        let mut inputs = input_test_evidence_artifacts.to_vec();
+        inputs.sort_unstable();
+        let mut hasher = CanonicalHasher::new(b"needle-action-verification-artifact-v1");
+        hasher.field_digest(base.0);
+        hasher.field_digest(action_request.digest());
+        hasher.field_digest(requirements_digest);
+        hasher.field_u16(inputs.len().try_into().unwrap_or(u16::MAX));
+        for input in inputs {
+            hasher.field_digest(input.digest());
+        }
+        VerificationArtifactId(hasher.finish())
+    }
+
     pub fn compute_id(
         change_id: &ChangeId,
         patch_id: PatchId,
@@ -474,7 +626,32 @@ impl VerificationArtifact {
     }
 
     pub fn is_canonical(&self) -> bool {
-        let identity = if self.test_plan_results.is_empty() && !self.test_plans_over_cap {
+        let action_bound = self.action_request.is_some()
+            || self.requirements_digest.is_some()
+            || !self.input_test_evidence_artifacts.is_empty();
+        let identity = if action_bound {
+            match (self.action_request, self.requirements_digest) {
+                (Some(action_request), Some(requirements_digest)) => {
+                    Self::compute_action_id_with_plan_results(
+                        action_request,
+                        requirements_digest,
+                        &self.input_test_evidence_artifacts,
+                        &self.change_id,
+                        self.patch_id,
+                        self.verdict,
+                        &self.acceptance_coverage,
+                        &self.findings,
+                        VerificationTestProjection {
+                            evidence_ids: &self.test_evidence_ids,
+                            plan_results: &self.test_plan_results,
+                            plans_over_cap: self.test_plans_over_cap,
+                        },
+                        self.verifier_definition,
+                    )
+                }
+                _ => return false,
+            }
+        } else if self.test_plan_results.is_empty() && !self.test_plans_over_cap {
             Self::compute_id(
                 &self.change_id,
                 self.patch_id,
@@ -532,6 +709,12 @@ impl VerificationArtifact {
         let evidence_unique = self.test_evidence_ids.windows(2).all(|pair| pair[0] != pair[1])
             && self.test_evidence_ids.iter().collect::<std::collections::BTreeSet<_>>().len()
                 == self.test_evidence_ids.len();
+        let action_inputs_canonical = !action_bound
+            || (self.action_request.is_some()
+                && self.requirements_digest.is_some_and(|digest| digest != Digest([0; 32]))
+                && !self.input_test_evidence_artifacts.is_empty()
+                && self.input_test_evidence_artifacts.len() <= crate::MAX_NEED_INPUTS
+                && self.input_test_evidence_artifacts.windows(2).all(|pair| pair[0] < pair[1]));
         let overflow_signal = !self.test_plans_over_cap
             || (self.test_plan_results.is_empty()
                 && self.findings.iter().any(|finding| finding.contains("test-plan bound")));
@@ -554,6 +737,7 @@ impl VerificationArtifact {
                 || (self.test_plan_results.is_empty() && self.test_evidence_ids.is_empty()))
             && ordered
             && evidence_unique
+            && action_inputs_canonical
             && records_valid
             && failure_reasons_bounded
             && overflow_signal
@@ -589,6 +773,8 @@ pub enum ChangeApplyStatus {
 #[serde(deny_unknown_fields)]
 pub struct ChangeApplyRecord {
     pub id: ChangeApplyId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<Digest>,
     pub change_id: ChangeId,
     pub patch_id: PatchId,
     pub repository_root: String,
@@ -667,6 +853,9 @@ mod tests {
             id,
             change_id,
             patch_id,
+            action_request: None,
+            requirements_digest: None,
+            input_test_evidence_artifacts: Vec::new(),
             verdict,
             acceptance_coverage: Vec::new(),
             findings,
@@ -761,6 +950,9 @@ mod tests {
             id,
             change_id,
             patch_id,
+            action_request: None,
+            requirements_digest: None,
+            input_test_evidence_artifacts: Vec::new(),
             verdict,
             acceptance_coverage,
             findings,

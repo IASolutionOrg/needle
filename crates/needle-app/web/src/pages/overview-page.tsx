@@ -13,7 +13,12 @@ import { Link } from "react-router"
 import { useActivationToggle, useControlPlane } from "@/api"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+} from "@/components/ui/empty"
 import {
   Table,
   TableBody,
@@ -23,7 +28,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 
-const resolutions = [
+const legacyRootResolutions = [
   "Exact Hit",
   "Coverage Hit",
   "Composite Hit",
@@ -46,7 +51,7 @@ function Panel({
   className?: string
 }) {
   return (
-    <section className={`border bg-panel ${className}`}>
+    <section className={`min-w-0 border bg-panel ${className}`}>
       <div className="border-b px-4 py-3">
         <h2 className="text-sm font-semibold">{title}</h2>
       </div>
@@ -60,6 +65,9 @@ export default function OverviewPage() {
   const activation = useActivationToggle()
   const routes = control.data?.routes ?? []
   const semantic = control.data?.semantic
+  const actionContracts = semantic?.action_contracts?.items ?? []
+  const partitionManifests = semantic?.partition_manifests?.items ?? []
+  const refreshEconomicAssessments = semantic?.refresh_economics?.items ?? []
   const proofPlans = semantic?.selected_plans ?? []
   const proofMetrics = semantic?.metrics
   const desktopSkill = control.data?.integrations.desktop_skill
@@ -81,10 +89,17 @@ export default function OverviewPage() {
         >
           <div>
             <div className="flex items-center gap-2">
-              <h2 id="needle-activation-title" className="text-sm font-semibold">
+              <h2
+                id="needle-activation-title"
+                className="text-sm font-semibold"
+              >
                 Codex companion
               </h2>
-              <Badge variant={control.data?.activation.enabled ? "default" : "outline"}>
+              <Badge
+                variant={
+                  control.data?.activation.enabled ? "default" : "outline"
+                }
+              >
                 {control.data?.activation.enabled ? "Enabled" : "Disabled"}
               </Badge>
               {desktopIntegrationNotReady ? (
@@ -95,7 +110,8 @@ export default function OverviewPage() {
               ) : null}
             </div>
             <p className="mt-1 text-sm text-muted-foreground">
-              When enabled, Codex can request repository context from Needle automatically.
+              When enabled, Codex can request repository context from Needle
+              automatically.
             </p>
             {activation.error ? (
               <p role="alert" className="mt-2 text-sm text-destructive">
@@ -110,8 +126,8 @@ export default function OverviewPage() {
             ) : null}
             {desktopCleanupPending ? (
               <p role="status" className="mt-2 text-sm text-muted-foreground">
-                Activation is disabled, but the managed Desktop skill remains installed. Run
-                `needle disable` to retry cleanup.
+                Activation is disabled, but the managed Desktop skill remains
+                installed. Run `needle disable` to retry cleanup.
               </p>
             ) : null}
           </div>
@@ -153,7 +169,10 @@ export default function OverviewPage() {
             ["Legacy v0.3 entries", control.data?.cache.length ?? 0],
             ["Proof candidates", proofPlans.length],
             ["Workers avoided", proofMetrics?.worker_avoided ?? 0],
-            ["Proof overhead", `${proofMetrics?.proof_overhead_micros ?? 0} µs`],
+            [
+              "Proof overhead",
+              `${proofMetrics?.proof_overhead_micros ?? 0} µs`,
+            ],
           ].map(([label, value], index) => (
             <div
               key={String(label)}
@@ -161,16 +180,113 @@ export default function OverviewPage() {
                 index > 0 ? "border-t sm:border-t-0 sm:border-l" : ""
               }`}
             >
-              <div className="text-xs text-muted-foreground">{String(label)}</div>
+              <div className="text-xs text-muted-foreground">
+                {String(label)}
+              </div>
               <div className="mt-1 font-mono text-lg">{String(value)}</div>
             </div>
           ))}
         </section>
 
         <div className="grid gap-4 lg:grid-cols-2">
-          <Panel title="Cache resolution">
+          <Panel title="Action contracts — Shadow" className="lg:col-span-2">
+            {actionContracts.length > 0 ? (
+              <div className="divide-y">
+                {actionContracts.map((action) => (
+                  <div
+                    key={action.id}
+                    className="grid gap-3 px-4 py-3 text-[13px] md:grid-cols-[minmax(0,1fr)_auto] md:items-center"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono break-all text-link">
+                          {action.id}
+                        </span>
+                        <Badge variant="outline">Shadow</Badge>
+                      </div>
+                      <div className="mt-1 text-muted-foreground">
+                        {action.coverage.kind === "semantic_predicate"
+                          ? action.coverage.predicate
+                          : "partitioned"}{" "}
+                        → {action.artifact_kind} · {action.effect_class}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 md:justify-end">
+                      {action.reuse_modes.map((mode) => (
+                        <span
+                          key={mode}
+                          className="border px-2 py-1 font-mono text-xs"
+                        >
+                          {mode}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <Empty className="min-h-36 rounded-none border-0">
+                <EmptyHeader>
+                  <Box />
+                  <EmptyTitle>No action contracts exposed</EmptyTitle>
+                  <EmptyDescription>
+                    This runtime predates the bounded Shadow action catalog
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            )}
+          </Panel>
+
+          <Panel title="Partition manifests — Shadow" className="lg:col-span-2">
+            <p className="border-b px-4 py-2.5 text-xs text-muted-foreground">
+              Server-certified audit records. They are not consumed by the
+              resolver.
+            </p>
+            {partitionManifests.length > 0 ? (
+              <div className="divide-y">
+                {partitionManifests.map((manifest) => (
+                  <div
+                    key={manifest.manifest}
+                    className="grid gap-2 px-4 py-3 text-[13px] md:grid-cols-[minmax(0,1fr)_auto] md:items-center"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-mono break-all text-link">
+                        {manifest.manifest}
+                      </div>
+                      <div className="mt-1 text-muted-foreground">
+                        {manifest.action_contract} · {manifest.scheme}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 md:justify-end">
+                      <Badge variant="outline">Shadow</Badge>
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {manifest.entry_count} partitions
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <Empty className="min-h-36 rounded-none border-0">
+                <EmptyHeader>
+                  <Box />
+                  <EmptyTitle>No partition manifests recorded</EmptyTitle>
+                  <EmptyDescription>
+                    Certified Shadow publications will appear here after
+                    validation
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            )}
+          </Panel>
+
+          <Panel title="Root proof decisions — legacy audit">
+            <p className="border-b px-4 py-2.5 text-xs text-muted-foreground">
+              Historical resolver outcomes retained separately from per-action
+              Shadow resolution.
+            </p>
             <div className="divide-y">
-              {resolutions.map((resolution) => (
+              {legacyRootResolutions.map((resolution) => (
                 <div
                   key={resolution}
                   className="grid grid-cols-[1fr_auto_auto] items-center gap-4 px-4 py-2.5 text-[13px]"
@@ -179,7 +295,9 @@ export default function OverviewPage() {
                   <span className="font-mono text-muted-foreground">
                     {
                       proofPlans.filter((plan) =>
-                        plan.decision_reason.includes(resolution.replaceAll(" ", ""))
+                        plan.decision_reason.includes(
+                          resolution.replaceAll(" ", "")
+                        )
                       ).length
                     }
                   </span>
@@ -195,16 +313,74 @@ export default function OverviewPage() {
             </div>
           </Panel>
 
-          <Panel title="Cost trend">
-            <Empty className="min-h-78 rounded-none border-0">
-              <EmptyHeader>
-                <Box />
-                <EmptyTitle>No cost data yet</EmptyTitle>
-                <EmptyDescription>
-                  Run an approved experiment to begin measurement
-                </EmptyDescription>
-              </EmptyHeader>
-            </Empty>
+          <Panel title="Refresh economics — Shadow">
+            <p className="border-b px-4 py-2.5 text-xs text-muted-foreground">
+              Immutable local assessments. They do not authorize refresh or
+              promote a capability.
+            </p>
+            {refreshEconomicAssessments.length > 0 ? (
+              <div className="divide-y">
+                {refreshEconomicAssessments.map(({ assessment }) => {
+                  const decision = assessment.decision
+                  const fallbackReason =
+                    decision.selection === "full_compute"
+                      ? decision.reason.replaceAll("_", " ")
+                      : null
+                  return (
+                    <div
+                      key={assessment.definition_digest}
+                      className="px-4 py-3 text-[13px]"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-mono break-all text-link">
+                          {assessment.action_contract}
+                        </span>
+                        <Badge variant="outline">
+                          {decision.selection === "refresh"
+                            ? "Refresh"
+                            : "Full compute"}
+                        </Badge>
+                      </div>
+                      <div className="mt-2 grid grid-cols-2 gap-3 text-xs">
+                        <div>
+                          <div className="text-muted-foreground">
+                            Expected net
+                          </div>
+                          <div className="mt-0.5 font-mono">
+                            {assessment.expected_net_microusd === null
+                              ? "Unknown"
+                              : `${assessment.expected_net_microusd} µUSD`}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-muted-foreground">Evidence</div>
+                          <div className="mt-0.5 font-mono">
+                            {assessment.evidence?.basis.replaceAll("_", " ") ??
+                              "Missing"}
+                          </div>
+                        </div>
+                      </div>
+                      {fallbackReason ? (
+                        <div className="mt-2 text-xs text-muted-foreground">
+                          Fallback: {fallbackReason}
+                        </div>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              <Empty className="min-h-44 rounded-none border-0">
+                <EmptyHeader>
+                  <Box />
+                  <EmptyTitle>No refresh economics recorded</EmptyTitle>
+                  <EmptyDescription>
+                    Shadow assessments will appear after an evaluated refresh
+                    candidate
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            )}
           </Panel>
 
           <Panel title="Route health" className="lg:col-span-2">
@@ -222,7 +398,9 @@ export default function OverviewPage() {
               <TableBody>
                 {routes.map((route) => (
                   <TableRow key={route.id}>
-                    <TableCell className="font-mono text-link">{route.id}</TableCell>
+                    <TableCell className="font-mono text-link">
+                      {route.id}
+                    </TableCell>
                     <TableCell>Not promoted</TableCell>
                     <TableCell>—</TableCell>
                     <TableCell>—</TableCell>

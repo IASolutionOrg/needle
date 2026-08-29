@@ -37,6 +37,10 @@ pub enum ChangeApplyError {
     SnapshotDrift,
     #[error("pending apply recovery failed: {0}")]
     Recovery(String),
+    #[error("the same Apply operation is still in progress")]
+    InProgress,
+    #[error("an external Apply effect was already recorded for this patch")]
+    DuplicateEffect,
     #[error(transparent)]
     Materialization(#[from] ChangeMaterializationError),
     #[error(transparent)]
@@ -137,6 +141,24 @@ pub fn apply_verified_change(
         change_id,
         expected_change_digest,
         None,
+        None,
+    )
+}
+
+pub fn apply_verified_change_for_operation(
+    store: &RuntimeStore,
+    repository_root: &Path,
+    change_id: &ChangeId,
+    expected_change_digest: Digest,
+    operation_id: Digest,
+) -> Result<ChangeApplyRecord, ChangeApplyError> {
+    apply_verified_change_with_lifecycle(
+        store,
+        repository_root,
+        change_id,
+        expected_change_digest,
+        None,
+        Some(operation_id),
     )
 }
 
@@ -156,6 +178,27 @@ pub fn apply_lifecycle_change(
         change_id,
         expected_change_digest,
         Some(expected_lifecycle_digest),
+        None,
+    )
+}
+
+/// Operation-idempotent lifecycle Apply. The lifecycle CAS and external-effect
+/// journal are committed through the same parent-owned boundary.
+pub fn apply_lifecycle_change_for_operation(
+    store: &RuntimeStore,
+    repository_root: &Path,
+    change_id: &ChangeId,
+    expected_change_digest: Digest,
+    expected_lifecycle_digest: Digest,
+    operation_id: Digest,
+) -> Result<ChangeApplyRecord, ChangeApplyError> {
+    apply_verified_change_with_lifecycle(
+        store,
+        repository_root,
+        change_id,
+        expected_change_digest,
+        Some(expected_lifecycle_digest),
+        Some(operation_id),
     )
 }
 
@@ -165,11 +208,41 @@ fn apply_verified_change_with_lifecycle(
     change_id: &ChangeId,
     expected_change_digest: Digest,
     expected_lifecycle_digest: Option<Digest>,
+    operation_id: Option<Digest>,
 ) -> Result<ChangeApplyRecord, ChangeApplyError> {
     let repository_root = fs::canonicalize(repository_root)?;
     let repository_text = repository_root.to_string_lossy().into_owned();
+    if let Some(operation_id) = operation_id
+        && let Some(existing) = store.change_apply_for_operation(operation_id)?
+        && existing.status == ChangeApplyStatus::Applying
+        && now_ms().saturating_sub(existing.created_unix_ms) < 300_000
+    {
+        return Err(ChangeApplyError::InProgress);
+    }
     recover_pending_change_applies(store, &repository_root)?;
     let prepared = store.prepared_change(change_id)?.ok_or(ChangeApplyError::NotFound)?;
+    if let Some(operation_id) = operation_id
+        && let Some(existing) = store.change_apply_for_operation(operation_id)?
+        && existing.status == ChangeApplyStatus::Applied
+    {
+        if existing.change_id == *change_id
+            && existing.patch_id == prepared.patch.id
+            && existing.pre_snapshot == prepared.source_snapshot
+            && existing.repository_root == repository_text
+            && existing.post_snapshot.is_some()
+        {
+            return Ok(existing);
+        }
+        return Err(ChangeApplyError::DuplicateEffect);
+    }
+    if operation_id.is_some()
+        && store
+            .change_applies(change_id)?
+            .iter()
+            .any(|record| record.status == ChangeApplyStatus::Applied)
+    {
+        return Err(ChangeApplyError::DuplicateEffect);
+    }
     store
         .latest_verification_artifact(change_id)?
         .filter(|artifact| {
@@ -195,10 +268,14 @@ fn apply_verified_change_with_lifecycle(
     hasher.field_str(change_id.as_str());
     hasher.field_digest(prepared.patch.id.0);
     hasher.field_digest(active_snapshot.source_digest);
+    if let Some(operation_id) = operation_id {
+        hasher.field_digest(operation_id);
+    }
     hasher.field_bytes(&created.to_le_bytes());
     let apply_id = ChangeApplyId(hasher.finish());
     let mut record = ChangeApplyRecord {
         id: apply_id,
+        operation_id,
         change_id: change_id.clone(),
         patch_id: prepared.patch.id,
         repository_root: repository_text,
@@ -209,6 +286,7 @@ fn apply_verified_change_with_lifecycle(
         completed_unix_ms: None,
     };
     let journal = serde_json::json!({
+        "operation_id": operation_id,
         "patch_id": prepared.patch.id,
         "paths": prepared.patch.files.iter().map(|file| &file.path).collect::<Vec<_>>()
     });

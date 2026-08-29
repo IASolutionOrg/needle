@@ -112,6 +112,10 @@ semantic_id!(SubjectId);
 semantic_id!(ArtifactRequestId);
 semantic_id!(ArtifactId);
 semantic_id!(ArtifactValidationCertificateId);
+semantic_id!(DependencyStampId);
+semantic_id!(OperationalValidityMemoId);
+semantic_id!(RefreshAttemptId);
+semantic_id!(FailedRefreshMemoId);
 semantic_id!(ReuseSufficiencyCertificateId);
 semantic_id!(SelectedPlanId);
 
@@ -936,6 +940,68 @@ pub struct Need {
     pub residual: Option<ResidualIntent>,
     pub body_digest: Digest,
     pub format_revision: u16,
+}
+
+impl Need {
+    /// Digest of the complete immutable compiled demand record.
+    ///
+    /// This is distinct from `NeedId`, whose semantic identity intentionally
+    /// excludes transport-only material such as the original body digest.
+    pub fn definition_digest(&self) -> Digest {
+        let mut hasher = CanonicalHasher::new(b"need-definition-v1");
+        hasher.field_u16(self.format_revision);
+        hasher.field_digest(self.id.digest());
+        hasher.field_u16(self.subjects.len().try_into().unwrap_or(u16::MAX));
+        for subject in &self.subjects {
+            hasher.field_digest(subject.id.digest());
+            hasher.field_str(subject.kind.as_str());
+            hasher.field_str(&subject.canonical_name);
+            hasher.field_digest(subject.repository_lineage);
+        }
+        hash_compiled_obligations(&mut hasher, &self.required);
+        hash_compiled_obligations(&mut hasher, &self.preferred);
+        hasher.field_u16(self.semantic_constraints.len().try_into().unwrap_or(u16::MAX));
+        for constraint in &self.semantic_constraints {
+            hasher.field_str(constraint);
+        }
+        hasher.field_digest(self.world.id());
+        hasher.field_u16(self.input_artifacts.len().try_into().unwrap_or(u16::MAX));
+        for artifact in &self.input_artifacts {
+            hasher.field_digest(artifact.digest());
+        }
+        if let Some(residual) = &self.residual {
+            hasher.field_u8(1);
+            hasher.field_digest(residual.raw_digest);
+            hasher.field_u8(match residual.reason {
+                ResidualReason::UndeclaredExactAnchor => 0,
+                ResidualReason::UnsupportedPredicate => 1,
+                ResidualReason::UnsupportedFacet => 2,
+                ResidualReason::ConflictingDeclaration => 3,
+                ResidualReason::AmbiguousSubject => 4,
+                ResidualReason::UnparsedConstraint => 5,
+                ResidualReason::LegacyFreeForm => 6,
+            });
+            hasher.field_u8(u8::from(residual.mandatory));
+        } else {
+            hasher.field_u8(0);
+        }
+        hasher.field_digest(self.body_digest);
+        hasher.finish()
+    }
+}
+
+fn hash_compiled_obligations(hasher: &mut CanonicalHasher, obligations: &[Obligation]) {
+    hasher.field_u16(obligations.len().try_into().unwrap_or(u16::MAX));
+    for obligation in obligations {
+        hasher.field_digest(obligation.id.digest());
+        hasher.field_str(obligation.predicate.as_str());
+        hasher.field_digest(obligation.subject.digest());
+        hasher.field_u16(obligation.facets.len().try_into().unwrap_or(u16::MAX));
+        for facet in &obligation.facets {
+            hasher.field_str(&facet.key);
+            hasher.field_str(&facet.value);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1844,6 +1910,8 @@ Locate it.\n\
         wording.body = "Use different words without changing semantics.".to_owned();
         let other = compile_need(&wording, lineage, &route()).unwrap();
         assert_eq!(need.id, other.id);
+        assert_ne!(need.definition_digest(), other.definition_digest());
+        assert_eq!(need.definition_digest(), need.clone().definition_digest());
         let fragment = need_fragment(&need, vec![need.required[0].clone()], Vec::new());
         let other_fragment = need_fragment(&other, vec![other.required[0].clone()], Vec::new());
         assert_eq!(fragment.id, other_fragment.id);

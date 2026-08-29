@@ -790,9 +790,9 @@ fn worker_system_instructions(request: &WorkerRequest) -> String {
     let preferred_model_kinds = preferred_model_artifact_kinds(request);
     let requested_model_kinds = requested_model_artifact_kinds(request);
     let test_policy = if effective_test_plan(request).is_some() {
-        "The declared TestPlan permits but does not require execution. Run it only when Needle has not marked test execution unavailable, and then run only that direct cargo test in the isolated checkout; Needle decides its approval. The TestPlan and its test locations are parent-owned; do not return them as code-location. "
+        "The declared TestPlan permits but does not require execution. Run it only when Needle has not marked test execution unavailable, and then run only its exact direct argv in the isolated checkout; Needle decides its approval. The TestPlan and its test locations are parent-owned; do not return them as code-location. "
     } else if requested_model_kinds.contains(&ArtifactKind::test_plan()) {
-        "No TestPlan was declared. Locate and return one from an observed test definition and Cargo target, but do not execute tests, builds, or scripts. "
+        "No TestPlan was declared. Locate one from observed test code and tooling configuration, but do not execute tests, builds, or scripts. "
     } else {
         "Do not run tests, builds, or scripts because no TestPlan was declared. "
     };
@@ -809,7 +809,7 @@ fn worker_system_instructions(request: &WorkerRequest) -> String {
         needle_core::ARTIFACT_RESULT_SCHEMA_ID
     };
     format!(
-        "{preset}\n\nContract: required artifact kinds: {required}. Preferred artifact kinds: {preferred}. Return every required kind. Preferred kinds are optional: include them only when bounded inspection finds valid evidence, and never sacrifice a required kind to obtain one. Use only needle_search, needle_read, and needle_list; never shell. Search the exact subject once, then narrow later calls to returned paths. Return only the minimal repository-relative evidence files that support the selected result; Needle reads and validates those declarations independently. Read-only source checkout. {test_policy}For semantic locations, identify the exact symbol and always return null byte_start and byte_end; line numbers are not byte offsets. Never modify files. No network, hooks, plugins, MCP, memory, project instructions, or subagents. Return only JSON matching the provided {schema_id} output schema. Return no unrequested artifact kind. Max 8 artifacts. Derive test argv only from an observed Cargo target and test identifier. In a test-plan, argv is the complete process vector and must begin exactly with [\"cargo\",\"test\"]; do not omit cargo even though runner is also \"cargo\"."
+        "{preset}\n\nContract: required artifact kinds: {required}. Preferred artifact kinds: {preferred}. Return every required kind. Preferred kinds are optional: include them only when bounded inspection finds valid evidence, and never sacrifice a required kind to obtain one. Use only needle_search, needle_read, and needle_list; never shell. Search the exact subject once, then narrow later calls to returned paths. Return only the minimal repository-relative evidence files that support the selected result; Needle reads and validates those declarations independently. Read-only source checkout. {test_policy}For semantic locations, identify the exact symbol and always return null byte_start and byte_end; line numbers are not byte offsets. Never modify files. No network, hooks, plugins, MCP, memory, project instructions, or subagents. Return only JSON matching the provided {schema_id} output schema. Return no unrequested artifact kind. Max 8 artifacts. Derive test argv only from observed test code and tooling configuration. In a test-plan, argv is the complete process vector, argv[0] must equal runner, and the safe focused-test identifier (or its final qualified segment) must be an exact argv element."
     )
 }
 
@@ -918,8 +918,9 @@ fn repair_with_test_diagnostic(
         prompt.push_str(&requested[0].0);
     }
     if requested == [ArtifactKind::test_plan()] {
-        prompt
-            .push_str("; test-plan argv is the complete process vector and must begin cargo,test");
+        prompt.push_str(
+            "; test-plan argv is the complete direct process vector, must begin with runner, and must contain the safe focused-test identifier",
+        );
     }
     if let Some(error) = test_error {
         prompt.push_str("; test_invalid=");
@@ -1152,6 +1153,7 @@ mod tests {
         assert!(system.contains("Needle reads and validates those declarations independently"));
         assert!(!system.contains("Get-Content"));
         assert!(system.contains("No TestPlan was declared"));
+        assert!(!system.to_ascii_lowercase().contains("cargo"));
         assert!(system.contains("always return null byte_start and byte_end"));
         assert!(system.contains("line numbers are not byte offsets"));
         assert!(!system.contains("root task must not be copied"));
@@ -1163,9 +1165,15 @@ mod tests {
         let mut request = request(None);
         request.requested_artifact_kinds = vec![ArtifactKind::test_plan()];
         let system = worker_system_instructions(&request);
-        assert!(system.contains("Locate and return one from an observed test definition"));
+        assert!(system.contains("Locate one from observed test code and tooling configuration"));
         assert!(system.contains("do not execute tests, builds, or scripts"));
-        assert!(system.contains("Derive test argv only from an observed Cargo target"));
+        assert!(
+            system.contains(
+                "Derive test argv only from observed test code and tooling configuration"
+            )
+        );
+        assert!(system.contains("argv[0] must equal runner"));
+        assert!(!system.to_ascii_lowercase().contains("cargo"));
     }
 
     #[test]
@@ -1230,6 +1238,8 @@ mod tests {
         );
 
         assert!(prompt.contains("required_artifact=test-plan"));
+        assert!(prompt.contains("must begin with runner"));
+        assert!(!prompt.to_ascii_lowercase().contains("cargo"));
     }
 
     #[test]

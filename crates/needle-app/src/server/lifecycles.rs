@@ -1,17 +1,24 @@
-use axum::extract::rejection::QueryRejection;
+use axum::extract::DefaultBodyLimit;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use needle_core::{
-    AcceptanceStatus, ApprovalDecisionSource, ChangeApplyStatus, ChangeId, Digest,
+    AcceptanceStatus, ApprovalDecisionSource, ArtifactId, ChangeApplyStatus, ChangeId, Digest,
     LifecycleArtifactKind, LifecycleEvent, LifecycleEventKind, LifecycleId, LifecyclePhase,
     LifecycleReason, LifecycleReviewVerdict, LifecycleStatus, LifecycleTerminalOutcome,
     VerificationStatus,
 };
 use needle_runtime::{
-    LifecycleProjection, LifecycleSummaryRecord, MAX_LIFECYCLE_LIST_LIMIT, StoreError,
+    LifecycleAdapterInvocationRecord, LifecycleAdapterInvocationState,
+    LifecycleAdapterRecoveryRecord, LifecycleAdapterRecoverySource, LifecycleExecutionDisposition,
+    LifecycleExploreShadowObservationPersistence, LifecycleExploreShadowObservationRecord,
+    LifecycleExploreShadowResolutionKind, LifecycleProjection, LifecycleSummaryRecord,
+    MAX_LIFECYCLE_EXPLORE_OBSERVATION_LIST_LIMIT, MAX_LIFECYCLE_LIST_LIMIT,
+    ShadowActionResolutionAuthority, ShadowActionResolutionKind, StoreError,
+    lifecycle_adapter_invocation_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,13 +28,33 @@ use super::AppState;
 const LIST_SCHEMA: &str = "needle.lifecycle-list/1";
 const DETAIL_SCHEMA: &str = "needle.lifecycle-detail/1";
 const EVENTS_SCHEMA: &str = "needle.lifecycle-events/1";
+const ACTION_OBSERVATIONS_SCHEMA: &str = "needle.lifecycle-action-observations/1";
+const STEP_SCHEMA: &str = "needle.lifecycle-step/1";
+const ADAPTER_INVOCATION_SCHEMA: &str = "needle.lifecycle-adapter-invocation/1";
+const ADAPTER_RECOVERY_SCHEMA: &str = "needle.lifecycle-adapter-recovery/1";
 const ERROR_SCHEMA: &str = "needle.lifecycle-error/1";
 const DEFAULT_LIMIT: usize = 50;
+const MAX_STEP_BODY_BYTES: usize = 4 * 1024;
+const MAX_ADAPTER_RECOVERY_BODY_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LimitQuery {
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleStepBody {
+    expected_state_digest: Digest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleAdapterRecoveryBody {
+    invocation_id: Digest,
+    expected_state_digest: Digest,
+    confirm_provider_stopped: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +69,20 @@ struct LifecycleRejection {
     status: StatusCode,
     code: &'static str,
     message: &'static str,
+}
+
+enum PrepareLifecycleStepError {
+    Store(StoreError),
+    Rejection(LifecycleRejection),
+}
+
+impl PrepareLifecycleStepError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Store(error) => store_error(error),
+            Self::Rejection(rejection) => rejection.into_response(),
+        }
+    }
 }
 
 impl LifecycleRejection {
@@ -122,6 +163,7 @@ struct LifecycleTestResultDto {
     executed: bool,
     passed: bool,
     evidence_id: Option<String>,
+    action_evidence_artifact: Option<ArtifactId>,
     failure_code: Option<String>,
 }
 
@@ -201,6 +243,7 @@ struct LifecycleDetailDto {
     budget: LifecycleBudgetDto,
     usage: LifecycleUsageDto,
     artifacts: LifecycleArtifactsDto,
+    explore_reuse: Option<needle_core::LifecycleExploreReuseCompletion>,
     repair_reserved: bool,
     repair_consumed: bool,
     terminal_outcome: Option<LifecycleTerminalOutcome>,
@@ -237,11 +280,130 @@ struct LifecycleEventDto {
     created_unix_ms: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct LifecycleActionResolutionDto {
+    request: Digest,
+    action_contract: needle_core::ActionContractId,
+    predicate: needle_core::PredicateKind,
+    resolution: ShadowActionResolutionKind,
+    artifacts: Vec<Digest>,
+    validation_certificates: Vec<Digest>,
+    selected_plan: Digest,
+    sufficiency_certificate: Option<Digest>,
+    covered_mask: u16,
+    missing_mask: u16,
+    definition_digest: Digest,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleActionObservationDto {
+    observation_digest: Digest,
+    lifecycle_id: LifecycleId,
+    expected_state_digest: Digest,
+    plan_definition_digest: Digest,
+    planned_action_count: u16,
+    resolution: needle_runtime::LifecycleExploreShadowResolutionKind,
+    actions: Vec<LifecycleActionResolutionDto>,
+    authority: ShadowActionResolutionAuthority,
+    adapter_invocation_required: bool,
+    recorded_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleStepObservationDto {
+    observation_digest: Digest,
+    resolution: LifecycleExploreShadowResolutionKind,
+    planned_action_count: u16,
+    authority: ShadowActionResolutionAuthority,
+    adapter_invocation_required: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleStepDto {
+    schema: &'static str,
+    change_id: ChangeId,
+    disposition: LifecycleExecutionDisposition,
+    phase: LifecyclePhase,
+    status: LifecycleStatus,
+    generation: u64,
+    state_digest: Digest,
+    invocation_id: Option<Digest>,
+    adapter_usage: needle_core::LifecycleUsage,
+    observation: Option<LifecycleStepObservationDto>,
+    observation_persistence: Option<LifecycleExploreShadowObservationPersistence>,
+    reuse: Option<needle_runtime::LifecycleExploreReuseOutcome>,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleAdapterRecoveryRecordDto {
+    recovery_digest: Digest,
+    source: &'static str,
+    recovered_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleAdapterInvocationDto {
+    invocation_id: Digest,
+    lifecycle_id: LifecycleId,
+    expected_state_digest: Digest,
+    phase: LifecyclePhase,
+    status: &'static str,
+    request_digest: Digest,
+    adapter_definition_digest: Digest,
+    started_unix_ms: u64,
+    completed_unix_ms: Option<u64>,
+    recovery: Option<LifecycleAdapterRecoveryRecordDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleAdapterInvocationResponseDto {
+    schema: &'static str,
+    change_id: ChangeId,
+    invocation: Option<LifecycleAdapterInvocationDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleAdapterRecoveryResponseDto {
+    schema: &'static str,
+    created: bool,
+    change_id: ChangeId,
+    lifecycle: LifecycleSummaryDto,
+    invocation: LifecycleAdapterInvocationDto,
+}
+
 pub(super) fn routes(router: Router<AppState>) -> Router<AppState> {
     router
-        .route("/api/v1/lifecycles", get(list_lifecycles))
+        .route(
+            "/api/v1/lifecycles",
+            get(list_lifecycles)
+                .post(super::lifecycle_start::create_lifecycle)
+                .layer(DefaultBodyLimit::max(super::lifecycle_start::MAX_CREATE_BODY_BYTES)),
+        )
+        .route(
+            "/api/v1/lifecycles/preflight",
+            get(super::lifecycle_start::preflight_lifecycle_start),
+        )
         .route("/api/v1/lifecycles/{id}", get(get_lifecycle))
         .route("/api/v1/lifecycles/{id}/events", get(get_lifecycle_events))
+        .route(
+            "/api/v1/lifecycles/{id}/action-observations",
+            get(get_lifecycle_action_observations),
+        )
+        .route(
+            "/api/v1/lifecycles/{id}/step",
+            post(step_lifecycle).layer(DefaultBodyLimit::max(MAX_STEP_BODY_BYTES)),
+        )
+        .route(
+            "/api/v1/lifecycles/{id}/apply",
+            post(super::lifecycle_apply::apply_lifecycle)
+                .layer(DefaultBodyLimit::max(super::lifecycle_apply::MAX_APPLY_BODY_BYTES)),
+        )
+        .route("/api/v1/lifecycles/{id}/adapter-invocation", get(get_lifecycle_adapter_invocation))
+        .route(
+            "/api/v1/lifecycles/{id}/adapter-invocation/recover",
+            post(recover_lifecycle_adapter_invocation)
+                .layer(DefaultBodyLimit::max(MAX_ADAPTER_RECOVERY_BODY_BYTES)),
+        )
 }
 
 async fn list_lifecycles(
@@ -306,9 +468,311 @@ async fn get_lifecycle_events(State(state): State<AppState>, Path(id): Path<Stri
     }
 }
 
+async fn get_lifecycle_action_observations(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<LimitQuery>, QueryRejection>,
+) -> Response {
+    let change_id = match parse_change_id(&id) {
+        Ok(change_id) => change_id,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let limit = match query {
+        Ok(Query(query)) => match bounded_action_observation_limit(query.limit) {
+            Ok(limit) => limit,
+            Err(rejection) => return rejection.into_response(),
+        },
+        Err(_) => {
+            return lifecycle_error(StatusCode::BAD_REQUEST, "invalid_query", "query is invalid");
+        }
+    };
+    let projection = match state.store.replay_lifecycle(&change_id) {
+        Ok(projection) => projection,
+        Err(error) => return store_error(error),
+    };
+    match state.store.list_lifecycle_explore_action_observations(projection.lifecycle.id, limit) {
+        Ok(records) => {
+            let items = records.into_iter().map(action_observation_dto).collect::<Vec<_>>();
+            Json(json!({
+                "schema": ACTION_OBSERVATIONS_SCHEMA,
+                "change_id": change_id,
+                "items": items,
+                "limit": limit,
+            }))
+            .into_response()
+        }
+        Err(error) => store_error(error),
+    }
+}
+
+async fn get_lifecycle_adapter_invocation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let change_id = match parse_change_id(&id) {
+        Ok(change_id) => change_id,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let projection = match state.store.replay_lifecycle(&change_id) {
+        Ok(projection) => projection,
+        Err(error) => return store_error(error),
+    };
+    let invocation = match state.store.latest_lifecycle_adapter_invocation(projection.lifecycle.id)
+    {
+        Ok(invocation) => invocation.map(adapter_invocation_dto),
+        Err(error) => return store_error(error),
+    };
+    Json(LifecycleAdapterInvocationResponseDto {
+        schema: ADAPTER_INVOCATION_SCHEMA,
+        change_id,
+        invocation,
+    })
+    .into_response()
+}
+
+async fn recover_lifecycle_adapter_invocation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<LifecycleAdapterRecoveryBody>, JsonRejection>,
+) -> Response {
+    let change_id = match parse_change_id(&id) {
+        Ok(change_id) => change_id,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return lifecycle_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "request body is invalid",
+            );
+        }
+    };
+    if !body.confirm_provider_stopped {
+        return lifecycle_error(
+            StatusCode::BAD_REQUEST,
+            "confirmation_required",
+            "recovery requires confirmation that the provider invocation has stopped",
+        );
+    }
+    let guard = match state.lifecycle_step_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return lifecycle_error(
+                StatusCode::CONFLICT,
+                "lifecycle_step_busy",
+                "another lifecycle step is currently executing",
+            );
+        }
+    };
+    let store = state.store.clone();
+    let change_id_for_recovery = change_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let recovered = store.abort_lifecycle_adapter_invocation(
+            &change_id_for_recovery,
+            body.expected_state_digest,
+            body.invocation_id,
+            LifecycleAdapterRecoverySource::WebUser,
+        )?;
+        let invocation = store
+            .latest_lifecycle_adapter_invocation(recovered.projection.lifecycle.id)?
+            .ok_or_else(|| {
+                StoreError::LifecycleAdapterInvocationCorruption(
+                    "recovered invocation is unavailable".to_owned(),
+                )
+            })?;
+        Ok::<_, StoreError>((recovered, invocation))
+    })
+    .await;
+    let (recovered, invocation) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return store_error(error),
+        Err(_) => {
+            return lifecycle_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "adapter_recovery_join_failed",
+                "lifecycle adapter recovery task failed",
+            );
+        }
+    };
+    let status = if recovered.created { StatusCode::CREATED } else { StatusCode::OK };
+    (
+        status,
+        Json(LifecycleAdapterRecoveryResponseDto {
+            schema: ADAPTER_RECOVERY_SCHEMA,
+            created: recovered.created,
+            change_id,
+            lifecycle: projection_summary_dto(&recovered.projection),
+            invocation: adapter_invocation_dto(invocation),
+        }),
+    )
+        .into_response()
+}
+
+async fn step_lifecycle(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<LifecycleStepBody>, JsonRejection>,
+) -> Response {
+    let change_id = match parse_change_id(&id) {
+        Ok(change_id) => change_id,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return lifecycle_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "request body is invalid",
+            );
+        }
+    };
+    let projection = match prepare_lifecycle_step(&state, &change_id, body.expected_state_digest) {
+        Ok(projection) => projection,
+        Err(error) => return error.into_response(),
+    };
+    let invocation_id = lifecycle_adapter_invocation_id(&projection);
+    match state.store.lifecycle_adapter_invocation_state(invocation_id) {
+        Ok(Some(LifecycleAdapterInvocationState::InProgress { .. })) => {
+            return lifecycle_error(
+                StatusCode::CONFLICT,
+                "adapter_in_progress",
+                "the lifecycle adapter invocation is already in progress",
+            );
+        }
+        Ok(Some(LifecycleAdapterInvocationState::Aborted { .. })) => {
+            return lifecycle_error(
+                StatusCode::CONFLICT,
+                "adapter_aborted",
+                "the lifecycle adapter invocation was explicitly aborted",
+            );
+        }
+        Ok(Some(LifecycleAdapterInvocationState::Completed { .. })) | Ok(None) => {}
+        Err(error) => return store_error(error),
+    }
+    let guard = match state.lifecycle_step_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return lifecycle_error(
+                StatusCode::CONFLICT,
+                "lifecycle_step_busy",
+                "another lifecycle step is currently executing",
+            );
+        }
+    };
+    if let Err(error) = prepare_lifecycle_step(&state, &change_id, body.expected_state_digest) {
+        return error.into_response();
+    }
+    let host = state.lifecycle_step_host.clone();
+    let change_id_for_host = change_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        host.step(&change_id_for_host)
+    })
+    .await;
+    let outcome = match result {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => {
+            return lifecycle_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lifecycle_execution_failed",
+                "lifecycle execution failed",
+            );
+        }
+        Err(_) => {
+            return lifecycle_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lifecycle_execution_join_failed",
+                "lifecycle execution task failed",
+            );
+        }
+    };
+    let lifecycle = outcome.projection.lifecycle;
+    let observation =
+        outcome.explore_action_observation.map(|observation| LifecycleStepObservationDto {
+            observation_digest: observation.definition_digest,
+            resolution: observation.resolution,
+            planned_action_count: observation.planned_action_count,
+            authority: observation.authority,
+            adapter_invocation_required: observation.adapter_invocation_required,
+        });
+    Json(LifecycleStepDto {
+        schema: STEP_SCHEMA,
+        change_id,
+        disposition: outcome.disposition,
+        phase: lifecycle.phase,
+        status: lifecycle.status,
+        generation: lifecycle.generation,
+        state_digest: outcome.projection.state_digest,
+        invocation_id: outcome.invocation_id,
+        adapter_usage: outcome.adapter_usage,
+        observation,
+        observation_persistence: outcome.explore_action_observation_persistence,
+        reuse: outcome.explore_reuse,
+    })
+    .into_response()
+}
+
+fn prepare_lifecycle_step(
+    state: &AppState,
+    change_id: &ChangeId,
+    expected_state_digest: Digest,
+) -> Result<LifecycleProjection, PrepareLifecycleStepError> {
+    let projection =
+        state.store.replay_lifecycle(change_id).map_err(PrepareLifecycleStepError::Store)?;
+    if projection.state_digest != expected_state_digest {
+        return Err(PrepareLifecycleStepError::Rejection(LifecycleRejection {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: "stale_state",
+            message: "lifecycle state changed",
+        }));
+    }
+    let planned = match projection.lifecycle.phase {
+        LifecyclePhase::Explore => projection.lifecycle.spec.explore_action_plan.is_some(),
+        LifecyclePhase::Implement
+        | LifecyclePhase::Test
+        | LifecyclePhase::Review
+        | LifecyclePhase::Verify => projection
+            .lifecycle
+            .spec
+            .action_phase_plans
+            .as_ref()
+            .and_then(|plans| plans.for_phase(projection.lifecycle.phase))
+            .is_some(),
+        LifecyclePhase::Apply => false,
+    };
+    let runnable_status = matches!(
+        projection.lifecycle.status,
+        LifecycleStatus::Active | LifecycleStatus::RepairReserved
+    );
+    if !planned || !runnable_status {
+        return Err(PrepareLifecycleStepError::Rejection(LifecycleRejection {
+            status: StatusCode::CONFLICT,
+            code: "lifecycle_step_unavailable",
+            message: "lifecycle is not in a runnable planned phase",
+        }));
+    }
+    Ok(projection)
+}
+
 fn bounded_limit(limit: Option<usize>) -> Result<usize, LifecycleRejection> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 || limit > MAX_LIFECYCLE_LIST_LIMIT {
+        return Err(LifecycleRejection {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_limit",
+            message: "limit must be between 1 and 100",
+        });
+    }
+    Ok(limit)
+}
+
+fn bounded_action_observation_limit(limit: Option<usize>) -> Result<usize, LifecycleRejection> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    if limit == 0 || limit > MAX_LIFECYCLE_EXPLORE_OBSERVATION_LIST_LIMIT {
         return Err(LifecycleRejection {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_limit",
@@ -340,6 +804,135 @@ fn summary_dto(record: LifecycleSummaryRecord) -> LifecycleSummaryDto {
         terminal_reason: record.terminal_reason.as_ref().map(reason_dto),
         created_unix_ms: record.created_unix_ms,
         updated_unix_ms: record.updated_unix_ms,
+    }
+}
+
+fn projection_summary_dto(projection: &LifecycleProjection) -> LifecycleSummaryDto {
+    let lifecycle = &projection.lifecycle;
+    LifecycleSummaryDto {
+        lifecycle_id: lifecycle.id,
+        change_id: lifecycle.change_id.clone(),
+        source_snapshot: lifecycle.source_snapshot,
+        phase: lifecycle.phase,
+        status: lifecycle.status,
+        state_digest: projection.state_digest,
+        generation: lifecycle.generation,
+        usage: usage_dto(&lifecycle.usage),
+        terminal_outcome: lifecycle.terminal_outcome,
+        terminal_reason: lifecycle.terminal_reason.as_ref().map(reason_dto),
+        created_unix_ms: lifecycle.created_unix_ms,
+        updated_unix_ms: lifecycle.updated_unix_ms,
+    }
+}
+
+fn adapter_invocation_dto(
+    record: LifecycleAdapterInvocationRecord,
+) -> LifecycleAdapterInvocationDto {
+    let (
+        status,
+        request_digest,
+        adapter_definition_digest,
+        started_unix_ms,
+        completed_unix_ms,
+        recovery,
+    ) = match record.state {
+        LifecycleAdapterInvocationState::InProgress {
+            request_digest,
+            adapter_definition_digest,
+            started_unix_ms,
+        } => {
+            ("in_progress", request_digest, adapter_definition_digest, started_unix_ms, None, None)
+        }
+        LifecycleAdapterInvocationState::Completed {
+            request_digest,
+            adapter_definition_digest,
+            started_unix_ms,
+            completed_unix_ms,
+            ..
+        } => (
+            "completed",
+            request_digest,
+            adapter_definition_digest,
+            started_unix_ms,
+            Some(completed_unix_ms),
+            None,
+        ),
+        LifecycleAdapterInvocationState::Aborted {
+            request_digest,
+            adapter_definition_digest,
+            started_unix_ms,
+            recovery,
+        } => (
+            "aborted",
+            request_digest,
+            adapter_definition_digest,
+            started_unix_ms,
+            None,
+            Some(adapter_recovery_record_dto(&recovery)),
+        ),
+    };
+    LifecycleAdapterInvocationDto {
+        invocation_id: record.invocation_id,
+        lifecycle_id: record.lifecycle_id,
+        expected_state_digest: record.expected_state_digest,
+        phase: record.phase,
+        status,
+        request_digest,
+        adapter_definition_digest,
+        started_unix_ms,
+        completed_unix_ms,
+        recovery,
+    }
+}
+
+fn adapter_recovery_record_dto(
+    recovery: &LifecycleAdapterRecoveryRecord,
+) -> LifecycleAdapterRecoveryRecordDto {
+    LifecycleAdapterRecoveryRecordDto {
+        recovery_digest: recovery.recovery_digest,
+        source: recovery.source.as_str(),
+        recovered_unix_ms: recovery.recovered_unix_ms,
+    }
+}
+
+fn action_observation_dto(
+    record: LifecycleExploreShadowObservationRecord,
+) -> LifecycleActionObservationDto {
+    let observation = record.observation;
+    let actions = observation
+        .actions
+        .into_iter()
+        .map(|action| LifecycleActionResolutionDto {
+            request: action.request.digest(),
+            action_contract: action.action_contract,
+            predicate: action.predicate,
+            resolution: action.resolution,
+            artifacts: action.artifacts.into_iter().map(|artifact| artifact.digest()).collect(),
+            validation_certificates: action
+                .validation_certificates
+                .into_iter()
+                .map(|certificate| certificate.digest())
+                .collect(),
+            selected_plan: action.selected_plan.0,
+            sufficiency_certificate: action
+                .sufficiency_certificate
+                .map(|certificate| certificate.0),
+            covered_mask: action.covered_mask,
+            missing_mask: action.missing_mask,
+            definition_digest: action.definition_digest,
+        })
+        .collect();
+    LifecycleActionObservationDto {
+        observation_digest: observation.definition_digest,
+        lifecycle_id: observation.lifecycle,
+        expected_state_digest: observation.expected_state_digest,
+        plan_definition_digest: observation.plan_definition_digest,
+        planned_action_count: observation.planned_action_count,
+        resolution: observation.resolution,
+        actions,
+        authority: observation.authority,
+        adapter_invocation_required: observation.adapter_invocation_required,
+        recorded_unix_ms: record.recorded_unix_ms,
     }
 }
 
@@ -398,6 +991,7 @@ fn detail_dto(
                 executed: result.executed,
                 passed: result.passed,
                 evidence_id: result.evidence_id.clone(),
+                action_evidence_artifact: result.action_evidence_artifact,
                 failure_code: result.failure_code.clone(),
             })
             .collect(),
@@ -449,6 +1043,7 @@ fn detail_dto(
         },
         usage: usage_dto(&lifecycle.usage),
         artifacts,
+        explore_reuse: lifecycle.explore_reuse,
         repair_reserved: lifecycle.repair_reserved,
         repair_consumed: lifecycle.repair_consumed,
         terminal_outcome: lifecycle.terminal_outcome,
@@ -518,8 +1113,14 @@ fn event_action_dto(kind: &LifecycleEventKind) -> LifecycleEventActionDto {
             needle_core::LifecycleTransition::CompleteExplore { .. } => {
                 ("complete_explore", None, None)
             }
+            needle_core::LifecycleTransition::CompleteExploreFromReuse { .. } => {
+                ("complete_explore_from_reuse", None, None)
+            }
             needle_core::LifecycleTransition::CompleteImplement { .. } => {
                 ("complete_implement", None, None)
+            }
+            needle_core::LifecycleTransition::BindTestPlans { .. } => {
+                ("bind_test_plans", None, None)
             }
             needle_core::LifecycleTransition::CompleteTest { .. } => ("complete_test", None, None),
             needle_core::LifecycleTransition::CompleteReview { .. } => {
@@ -550,16 +1151,28 @@ fn store_error(error: StoreError) -> Response {
         StoreError::LifecycleNotFound(_) => {
             lifecycle_error(StatusCode::NOT_FOUND, "not_found", "lifecycle was not found")
         }
-        StoreError::LifecycleQuery(_) => {
+        StoreError::LifecycleQuery(_) | StoreError::LifecycleExploreObservationQuery(_) => {
             lifecycle_error(StatusCode::BAD_REQUEST, "invalid_limit", "lifecycle query is invalid")
         }
-        StoreError::LifecycleCorruption(_) | StoreError::Lifecycle(_) | StoreError::Json(_) => {
-            lifecycle_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "lifecycle_corruption",
-                "stored lifecycle data is corrupt",
-            )
-        }
+        StoreError::LifecycleAdapterInvocationValidation(_) => lifecycle_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_adapter_invocation",
+            "lifecycle adapter invocation is invalid",
+        ),
+        StoreError::LifecycleAdapterInvocationConflict(_) => lifecycle_error(
+            StatusCode::CONFLICT,
+            "adapter_invocation_conflict",
+            "lifecycle adapter invocation conflicts with durable state",
+        ),
+        StoreError::LifecycleCorruption(_)
+        | StoreError::LifecycleExploreObservationCorruption(_)
+        | StoreError::LifecycleAdapterInvocationCorruption(_)
+        | StoreError::Lifecycle(_)
+        | StoreError::Json(_) => lifecycle_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "lifecycle_corruption",
+            "stored lifecycle data is corrupt",
+        ),
         _ => lifecycle_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "storage_error",

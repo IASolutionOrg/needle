@@ -56,6 +56,157 @@ export interface RoutePlan {
   nodes: PlanNode[]
 }
 
+export interface ActionContractSummary {
+  id: string
+  coverage:
+    | {
+        kind: "semantic_predicate"
+        predicate: "implementation-location" | "runtime-flow" | "focused-tests"
+        definition_digest: string
+      }
+    | {
+        kind: "partitioned"
+        declared_policy_authority_digest: string
+        scheme: {
+          id: string
+          kind: { kind: string; provider?: string }
+          key_scope: "manifest_local" | "lineage_stable" | "provider_stable"
+          key_schema: string
+          maximum_key_bytes: number
+          definition_digest: string
+        }
+        policy: {
+          id: string
+          manifest_validator: string
+          maximum_partitions: number
+          maximum_manifest_bytes: number
+          overlap_policy: "disjoint" | "validator_defined"
+          closure_policy: "open_allowed" | "closed_required"
+          definition_digest: string
+        }
+        adapter_definition_digest: string
+        fixed_mode: "shadow"
+      }
+  artifact_kind: string
+  output_contract: {
+    id: string
+    revision: number
+    schema: string
+    definition_digest: string
+  }
+  validator_definition_digest: string
+  effect_class:
+    | "pure-evidence"
+    | "derived-analysis"
+    | "transform-proposal"
+    | "execution-evidence"
+    | "external-read"
+    | "external-effect"
+  reuse_modes: Array<"exact" | "project" | "assemble" | "refresh" | "never">
+  default_dispatch_policy: {
+    completion: "reuse-allowed" | "exact-reuse-only" | "fresh-required"
+    evidence: "standard" | "independent-evidence-required"
+    prior_artifacts: "contract-defined" | "advisory-only" | "forbidden"
+    persistence: "persistent" | "ephemeral" | "no-store"
+  }
+  initial_mode: "disabled" | "shadow" | "advisory" | "authoritative"
+  definition_digests: {
+    semantic: string
+    validation: string
+    operational: string
+    complete: string
+  }
+}
+
+export interface ActionContractCatalog {
+  schema: "needle.action-contract-catalog/3"
+  status: "shadow_only"
+  items: ActionContractSummary[]
+  bounded: { limit: number }
+}
+
+export interface PartitionManifestSummary {
+  manifest: string
+  certificate: string
+  action_request: string
+  action_contract: string
+  output_contract: string
+  scheme: string
+  repository: string
+  closure: "open" | "closed"
+  entry_count: number
+  created_unix_ms: number
+}
+
+export interface PartitionManifestInspection {
+  schema: "needle.partition-manifest-inspection/1"
+  status: "shadow_only"
+  items: PartitionManifestSummary[]
+  bounded: { limit: number; maximum: number }
+}
+
+export type RefreshEconomicDecision =
+  | { selection: "refresh" }
+  | {
+      selection: "full_compute"
+      reason:
+        | "missing_cost_evidence"
+        | "below_minimum_net_value"
+        | "missing_latency_evidence"
+        | "refresh_latency_budget_exceeded"
+    }
+
+export interface RefreshEconomicAssessment {
+  format_revision: number
+  definition_digest: string
+  request: string
+  action_contract: string
+  candidate_definition_digest: string
+  operator_definition_digest: string
+  execution_scope_digest: string
+  policy: {
+    format_revision: number
+    action_operational_policy_digest: string
+    refresh_policy_definition_digest: string
+    minimum_expected_net_microusd: string
+    maximum_refresh_latency_micros: number | null
+    definition_digest: string
+  }
+  evidence: {
+    format_revision: number
+    request: string
+    action_contract: string
+    candidate_definition_digest: string
+    operator_definition_digest: string
+    execution_scope_digest: string
+    basis:
+      | "paired_observed"
+      | "benchmark_derived"
+      | "historical_estimate"
+      | "configured_static"
+    evidence_digest: string
+    pricing_revision: string | null
+    estimated_fresh_total_microusd: string
+    estimated_refresh_total_microusd: string
+    estimated_refresh_latency_micros: number | null
+    definition_digest: string
+  } | null
+  expected_net_microusd: string | null
+  decision: RefreshEconomicDecision
+  authority: "shadow"
+}
+
+export interface RefreshEconomicInspection {
+  schema: "needle.refresh-economic-inspection/1"
+  status: "shadow_audit_only"
+  items: Array<{
+    assessment: RefreshEconomicAssessment
+    selected_refresh_attempt: string | null
+    recorded_unix_ms: number
+  }>
+  bounded: { limit: number; maximum: number }
+}
+
 export interface SettingsConfig {
   worker_model: string
   worker_reasoning: string
@@ -168,6 +319,9 @@ export interface ControlPlane {
   changes: ChangeWorkflow[]
   semantic: {
     format_revision: number
+    action_contracts?: ActionContractCatalog
+    partition_manifests?: PartitionManifestInspection
+    refresh_economics?: RefreshEconomicInspection
     needs: SemanticNeed[]
     subjects: SemanticSubject[]
     capabilities: CapabilityClass[]
@@ -190,8 +344,7 @@ export interface ControlPlane {
 }
 
 export type ActivationScope =
-  | { kind: "global" }
-  | { kind: "repository"; repository_root: string }
+  { kind: "global" } | { kind: "repository"; repository_root: string }
 
 export interface ActivationRecord {
   scope: ActivationScope
@@ -220,11 +373,7 @@ export interface DesktopSkillStatus {
 
 export type PatchOperation = "create" | "update" | "delete"
 export type VerificationStatus =
-  | "not_requested"
-  | "verified"
-  | "rejected"
-  | "repairable"
-  | "inconclusive"
+  "not_requested" | "verified" | "rejected" | "repairable" | "inconclusive"
 
 export interface ChangedFile {
   path: string
@@ -233,7 +382,7 @@ export interface ChangedFile {
 
 export interface ChangeAttempt {
   role: "patcher" | "verifier"
-  patch_id: string
+  patch_id: string | null
   attempt: Record<string, unknown>
   usage: {
     input_tokens?: number | null
@@ -338,6 +487,273 @@ export interface ChangeDetail {
   apply_allowed: boolean
 }
 
+export type LifecyclePhase =
+  "explore" | "implement" | "test" | "review" | "verify" | "apply"
+
+export type LifecycleStatus =
+  | "active"
+  | "repair_reserved"
+  | "awaiting_approval"
+  | "approved"
+  | "applying"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "inconclusive"
+  | "rolled_back"
+
+export interface LifecycleStartProfile {
+  profile_id: string
+  role: "explorer" | "implementer" | "test_runner" | "reviewer" | "verifier"
+  revision: number
+  definition_digest: string
+}
+
+export interface LifecycleStartNeed {
+  need_id: string
+  route: string
+  required_predicates: string[]
+  need_definition_digest: string
+  action_plan_definition_digest: string
+}
+
+export interface LifecycleStartTestPlan {
+  artifact_id: string
+  plan_digest: string
+  certificate_digest: string
+  issued_unix_ms: number
+}
+
+export interface LifecycleBudget {
+  max_worker_turns: number
+  max_output_tokens: number
+  max_cost_microusd: number
+  max_concurrent_workers: number
+}
+
+export interface LifecycleStartPreflight {
+  schema: "needle.lifecycle-start-preflight/1"
+  repository_id: string
+  source_snapshot: string
+  watcher_uncertain: boolean
+  eligible: boolean
+  blockers: string[]
+  profiles: LifecycleStartProfile[]
+  needs: LifecycleStartNeed[]
+  test_plans: LifecycleStartTestPlan[]
+  max_selected_test_plans: number
+  default_budget: LifecycleBudget
+}
+
+export interface LifecycleProfileSelection {
+  profile_id: string
+  definition_digest: string
+}
+
+export interface LifecycleCreateInput {
+  operation_id: string
+  expected_source_snapshot: string
+  need_id: string
+  change: {
+    task: string
+    acceptance_criteria: string[]
+    allowed_paths: Array<{ path: string; scope: "exact" | "subtree" }>
+    artifact_ids: string[]
+    claim_ids: string[]
+    constraints: string[]
+  }
+  profiles: {
+    explore: LifecycleProfileSelection
+    implement: LifecycleProfileSelection
+    test: LifecycleProfileSelection
+    review: LifecycleProfileSelection
+    verify: LifecycleProfileSelection
+  }
+  budget: Omit<LifecycleBudget, "max_concurrent_workers">
+  test_plan_certificates: string[]
+}
+
+export interface LifecycleCreateResponse {
+  schema: "needle.lifecycle-create/1"
+  created: boolean
+  change_id: string
+  lifecycle_id: string
+  phase: LifecyclePhase
+  status: LifecycleStatus
+  generation: number
+  state_digest: string
+  source_snapshot: string
+  action_plan_definition_digest: string
+}
+
+export interface LifecycleUsage {
+  worker_turns: number
+  output_tokens: number
+  cost_microusd: number
+}
+
+export interface LifecycleExploreReuseAuthority {
+  capability_class: string
+  capability_definition_digest: string
+  evidence: string
+  decision: string
+}
+
+export interface LifecycleExploreReuseCompletion {
+  authority: LifecycleExploreReuseAuthority
+  action_request: string
+  origin_request: string
+  artifact: string
+  validation_certificate: string
+  selected_plan: string
+  sufficiency_certificate: string
+  repository_id: string
+  source_snapshot: string
+  resolution_definition_digest: string
+}
+
+export type LifecycleExploreReuseOutcome =
+  | {
+      kind: "resolver_authorized"
+      authority: LifecycleExploreReuseAuthority
+    }
+  | {
+      kind: "consumed"
+      completion: LifecycleExploreReuseCompletion
+    }
+
+export interface LifecycleSummary {
+  lifecycle_id: string
+  change_id: string
+  source_snapshot: string
+  phase: LifecyclePhase
+  status: LifecycleStatus
+  state_digest: string
+  generation: number
+  usage: LifecycleUsage
+  terminal_outcome: string | null
+  terminal_reason: { code: string; detail_digest: string } | null
+  created_unix_ms: number
+  updated_unix_ms: number
+}
+
+export interface LifecycleDetail extends LifecycleSummary {
+  worker_depth_limit: number
+  profiles: Array<{
+    phase: LifecyclePhase
+    profile_id: string
+    revision: number
+    definition_digest: string
+  }>
+  test_plans: Array<{ plan_digest: string; certificate_digest: string }>
+  budget: LifecycleBudget
+  artifacts: {
+    exploration: Array<{
+      kind: string
+      artifact_id: string
+      source_snapshot: string
+    }>
+    patch: { patch_id: string; revision: number } | null
+    tests: Array<{
+      plan_digest: string
+      certificate_digest: string
+      available: boolean
+      executed: boolean
+      passed: boolean
+      evidence_id: string | null
+      action_evidence_artifact: string | null
+      failure_code: string | null
+    }>
+    review: unknown | null
+    verification: unknown | null
+  }
+  explore_reuse: LifecycleExploreReuseCompletion | null
+  repair_reserved: boolean
+  repair_consumed: boolean
+  approval: unknown | null
+  apply_id: string | null
+  cleanup: unknown | null
+  recovery: unknown | null
+}
+
+export interface LifecycleStepResponse {
+  schema: "needle.lifecycle-step/1"
+  change_id: string
+  disposition: string
+  phase: LifecyclePhase
+  status: LifecycleStatus
+  generation: number
+  state_digest: string
+  invocation_id: string | null
+  adapter_usage: LifecycleUsage
+  observation: {
+    observation_digest: string
+    resolution: string
+    planned_action_count: number
+    authority: "shadow"
+    adapter_invocation_required: boolean
+  } | null
+  observation_persistence: string | null
+  reuse: LifecycleExploreReuseOutcome | null
+}
+
+export interface LifecycleApplyResponse {
+  schema: "needle.lifecycle-apply/1"
+  operation_id: string
+  change_id: string
+  phase: "apply"
+  status: LifecycleStatus
+  state_digest: string
+  artifact_id: string
+  validation_certificate_id: string
+  idempotent_replay: boolean
+  receipt: {
+    schema: string
+    id: string
+    operation_id: string
+    change_id: string
+    patch_id: string
+    expected_state_digest: string
+    source_before: string
+    source_after: string
+    applied_files_digest: string
+    applied_unix_ms: number
+  }
+}
+
+export interface LifecycleAdapterRecoveryRecord {
+  recovery_digest: string
+  source: "web_user"
+  recovered_unix_ms: number
+}
+
+export interface LifecycleAdapterInvocation {
+  invocation_id: string
+  lifecycle_id: string
+  expected_state_digest: string
+  phase: LifecyclePhase
+  status: "in_progress" | "completed" | "aborted"
+  request_digest: string
+  adapter_definition_digest: string
+  started_unix_ms: number
+  completed_unix_ms: number | null
+  recovery: LifecycleAdapterRecoveryRecord | null
+}
+
+export interface LifecycleAdapterInvocationResponse {
+  schema: "needle.lifecycle-adapter-invocation/1"
+  change_id: string
+  invocation: LifecycleAdapterInvocation | null
+}
+
+export interface LifecycleAdapterRecoveryResponse {
+  schema: "needle.lifecycle-adapter-recovery/1"
+  created: boolean
+  change_id: string
+  lifecycle: LifecycleSummary
+  invocation: LifecycleAdapterInvocation
+}
+
 export interface NeedStep {
   id: string
   ordinal: number
@@ -366,11 +782,7 @@ export interface NeedStep {
   artifacts: string[]
   proof: string | null
   delivery:
-    | "turn_start"
-    | "turn_steer"
-    | "already_satisfied"
-    | "native_fallback"
-    | null
+    "turn_start" | "turn_steer" | "already_satisfied" | "native_fallback" | null
   worker_avoided: boolean
   main_discovery_tainted: boolean
 }
@@ -409,10 +821,7 @@ export interface SemanticFacet {
 
 export interface SemanticObligation {
   id: string
-  predicate:
-    | "implementation-location"
-    | "runtime-flow"
-    | "focused-tests"
+  predicate: "implementation-location" | "runtime-flow" | "focused-tests"
   subject: string
   facets: SemanticFacet[]
 }
@@ -710,8 +1119,10 @@ async function roleProfileJson<T>(url: string, init?: RequestInit): Promise<T> {
   throw new RoleProfileApiError(
     response.status,
     body?.code ?? "request_failed",
-    body?.message ?? body?.error ?? `Role-profile request failed with ${response.status}`,
-    body,
+    body?.message ??
+      body?.error ??
+      `Role-profile request failed with ${response.status}`,
+    body
   )
 }
 
@@ -731,7 +1142,9 @@ function roleProfileHeaders(digest?: string) {
   }
 }
 
-function invalidateRoleProfileQueries(queryClient: ReturnType<typeof useQueryClient>) {
+function invalidateRoleProfileQueries(
+  queryClient: ReturnType<typeof useQueryClient>
+) {
   return Promise.all([
     queryClient.invalidateQueries({ queryKey: ["role-profiles"] }),
     queryClient.invalidateQueries({ queryKey: ["role-profile"] }),
@@ -741,9 +1154,12 @@ function invalidateRoleProfileQueries(queryClient: ReturnType<typeof useQueryCli
 
 function refreshAfterRoleProfileConflict(
   queryClient: ReturnType<typeof useQueryClient>,
-  error: unknown,
+  error: unknown
 ) {
-  if (error instanceof RoleProfileApiError && (error.status === 409 || error.status === 412)) {
+  if (
+    error instanceof RoleProfileApiError &&
+    (error.status === 409 || error.status === 412)
+  ) {
     return Promise.all([
       invalidateRoleProfileQueries(queryClient),
       queryClient.refetchQueries({ queryKey: ["role-profile"] }),
@@ -755,17 +1171,21 @@ function refreshAfterRoleProfileConflict(
 export function useRoleProfiles() {
   return useQuery({
     queryKey: ["role-profiles"],
-    queryFn: () => roleProfileJson<RoleProfileListResponse>("/api/v1/role-profiles"),
+    queryFn: () =>
+      roleProfileJson<RoleProfileListResponse>("/api/v1/role-profiles"),
   })
 }
 
-export function useRoleProfile(profileId: string | undefined, revision?: number) {
+export function useRoleProfile(
+  profileId: string | undefined,
+  revision?: number
+) {
   const query = revision == null ? "" : `?revision=${revision}`
   return useQuery({
     queryKey: ["role-profile", profileId, revision ?? "latest"],
     queryFn: () =>
       roleProfileJson<RoleProfileDetailResponse>(
-        `/api/v1/role-profiles/${encodeURIComponent(profileId ?? "")}${query}`,
+        `/api/v1/role-profiles/${encodeURIComponent(profileId ?? "")}${query}`
       ),
     enabled: Boolean(profileId),
   })
@@ -776,7 +1196,7 @@ export function useRoleProfileRevisions(profileId: string | undefined) {
     queryKey: ["role-profile", profileId, "revisions"],
     queryFn: () =>
       roleProfileJson<RoleProfileRevisionsResponse>(
-        `/api/v1/role-profiles/${encodeURIComponent(profileId ?? "")}/revisions`,
+        `/api/v1/role-profiles/${encodeURIComponent(profileId ?? "")}/revisions`
       ),
     enabled: Boolean(profileId),
   })
@@ -787,7 +1207,7 @@ export function useRoleProfileAudit(profileId: string | undefined) {
     queryKey: ["role-profile", profileId, "audit"],
     queryFn: () =>
       roleProfileJson<RoleProfileAuditResponse>(
-        `/api/v1/role-profiles/${encodeURIComponent(profileId ?? "")}/audit`,
+        `/api/v1/role-profiles/${encodeURIComponent(profileId ?? "")}/audit`
       ),
     enabled: Boolean(profileId),
   })
@@ -796,14 +1216,20 @@ export function useRoleProfileAudit(profileId: string | undefined) {
 export function useRoleProfilePreflight() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ profileId, input }: { profileId: string; input: RoleProfileDefinitionInput }) =>
+    mutationFn: ({
+      profileId,
+      input,
+    }: {
+      profileId: string
+      input: RoleProfileDefinitionInput
+    }) =>
       roleProfileJson<RoleProfilePreflightResponse>(
         `/api/v1/role-profiles/${encodeURIComponent(profileId)}/preflight`,
         {
           method: "POST",
           headers: roleProfileHeaders(),
           body: JSON.stringify(input),
-        },
+        }
       ),
     onError: (error) => refreshAfterRoleProfileConflict(queryClient, error),
   })
@@ -827,12 +1253,14 @@ export function useRoleProfileDraft() {
           method: "POST",
           headers: roleProfileHeaders(stateDigest),
           body: JSON.stringify(input),
-        },
+        }
       ),
     onSuccess: (_, variables) =>
       Promise.all([
         invalidateRoleProfileQueries(queryClient),
-        queryClient.invalidateQueries({ queryKey: ["role-profile", variables.profileId] }),
+        queryClient.invalidateQueries({
+          queryKey: ["role-profile", variables.profileId],
+        }),
       ]),
     onError: (error) => refreshAfterRoleProfileConflict(queryClient, error),
   })
@@ -857,13 +1285,19 @@ export function useRoleProfileActivate() {
         {
           method: "POST",
           headers: roleProfileHeaders(stateDigest),
-          body: JSON.stringify({ revision, definition_digest: definitionDigest, confirm: true }),
-        },
+          body: JSON.stringify({
+            revision,
+            definition_digest: definitionDigest,
+            confirm: true,
+          }),
+        }
       ),
     onSuccess: (_, variables) =>
       Promise.all([
         invalidateRoleProfileQueries(queryClient),
-        queryClient.invalidateQueries({ queryKey: ["role-profile", variables.profileId] }),
+        queryClient.invalidateQueries({
+          queryKey: ["role-profile", variables.profileId],
+        }),
       ]),
     onError: (error) => refreshAfterRoleProfileConflict(queryClient, error),
   })
@@ -890,12 +1324,14 @@ export function useRoleProfileDeactivate() {
             active_definition_digest: activeDefinitionDigest,
             confirm: true,
           }),
-        },
+        }
       ),
     onSuccess: (_, variables) =>
       Promise.all([
         invalidateRoleProfileQueries(queryClient),
-        queryClient.invalidateQueries({ queryKey: ["role-profile", variables.profileId] }),
+        queryClient.invalidateQueries({
+          queryKey: ["role-profile", variables.profileId],
+        }),
       ]),
     onError: (error) => refreshAfterRoleProfileConflict(queryClient, error),
   })
@@ -922,16 +1358,22 @@ export function useActivationToggle() {
         },
         body: JSON.stringify({
           enabled,
-          expected_state_digest: current?.activation.repository?.state_digest ?? null,
+          expected_state_digest:
+            current?.activation.repository?.state_digest ?? null,
         }),
       })
       if (!response.ok) {
-        const body = (await response.json().catch(() => null)) as { error?: string } | null
-        throw new Error(body?.error ?? `Activation request failed with ${response.status}`)
+        const body = (await response.json().catch(() => null)) as {
+          error?: string
+        } | null
+        throw new Error(
+          body?.error ?? `Activation request failed with ${response.status}`
+        )
       }
       return response.json() as Promise<ActivationStatus>
     },
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ["control-plane"] }),
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: ["control-plane"] }),
   })
 }
 
@@ -1187,6 +1629,206 @@ export function useProofReplay() {
   })
 }
 
+async function lifecycleJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, { credentials: "same-origin", ...init })
+  if (response.ok) return response.json() as Promise<T>
+  const body = (await response.json().catch(() => null)) as {
+    code?: string
+    message?: string
+  } | null
+  throw new Error(
+    body?.message ??
+      body?.code ??
+      `Lifecycle request failed with ${response.status}`
+  )
+}
+
+export function useLifecycleStartPreflight() {
+  return useQuery({
+    queryKey: ["lifecycles", "preflight"],
+    queryFn: () =>
+      lifecycleJson<LifecycleStartPreflight>("/api/v1/lifecycles/preflight"),
+  })
+}
+
+export function useCreateLifecycle() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: LifecycleCreateInput) =>
+      lifecycleJson<LifecycleCreateResponse>("/api/v1/lifecycles", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-csrf-token": csrfToken(),
+        },
+        body: JSON.stringify(input),
+      }),
+    onSuccess: async (created) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["lifecycles", "list"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["lifecycles", "detail", created.change_id],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["lifecycles", "preflight"],
+        }),
+      ])
+    },
+  })
+}
+
+export function useLifecycles() {
+  return useQuery({
+    queryKey: ["lifecycles", "list"],
+    queryFn: () =>
+      lifecycleJson<{
+        schema: "needle.lifecycle-list/1"
+        items: LifecycleSummary[]
+        limit: number
+      }>("/api/v1/lifecycles"),
+  })
+}
+
+export function useLifecycle(changeId: string | undefined) {
+  return useQuery({
+    queryKey: ["lifecycles", "detail", changeId],
+    queryFn: () =>
+      lifecycleJson<{
+        schema: "needle.lifecycle-detail/1"
+        lifecycle: LifecycleDetail
+      }>(`/api/v1/lifecycles/${encodeURIComponent(changeId ?? "")}`),
+    enabled: Boolean(changeId),
+  })
+}
+
+export function useLifecycleAdapterInvocation(changeId: string | undefined) {
+  return useQuery({
+    queryKey: ["lifecycles", "adapter-invocation", changeId],
+    queryFn: () =>
+      lifecycleJson<LifecycleAdapterInvocationResponse>(
+        `/api/v1/lifecycles/${encodeURIComponent(changeId ?? "")}/adapter-invocation`
+      ),
+    enabled: Boolean(changeId),
+  })
+}
+
+export function useStepLifecycle() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      changeId,
+      expectedStateDigest,
+    }: {
+      changeId: string
+      expectedStateDigest: string
+    }) =>
+      lifecycleJson<LifecycleStepResponse>(
+        `/api/v1/lifecycles/${encodeURIComponent(changeId)}/step`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-csrf-token": csrfToken(),
+          },
+          body: JSON.stringify({ expected_state_digest: expectedStateDigest }),
+        }
+      ),
+    onSuccess: async (_, variables) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["lifecycles", "list"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["lifecycles", "detail", variables.changeId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["lifecycles", "adapter-invocation", variables.changeId],
+        }),
+      ])
+    },
+    onError: async (_, variables) => {
+      await queryClient.invalidateQueries({
+        queryKey: ["lifecycles", "adapter-invocation", variables.changeId],
+      })
+    },
+  })
+}
+
+export function useApplyLifecycle() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      changeId,
+      expectedStateDigest,
+    }: {
+      changeId: string
+      expectedStateDigest: string
+    }) =>
+      lifecycleJson<LifecycleApplyResponse>(
+        `/api/v1/lifecycles/${encodeURIComponent(changeId)}/apply`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-csrf-token": csrfToken(),
+          },
+          body: JSON.stringify({
+            expected_state_digest: expectedStateDigest,
+            confirm: true,
+          }),
+        }
+      ),
+    onSuccess: async (_, variables) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["lifecycles", "list"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["lifecycles", "detail", variables.changeId],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["changes"] }),
+      ])
+    },
+  })
+}
+
+export function useRecoverLifecycleAdapterInvocation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      changeId,
+      invocationId,
+      expectedStateDigest,
+    }: {
+      changeId: string
+      invocationId: string
+      expectedStateDigest: string
+    }) =>
+      lifecycleJson<LifecycleAdapterRecoveryResponse>(
+        `/api/v1/lifecycles/${encodeURIComponent(changeId)}/adapter-invocation/recover`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-csrf-token": csrfToken(),
+          },
+          body: JSON.stringify({
+            invocation_id: invocationId,
+            expected_state_digest: expectedStateDigest,
+            confirm_provider_stopped: true,
+          }),
+        }
+      ),
+    onSuccess: async (_, variables) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["lifecycles", "list"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["lifecycles", "detail", variables.changeId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["lifecycles", "adapter-invocation", variables.changeId],
+        }),
+      ])
+    },
+  })
+}
+
 export function useChanges() {
   return useQuery({
     queryKey: ["changes"],
@@ -1198,7 +1840,9 @@ export function useChange(changeId: string | undefined) {
   return useQuery({
     queryKey: ["changes", changeId],
     queryFn: () =>
-      getJson<ChangeDetail>(`/api/v1/changes/${encodeURIComponent(changeId ?? "")}`),
+      getJson<ChangeDetail>(
+        `/api/v1/changes/${encodeURIComponent(changeId ?? "")}`
+      ),
     enabled: Boolean(changeId),
   })
 }

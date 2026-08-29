@@ -1,11 +1,18 @@
+use crate::store::LifecycleExploreReuseCommit;
 use crate::{LifecycleChangeContext, LifecycleProjection, RuntimeStore, StoreError};
 use needle_core::{
-    CanonicalHasher, ChangeId, DevelopmentLifecycle, Digest, LifecyclePhase, LifecycleReason,
-    LifecycleStatus, LifecycleTransition, LifecycleUsage, PatchId, RoleProfileProvenance,
-    VerificationArtifact, VerificationStatus,
+    CanonicalHasher, ChangeId, DevelopmentLifecycle, Digest, LifecycleExploreReuseAuthority,
+    LifecycleExploreReuseCompletion, LifecyclePhase, LifecycleReason, LifecycleStatus,
+    LifecycleTransition, LifecycleUsage, PatchId, RoleProfileProvenance, VerificationArtifact,
+    VerificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod action_resolution;
+mod semantic_resolver;
+pub use action_resolution::*;
+pub use semantic_resolver::*;
 
 pub const LIFECYCLE_ADAPTER_REQUEST_SCHEMA: &str = "needle.lifecycle-adapter-request/1";
 pub const LIFECYCLE_ADAPTER_OUTCOME_SCHEMA: &str = "needle.lifecycle-adapter-outcome/1";
@@ -135,6 +142,13 @@ pub enum LifecycleExecutionDisposition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LifecycleExploreReuseOutcome {
+    ResolverAuthorized { authority: LifecycleExploreReuseAuthority },
+    Consumed { completion: Box<LifecycleExploreReuseCompletion> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LifecycleExecutionOutcome {
     pub disposition: LifecycleExecutionDisposition,
@@ -144,6 +158,13 @@ pub struct LifecycleExecutionOutcome {
     pub adapter_usage: LifecycleUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<LifecycleAdapterCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explore_action_observation: Option<LifecycleExploreShadowObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explore_action_observation_persistence:
+        Option<LifecycleExploreShadowObservationPersistence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explore_reuse: Option<LifecycleExploreReuseOutcome>,
 }
 
 #[derive(Debug, Error)]
@@ -158,6 +179,7 @@ pub struct LifecycleExecutionKernel<'a> {
     store: &'a RuntimeStore,
     adapters: LifecyclePhaseAdapters<'a>,
     cancellation: &'a dyn LifecycleCancellation,
+    explore_action_resolver: &'a dyn LifecycleExploreActionResolver,
 }
 
 impl<'a> LifecycleExecutionKernel<'a> {
@@ -166,14 +188,34 @@ impl<'a> LifecycleExecutionKernel<'a> {
         adapters: LifecyclePhaseAdapters<'a>,
         cancellation: &'a dyn LifecycleCancellation,
     ) -> Self {
-        Self { store, adapters, cancellation }
+        Self {
+            store,
+            adapters,
+            cancellation,
+            explore_action_resolver: &NOOP_LIFECYCLE_EXPLORE_ACTION_RESOLVER,
+        }
+    }
+
+    pub fn new_with_explore_resolver(
+        store: &'a RuntimeStore,
+        adapters: LifecyclePhaseAdapters<'a>,
+        cancellation: &'a dyn LifecycleCancellation,
+        explore_action_resolver: &'a dyn LifecycleExploreActionResolver,
+    ) -> Self {
+        Self { store, adapters, cancellation, explore_action_resolver }
     }
 
     pub fn step(
         &self,
         change_id: &ChangeId,
     ) -> Result<LifecycleExecutionOutcome, LifecycleExecutionError> {
-        execute_step(self.store, &self.adapters, self.cancellation, change_id)
+        execute_step(
+            self.store,
+            &self.adapters,
+            self.cancellation,
+            self.explore_action_resolver,
+            change_id,
+        )
     }
 }
 
@@ -193,7 +235,33 @@ trait LifecycleKernelStore {
         expected_state_digest: Digest,
         transition: LifecycleTransition,
     ) -> Result<LifecycleProjection, StoreError>;
-    fn begin_repair(&self, change_id: &ChangeId, patch_id: PatchId) -> Result<(), StoreError>;
+    fn test_plan_candidates(
+        &self,
+        source_snapshot: Digest,
+    ) -> Result<Vec<crate::LifecycleStartTestPlanCandidate>, StoreError>;
+    fn bind_test_plans(
+        &self,
+        change_id: &ChangeId,
+        expected_state_digest: Digest,
+        worker: Option<needle_core::LifecycleWorkerCompletion>,
+        plans: Vec<needle_core::LifecycleResolvedTestPlan>,
+    ) -> Result<LifecycleProjection, StoreError>;
+    fn begin_repair(
+        &self,
+        lifecycle_change_id: &ChangeId,
+        action_change_id: &ChangeId,
+        patch_id: PatchId,
+    ) -> Result<(), StoreError>;
+    fn record_explore_action_observation(
+        &self,
+        observation: &LifecycleExploreShadowObservation,
+    ) -> Result<(), StoreError>;
+    fn try_complete_explore_from_reuse(
+        &self,
+        change_id: &ChangeId,
+        expected_state_digest: Digest,
+        summary: &crate::ShadowActionResolutionSummary,
+    ) -> Result<LifecycleExploreReuseCommit, StoreError>;
 }
 
 impl LifecycleKernelStore for RuntimeStore {
@@ -224,8 +292,46 @@ impl LifecycleKernelStore for RuntimeStore {
         self.parent_transition_lifecycle(change_id, expected_state_digest, transition)
     }
 
-    fn begin_repair(&self, change_id: &ChangeId, patch_id: PatchId) -> Result<(), StoreError> {
-        self.begin_change_repair(change_id, patch_id)
+    fn test_plan_candidates(
+        &self,
+        source_snapshot: Digest,
+    ) -> Result<Vec<crate::LifecycleStartTestPlanCandidate>, StoreError> {
+        self.lifecycle_start_test_plan_candidates(source_snapshot)
+    }
+
+    fn bind_test_plans(
+        &self,
+        change_id: &ChangeId,
+        expected_state_digest: Digest,
+        worker: Option<needle_core::LifecycleWorkerCompletion>,
+        plans: Vec<needle_core::LifecycleResolvedTestPlan>,
+    ) -> Result<LifecycleProjection, StoreError> {
+        self.bind_lifecycle_test_plans(change_id, expected_state_digest, worker, plans)
+    }
+
+    fn begin_repair(
+        &self,
+        lifecycle_change_id: &ChangeId,
+        action_change_id: &ChangeId,
+        patch_id: PatchId,
+    ) -> Result<(), StoreError> {
+        self.begin_linked_change_repair(lifecycle_change_id, action_change_id, patch_id)
+    }
+
+    fn record_explore_action_observation(
+        &self,
+        observation: &LifecycleExploreShadowObservation,
+    ) -> Result<(), StoreError> {
+        self.record_lifecycle_explore_action_observation(observation)
+    }
+
+    fn try_complete_explore_from_reuse(
+        &self,
+        change_id: &ChangeId,
+        expected_state_digest: Digest,
+        summary: &crate::ShadowActionResolutionSummary,
+    ) -> Result<LifecycleExploreReuseCommit, StoreError> {
+        self.try_complete_lifecycle_explore_from_reuse(change_id, expected_state_digest, summary)
     }
 }
 
@@ -233,6 +339,7 @@ fn execute_step<S: LifecycleKernelStore>(
     store: &S,
     adapters: &LifecyclePhaseAdapters<'_>,
     cancellation: &dyn LifecycleCancellation,
+    explore_action_resolver: &dyn LifecycleExploreActionResolver,
     change_id: &ChangeId,
 ) -> Result<LifecycleExecutionOutcome, LifecycleExecutionError> {
     let projection = store.replay(change_id)?;
@@ -262,6 +369,34 @@ fn execute_step<S: LifecycleKernelStore>(
     }
     if projection.lifecycle.status != LifecycleStatus::Active {
         return Ok(outcome(LifecycleExecutionDisposition::Terminal, projection));
+    }
+    if projection.lifecycle.phase == LifecyclePhase::Test
+        && projection.lifecycle.spec.test_plans.is_empty()
+        && projection.lifecycle.resolved_test_plans.is_empty()
+    {
+        let mut plans = store
+            .test_plan_candidates(projection.lifecycle.source_snapshot)?
+            .into_iter()
+            .map(|candidate| needle_core::LifecycleResolvedTestPlan {
+                artifact: candidate.artifact_id,
+                binding: candidate.binding,
+            })
+            .collect::<Vec<_>>();
+        plans.sort_by_key(|plan| (plan.binding.plan_digest(), plan.artifact));
+        if !plans.is_empty() {
+            return match store.bind_test_plans(change_id, expected_state_digest, None, plans) {
+                Ok(projection) => Ok(outcome(LifecycleExecutionDisposition::Advanced, projection)),
+                Err(error @ StoreError::LifecycleConflict(_)) => {
+                    let current = store.replay(change_id)?;
+                    if current.state_digest != expected_state_digest {
+                        Ok(outcome(LifecycleExecutionDisposition::StaleState, current))
+                    } else {
+                        Err(error.into())
+                    }
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
     }
     let remaining_budget = remaining_budget(&projection.lifecycle);
     if remaining_budget.worker_turns == 0
@@ -307,7 +442,7 @@ fn execute_step<S: LifecycleKernelStore>(
         .into());
     }
     let repair_verification = repair_verification(store, &projection)?;
-    let invocation_id = invocation_id(&projection);
+    let invocation_id = lifecycle_adapter_invocation_id(&projection);
     let request = LifecyclePhaseAdapterRequest {
         schema: LIFECYCLE_ADAPTER_REQUEST_SCHEMA.to_owned(),
         invocation_id,
@@ -334,10 +469,109 @@ fn execute_step<S: LifecycleKernelStore>(
             b"lifecycle adapter request exceeds the byte bound",
         );
     }
+    let explore_action_observation = if request.phase == LifecyclePhase::Explore {
+        request.lifecycle.spec.explore_action_plan.as_ref().map(|plan| {
+            let resolution = if plan.repository_id() != request.change.repository_id
+                || plan.source_snapshot() != Some(request.change.source_snapshot)
+            {
+                LifecycleExploreActionResolverOutcome::Invalid
+            } else {
+                explore_action_resolver.resolve(plan, &request.change)
+            };
+            LifecycleExploreShadowObservation::from_resolver_outcome(
+                request.lifecycle.id,
+                request.expected_state_digest,
+                plan,
+                resolution,
+            )
+        })
+    } else {
+        None
+    };
+    let explore_action_observation_persistence =
+        explore_action_observation.as_ref().map(|observation| {
+            match store.record_explore_action_observation(observation) {
+                Ok(()) => LifecycleExploreShadowObservationPersistence::Stored,
+                Err(_) => LifecycleExploreShadowObservationPersistence::Failed,
+            }
+        });
+    let mut explore_reuse = None;
+    if explore_action_observation_persistence
+        == Some(LifecycleExploreShadowObservationPersistence::Stored)
+        && let Some(observation) = explore_action_observation.as_ref()
+        && observation.resolution == LifecycleExploreShadowResolutionKind::Resolved
+        && observation.actions.len() == 1
+    {
+        if cancellation.is_cancelled(change_id, request.expected_state_digest) {
+            let mut outcome = commit_terminal(
+                store,
+                change_id,
+                projection,
+                LifecycleExecutionDisposition::Cancelled,
+                LifecycleTransition::Cancel {
+                    reason: fixed_reason(
+                        "cancelled",
+                        b"lifecycle cancelled before authoritative reuse consumption",
+                    ),
+                },
+                None,
+                LifecycleUsage::default(),
+                None,
+            )?;
+            outcome.explore_action_observation = explore_action_observation;
+            outcome.explore_action_observation_persistence = explore_action_observation_persistence;
+            return Ok(outcome);
+        }
+        match store.try_complete_explore_from_reuse(
+            change_id,
+            request.expected_state_digest,
+            &observation.actions[0],
+        ) {
+            Ok(LifecycleExploreReuseCommit::Ineligible) => {}
+            Ok(LifecycleExploreReuseCommit::ResolverAuthorized(authority)) => {
+                explore_reuse =
+                    Some(LifecycleExploreReuseOutcome::ResolverAuthorized { authority });
+            }
+            Ok(LifecycleExploreReuseCommit::Committed { projection, completion }) => {
+                return Ok(LifecycleExecutionOutcome {
+                    disposition: LifecycleExecutionDisposition::Advanced,
+                    projection: *projection,
+                    invocation_id: None,
+                    adapter_usage: LifecycleUsage::default(),
+                    cleanup: None,
+                    explore_action_observation,
+                    explore_action_observation_persistence,
+                    explore_reuse: Some(LifecycleExploreReuseOutcome::Consumed { completion }),
+                });
+            }
+            Err(error @ StoreError::LifecycleConflict(_)) => {
+                let current = store.replay(change_id)?;
+                if current.state_digest != request.expected_state_digest {
+                    return Ok(LifecycleExecutionOutcome {
+                        disposition: LifecycleExecutionDisposition::StaleState,
+                        projection: current,
+                        invocation_id: None,
+                        adapter_usage: LifecycleUsage::default(),
+                        cleanup: None,
+                        explore_action_observation,
+                        explore_action_observation_persistence,
+                        explore_reuse: None,
+                    });
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     let adapter =
         adapters.for_phase(request.phase).expect("active worker phases have an injected adapter");
     let adapter_outcome = adapter.invoke(&request);
-    finish_adapter_step(store, cancellation, change_id, projection, request, adapter_outcome)
+    let mut outcome =
+        finish_adapter_step(store, cancellation, change_id, projection, request, adapter_outcome)?;
+    outcome.explore_action_observation = explore_action_observation;
+    outcome.explore_action_observation_persistence = explore_action_observation_persistence;
+    outcome.explore_reuse = explore_reuse;
+    Ok(outcome)
 }
 
 fn resume_repair<S: LifecycleKernelStore>(
@@ -357,7 +591,11 @@ fn resume_repair<S: LifecycleKernelStore>(
         .as_ref()
         .map(|patch| patch.patch_id)
         .ok_or_else(|| StoreError::LifecycleCorruption(format!("{change_id}: repair patch")))?;
-    match store.begin_repair(change_id, patch_id) {
+    let change = store.change_context(change_id)?.ok_or_else(|| {
+        StoreError::LifecycleCorruption(format!("{change_id}: immutable change request"))
+    })?;
+    let action_change_id = ChangeId::from_digest(change.request_digest);
+    match store.begin_repair(change_id, &action_change_id, patch_id) {
         Ok(()) => {
             let resumed = store.replay(change_id)?;
             Ok(outcome(LifecycleExecutionDisposition::RepairResumed, resumed))
@@ -478,7 +716,13 @@ fn commit_completion<S: LifecycleKernelStore>(
     usage: LifecycleUsage,
     cleanup: LifecycleAdapterCleanup,
 ) -> Result<LifecycleExecutionOutcome, LifecycleExecutionError> {
-    match store.parent_transition(change_id, projection.state_digest, transition) {
+    let committed = match transition {
+        LifecycleTransition::BindTestPlans { worker, plans } => {
+            store.bind_test_plans(change_id, projection.state_digest, worker, plans)
+        }
+        transition => store.parent_transition(change_id, projection.state_digest, transition),
+    };
+    match committed {
         Ok(next) => {
             let disposition = if next.lifecycle.status.terminal() {
                 LifecycleExecutionDisposition::Terminal
@@ -495,6 +739,9 @@ fn commit_completion<S: LifecycleKernelStore>(
                 invocation_id: Some(invocation_id),
                 adapter_usage: usage,
                 cleanup: Some(cleanup),
+                explore_action_observation: None,
+                explore_action_observation_persistence: None,
+                explore_reuse: None,
             })
         }
         Err(error @ (StoreError::Lifecycle(_) | StoreError::LifecycleConflict(_))) => {
@@ -506,6 +753,9 @@ fn commit_completion<S: LifecycleKernelStore>(
                     invocation_id: Some(invocation_id),
                     adapter_usage: usage,
                     cleanup: Some(cleanup),
+                    explore_action_observation: None,
+                    explore_action_observation_persistence: None,
+                    explore_reuse: None,
                 });
             }
             invalid_output(
@@ -561,6 +811,9 @@ fn commit_terminal<S: LifecycleKernelStore>(
             invocation_id,
             adapter_usage: usage,
             cleanup,
+            explore_action_observation: None,
+            explore_action_observation_persistence: None,
+            explore_reuse: None,
         }),
         Err(error @ StoreError::LifecycleConflict(_)) => {
             let current = store.replay(change_id)?;
@@ -571,6 +824,9 @@ fn commit_terminal<S: LifecycleKernelStore>(
                     invocation_id,
                     adapter_usage: usage,
                     cleanup,
+                    explore_action_observation: None,
+                    explore_action_observation_persistence: None,
+                    explore_reuse: None,
                 })
             } else {
                 Err(error.into())
@@ -619,6 +875,7 @@ fn completion_matches(
         (request.phase, transition),
         (LifecyclePhase::Explore, LifecycleTransition::CompleteExplore { .. })
             | (LifecyclePhase::Implement, LifecycleTransition::CompleteImplement { .. })
+            | (LifecyclePhase::Test, LifecycleTransition::BindTestPlans { worker: Some(_), .. })
             | (LifecyclePhase::Test, LifecycleTransition::CompleteTest { .. })
             | (LifecyclePhase::Review, LifecycleTransition::CompleteReview { .. })
             | (LifecyclePhase::Verify, LifecycleTransition::CompleteVerify { .. })
@@ -667,14 +924,20 @@ fn repair_verification<S: LifecycleKernelStore>(
     if !projection.lifecycle.repair_consumed {
         return Ok(None);
     }
-    let verification =
-        store.latest_verification(&projection.lifecycle.change_id)?.ok_or_else(|| {
-            StoreError::LifecycleCorruption(format!(
-                "{}: consumed repair has no verification artifact",
-                projection.lifecycle.change_id
-            ))
-        })?;
-    if verification.change_id != projection.lifecycle.change_id
+    let change = store.change_context(&projection.lifecycle.change_id)?.ok_or_else(|| {
+        StoreError::LifecycleCorruption(format!(
+            "{}: consumed repair has no immutable change request",
+            projection.lifecycle.change_id
+        ))
+    })?;
+    let action_change_id = ChangeId::from_digest(change.request_digest);
+    let verification = store.latest_verification(&action_change_id)?.ok_or_else(|| {
+        StoreError::LifecycleCorruption(format!(
+            "{}: consumed repair has no verification artifact",
+            projection.lifecycle.change_id
+        ))
+    })?;
+    if verification.change_id != action_change_id
         || verification.verdict != VerificationStatus::Repairable
         || !verification.is_canonical()
     {
@@ -687,12 +950,63 @@ fn repair_verification<S: LifecycleKernelStore>(
     Ok(Some(verification))
 }
 
-fn invocation_id(projection: &LifecycleProjection) -> Digest {
+pub fn lifecycle_adapter_invocation_id(projection: &LifecycleProjection) -> Digest {
+    lifecycle_adapter_invocation_id_for(
+        projection.lifecycle.id.0,
+        projection.state_digest,
+        projection.lifecycle.phase,
+    )
+}
+
+fn lifecycle_adapter_invocation_id_for(
+    lifecycle_id: Digest,
+    state_digest: Digest,
+    phase: LifecyclePhase,
+) -> Digest {
     let mut hasher = CanonicalHasher::new(b"needle-lifecycle-adapter-invocation");
-    hasher.field_digest(projection.lifecycle.id.0);
-    hasher.field_digest(projection.state_digest);
-    hasher.field_str(projection.lifecycle.phase.as_str());
+    hasher.field_digest(lifecycle_id);
+    hasher.field_digest(state_digest);
+    hasher.field_str(phase.as_str());
     hasher.finish()
+}
+
+pub(crate) fn validate_lifecycle_phase_adapter_request(
+    request: &LifecyclePhaseAdapterRequest,
+) -> bool {
+    request.schema == LIFECYCLE_ADAPTER_REQUEST_SCHEMA
+        && request.lifecycle.validate().is_ok()
+        && request.lifecycle.source_snapshot == request.change.source_snapshot
+        && request.change.request.digest(request.change.source_snapshot)
+            == request.change.request_digest
+        && request.lifecycle.phase == request.phase
+        && request.lifecycle.status == LifecycleStatus::Active
+        && request.lifecycle.spec.profiles.for_phase(request.phase) == Some(&request.profile)
+        && request.lifecycle.state_digest() == request.expected_state_digest
+        && request.invocation_id
+            == lifecycle_adapter_invocation_id_for(
+                request.lifecycle.id.0,
+                request.expected_state_digest,
+                request.phase,
+            )
+        && request.remaining_budget == remaining_budget(&request.lifecycle)
+        && serde_json::to_vec(request)
+            .is_ok_and(|encoded| encoded.len() <= MAX_LIFECYCLE_ADAPTER_REQUEST_BYTES)
+}
+
+pub(crate) fn validate_lifecycle_phase_adapter_outcome(
+    request: &LifecyclePhaseAdapterRequest,
+    outcome: &LifecyclePhaseAdapterOutcome,
+) -> bool {
+    serde_json::to_vec(outcome)
+        .is_ok_and(|encoded| encoded.len() <= MAX_LIFECYCLE_ADAPTER_OUTCOME_BYTES)
+        && adapter_outcome_matches(request, outcome)
+        && usage_within(&outcome.usage, &request.remaining_budget)
+        && match &outcome.result {
+            LifecycleAdapterResult::Completed { transition } => {
+                completion_matches(request, transition, &outcome.usage)
+            }
+            LifecycleAdapterResult::Failed { .. } => true,
+        }
 }
 
 fn problem_detail(problem: &LifecycleAdapterFailure) -> Vec<u8> {
@@ -713,6 +1027,9 @@ fn outcome(
         invocation_id: None,
         adapter_usage: LifecycleUsage::default(),
         cleanup: None,
+        explore_action_observation: None,
+        explore_action_observation_persistence: None,
+        explore_reuse: None,
     }
 }
 

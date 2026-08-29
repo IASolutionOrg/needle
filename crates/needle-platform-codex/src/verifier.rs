@@ -5,8 +5,9 @@ use crate::worker::CodexWorker;
 use needle_core::claim::ClaimPayload;
 use needle_core::{
     AcceptanceCoverage, AcceptanceStatus, ChangeId, Digest, MAX_VERIFIER_TEST_PLANS, PatchArtifact,
-    SemanticWorkerArtifact, TestPlan, VerificationArtifact, VerificationPlanResult,
-    VerificationStatus, VerificationTestProjection, WorkerConfig,
+    SemanticWorkerArtifact, TestExecutionEvidence, TestExecutionStatus, TestPlan,
+    VerificationArtifact, VerificationPlanResult, VerificationStatus, VerificationTestProjection,
+    WorkerConfig,
 };
 use needle_runtime::{
     IsolatedCheckout, RuntimeStore, artifact_and_certificate_are_fresh, capture_git_snapshot,
@@ -33,6 +34,23 @@ pub struct VerifyChangeOutcome {
     pub output_tokens: Option<u64>,
     pub duration_ms: u64,
     pub verifier_started: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CertifiedTestExecutionInput {
+    pub artifact: needle_core::ArtifactId,
+    pub evidence: TestExecutionEvidence,
+    pub plan: TestPlan,
+}
+
+pub(crate) struct FreshVerificationRequest<'a> {
+    pub config: &'a WorkerConfig,
+    pub repository_root: &'a Path,
+    pub change_id: &'a ChangeId,
+    pub action_request: needle_core::ArtifactRequestId,
+    pub requirements_digest: Digest,
+    pub patch_id: needle_core::PatchId,
+    pub test_inputs: &'a [CertifiedTestExecutionInput],
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +285,9 @@ impl CodexVerifier {
             ),
             change_id: change_id.clone(),
             patch_id: prepared.patch.id,
+            action_request: None,
+            requirements_digest: None,
+            input_test_evidence_artifacts: Vec::new(),
             verdict: declared.verdict,
             acceptance_coverage: declared.acceptance_coverage,
             findings: declared.findings,
@@ -283,6 +304,245 @@ impl CodexVerifier {
             "codex_version": isolation.codex_version,
             "verifier_started": true,
             "test_plans_over_cap": associated.over_cap,
+            "test_plan_results": plan_results,
+        });
+        let usage = json!({
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens
+        });
+        store
+            .record_verification_artifact_with_provenance(
+                &artifact,
+                &attempt,
+                &usage,
+                None,
+                config.role_profile_provenance.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(VerifyChangeOutcome {
+            artifact,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            verifier_started: true,
+        })
+    }
+
+    pub(crate) fn verify_action_fresh(
+        &self,
+        request: FreshVerificationRequest<'_>,
+    ) -> Result<VerifyChangeOutcome, String> {
+        let FreshVerificationRequest {
+            config,
+            repository_root,
+            change_id,
+            action_request,
+            requirements_digest,
+            patch_id,
+            test_inputs,
+        } = request;
+        let started = Instant::now();
+        if test_inputs.is_empty() || test_inputs.len() > MAX_VERIFIER_TEST_PLANS {
+            return Err("fresh verification requires a bounded non-empty evidence set".to_owned());
+        }
+        let store = RuntimeStore::new(self.data_directory.join("needle.sqlite3"));
+        store.initialize().map_err(|error| error.to_string())?;
+        let prepared = store
+            .prepared_change(change_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("change `{change_id}` does not exist"))?;
+        if prepared.state == "failed" || prepared.state == "repairing" {
+            return Err(format!("change `{change_id}` is not eligible for fresh verification"));
+        }
+        if prepared.patch.id != patch_id
+            || prepared.source_snapshot != prepared.patch.source_snapshot
+            || prepared.request_digest != requirements_digest
+            || prepared.request_digest != prepared.request.digest(prepared.source_snapshot)
+        {
+            return Err("fresh verifier patch or requirements binding changed".to_owned());
+        }
+        let mut evidence_ids = BTreeSet::new();
+        let mut plan_digests = BTreeSet::new();
+        for input in test_inputs {
+            input.evidence.validate().map_err(|error| error.to_string())?;
+            if input.evidence.change_id != *change_id
+                || input.evidence.patch_id != patch_id
+                || input.evidence.source_snapshot != prepared.source_snapshot
+                || input.evidence.test_plan_digest != input.plan.identity_digest()
+                || !evidence_ids.insert(input.evidence.id.0)
+                || !plan_digests.insert(input.plan.identity_digest())
+            {
+                return Err("fresh verifier test evidence binding is invalid".to_owned());
+            }
+        }
+
+        let isolation = CodexWorker::verify_isolation(&config.executable)?;
+        if !isolation.verified() {
+            return Err(format!(
+                "verifier isolation is not verified for Codex {}",
+                isolation.codex_version
+            ));
+        }
+        let repository_root = fs::canonicalize(repository_root)
+            .map_err(|error| format!("cannot resolve verification repository: {error}"))?;
+        let sandbox = IsolatedCheckout::materialize(
+            &repository_root,
+            &self.data_directory.join("verification-action-runs"),
+        )
+        .map_err(|error| error.to_string())?;
+        if sandbox.snapshot().source_digest != prepared.source_snapshot {
+            return cleanup_sandbox_after_error(
+                sandbox,
+                "active source snapshot changed before fresh verification".to_owned(),
+            );
+        }
+        let blobs = match store.patch_file_blobs(prepared.patch.id) {
+            Ok(blobs) => blobs,
+            Err(error) => return cleanup_sandbox_after_error(sandbox, error.to_string()),
+        };
+        if let Err(error) =
+            materialize_patch_artifact(sandbox.checkout_root(), &prepared.patch, &blobs)
+        {
+            return cleanup_sandbox_after_error(sandbox, error.to_string());
+        }
+        let (_, patched_snapshot) = match capture_git_snapshot(sandbox.checkout_root()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return cleanup_sandbox_after_error(sandbox, error.to_string()),
+        };
+        let mut session = match AppServerSession::start_reviewer(
+            config,
+            self.codex_home.as_deref(),
+            &action_verifier_instructions(test_inputs),
+            sandbox.checkout_root(),
+            sandbox.target_root(),
+            sandbox.temp_root(),
+            patched_snapshot.source_digest,
+            patched_snapshot.repository_id,
+            store.clone(),
+        ) {
+            Ok(session) => session,
+            Err(error) => return cleanup_sandbox_after_error(sandbox, error),
+        };
+        session.fail_fast_on_pending_approvals();
+        let turn = session.run_turn_cancellable(
+            &verifier_prompt(&prepared.request, &prepared.patch),
+            &verifier_output_schema(),
+            Duration::from_secs(config.timeout_seconds),
+            self.cancellation.as_deref(),
+        );
+        let NormalizedVerifierTurn {
+            mut declared,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            ..
+        } = normalize_verifier_turn(
+            turn,
+            NormalizeVerifierContext {
+                requested_criteria: &prepared.request.acceptance_criteria,
+                plans: &[],
+                test_expected: false,
+                over_cap: false,
+                unavailable_reason: None,
+                checkout_root: sandbox.checkout_root(),
+                snapshot_digest: patched_snapshot.source_digest,
+            },
+        );
+        let plan_results = test_inputs.iter().map(action_test_plan_result).collect::<Vec<_>>();
+        if plan_results.iter().any(|result| !result.available || !result.executed)
+            && matches!(
+                declared.verdict,
+                VerificationStatus::Verified | VerificationStatus::Repairable
+            )
+        {
+            declared.verdict = VerificationStatus::Inconclusive;
+            append_authoritative_finding(
+                &mut declared,
+                "independent verification received unavailable or inconclusive execution evidence",
+            );
+        }
+        if plan_results.iter().any(|result| result.executed && !result.passed)
+            && declared.verdict == VerificationStatus::Verified
+        {
+            declared.verdict = VerificationStatus::Inconclusive;
+            append_authoritative_finding(
+                &mut declared,
+                "independent verification cannot pass while certified test evidence is failing",
+            );
+        }
+        if let Err(error) = session.cleanup() {
+            return cleanup_sandbox_after_error(
+                sandbox,
+                format!("fresh verifier App Server cleanup failed: {error}"),
+            );
+        }
+        let (_, after_verifier) = match capture_git_snapshot(sandbox.checkout_root()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return cleanup_sandbox_after_error(sandbox, error.to_string()),
+        };
+        if after_verifier.source_digest != patched_snapshot.source_digest {
+            return cleanup_sandbox_after_error(
+                sandbox,
+                "read-only fresh verifier changed the patched checkout".to_owned(),
+            );
+        }
+        if let Err(error) = sandbox.cleanup() {
+            return Err(format!("fresh verifier checkout cleanup failed closed: {error}"));
+        }
+
+        let definition = action_verifier_definition();
+        let evidence_ids =
+            test_inputs.iter().map(|input| input.evidence.id.0.to_string()).collect::<Vec<_>>();
+        let previous_created_unix_ms = store
+            .latest_verification_artifact(change_id)
+            .map_err(|error| error.to_string())?
+            .filter(|artifact| artifact.patch_id == prepared.patch.id)
+            .map(|artifact| artifact.created_unix_ms)
+            .unwrap_or(0);
+        let created_unix_ms = now_ms().max(previous_created_unix_ms.saturating_add(1));
+        let mut input_test_evidence_artifacts =
+            test_inputs.iter().map(|input| input.artifact).collect::<Vec<_>>();
+        input_test_evidence_artifacts.sort_unstable();
+        let artifact = VerificationArtifact {
+            id: VerificationArtifact::compute_action_id_with_plan_results(
+                action_request,
+                requirements_digest,
+                &input_test_evidence_artifacts,
+                change_id,
+                prepared.patch.id,
+                declared.verdict,
+                &declared.acceptance_coverage,
+                &declared.findings,
+                VerificationTestProjection {
+                    evidence_ids: &evidence_ids,
+                    plan_results: &plan_results,
+                    plans_over_cap: false,
+                },
+                definition,
+            ),
+            change_id: change_id.clone(),
+            patch_id: prepared.patch.id,
+            action_request: Some(action_request),
+            requirements_digest: Some(requirements_digest),
+            input_test_evidence_artifacts,
+            verdict: declared.verdict,
+            acceptance_coverage: declared.acceptance_coverage,
+            findings: declared.findings,
+            test_evidence_ids: evidence_ids,
+            test_plan_results: plan_results.clone(),
+            test_plans_over_cap: false,
+            verifier_definition: definition,
+            created_unix_ms,
+        };
+        let attempt = json!({
+            "model": config.model,
+            "reasoning": config.reasoning,
+            "service_tier": config.service_tier,
+            "codex_version": isolation.codex_version,
+            "verifier_started": true,
+            "action_native_fresh": true,
             "test_plan_results": plan_results,
         });
         let usage = json!({
@@ -361,6 +621,9 @@ impl CodexVerifier {
             ),
             change_id: change_id.clone(),
             patch_id: prepared.patch.id,
+            action_request: None,
+            requirements_digest: None,
+            input_test_evidence_artifacts: Vec::new(),
             verdict: VerificationStatus::Inconclusive,
             acceptance_coverage,
             findings,
@@ -897,6 +1160,54 @@ fn verifier_instructions(
     )
 }
 
+fn action_test_plan_result(input: &CertifiedTestExecutionInput) -> VerificationPlanResult {
+    let status = input.evidence.status;
+    VerificationPlanResult {
+        plan_digest: input.plan.identity_digest(),
+        runner: input.plan.runner.clone(),
+        argv: input.plan.argv.clone(),
+        cwd_relative: input.plan.cwd_relative.clone(),
+        test_identifier: input.plan.test_identifier.clone(),
+        expected: true,
+        available: status != TestExecutionStatus::Unavailable,
+        executed: matches!(status, TestExecutionStatus::Passed | TestExecutionStatus::Failed),
+        passed: status == TestExecutionStatus::Passed,
+        evidence_id: Some(input.evidence.id.0.to_string()),
+        failure_reason: match status {
+            TestExecutionStatus::Passed => None,
+            TestExecutionStatus::Failed => Some("certified test execution failed".to_owned()),
+            TestExecutionStatus::Unavailable => {
+                Some("certified test execution was unavailable".to_owned())
+            }
+            TestExecutionStatus::Inconclusive => {
+                Some("certified test execution was inconclusive".to_owned())
+            }
+        },
+    }
+}
+
+fn action_verifier_instructions(test_inputs: &[CertifiedTestExecutionInput]) -> String {
+    let evidence = test_inputs
+        .iter()
+        .map(|input| {
+            json!({
+                "evidence_id": input.evidence.id.0,
+                "plan_digest": input.plan.identity_digest(),
+                "status": input.evidence.status,
+                "exit_status": input.evidence.exit_status,
+                "output_digest": input.evidence.output_digest,
+                "toolchain_digest": input.evidence.toolchain_digest,
+                "environment_digest": input.evidence.environment_digest,
+                "execution_policy_digest": input.evidence.execution_policy_digest,
+            })
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "You are Needle's independent fresh verifier. The patch is materialized in a read-only disposable checkout. You receive certified test execution summaries, never the patcher transcript and never the test command output or patcher reasoning. Do not run tests or any write command. Check the actual filesystem against every acceptance criterion using only bounded repository inspection. No network, credentials, hooks, plugins, MCP, project instructions, memory, or other agents. Certified execution summaries: {}. Return only JSON matching the output schema.",
+        serde_json::to_string(&evidence).expect("bounded test summaries serialize")
+    )
+}
+
 fn verifier_prompt(request: &needle_core::ChangeRequest, patch: &PatchArtifact) -> String {
     let mut prompt =
         format!("Verify this task independently:\n{}\n\nAcceptance criteria:\n", request.task);
@@ -945,6 +1256,15 @@ fn verifier_definition() -> Digest {
     hasher.field_u16(MAX_VERIFIER_TEST_PLANS as u16);
     hasher.field_str("ordered-plan-results");
     hasher.field_str("runner argv cwd_relative test_identifier expected available executed passed evidence_id failure_reason");
+    hasher.field_bytes(&serde_json::to_vec(&verifier_output_schema()).unwrap_or_default());
+    hasher.finish()
+}
+
+fn action_verifier_definition() -> Digest {
+    let mut hasher = needle_core::CanonicalHasher::new(b"needle-action-verifier-definition-v1");
+    hasher.field_str("independent-fresh-no-test-execution");
+    hasher.field_str("certified-test-execution-summary-v1");
+    hasher.field_u16(MAX_VERIFIER_TEST_PLANS as u16);
     hasher.field_bytes(&serde_json::to_vec(&verifier_output_schema()).unwrap_or_default());
     hasher.finish()
 }

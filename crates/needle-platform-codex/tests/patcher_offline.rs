@@ -4,9 +4,9 @@ use needle_core::{
     SemanticWorkerArtifact, TestPlan, VerificationStatus, WorkerConfig, built_in_route_contracts,
     compile_need, need_fragment,
 };
-use needle_platform_codex::{CodexPatchWorker, CodexVerifier};
+use needle_platform_codex::{CodexPatchWorker, CodexVerifier, ProposeActionBinding};
 use needle_runtime::{
-    ChangeApplyError, RuntimeSettings, RuntimeStore, apply_verified_change,
+    ChangeApplyError, RuntimeSettings, RuntimeStore, apply_verified_change, capture_git_snapshot,
     materialize_patch_artifact, recover_pending_change_applies, validate_semantic_test_plan,
 };
 use std::collections::BTreeSet;
@@ -17,6 +17,92 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SIMULATOR: &str = env!("CARGO_BIN_EXE_needle-sim-codex");
+
+#[test]
+fn rejected_completed_patcher_turn_is_accounted_once_without_a_patch() {
+    let root = temporary_root();
+    let repository = root.join("source");
+    let data = root.join("data");
+    let codex_home = root.join("codex-home");
+    fs::create_dir_all(&repository).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(
+        codex_home.join(".needle-simulation-worker-scenario"),
+        "patch_worker_paraphrased_criterion\n",
+    )
+    .unwrap();
+    git(&repository, &["init", "--quiet"]);
+    git(&repository, &["config", "user.email", "needle@example.invalid"]);
+    git(&repository, &["config", "user.name", "Needle Test"]);
+    fs::write(repository.join("fixture.txt"), "original active content\n").unwrap();
+    git(&repository, &["add", "fixture.txt"]);
+    git(&repository, &["commit", "--quiet", "-m", "fixture"]);
+
+    let request = ChangeRequest {
+        task: "Update the fixture text.".to_owned(),
+        acceptance_criteria: vec!["The fixture changes.".to_owned()],
+        allowed_paths: vec![AllowedPath {
+            path: "fixture.txt".to_owned(),
+            scope: AllowedPathScope::Exact,
+        }],
+        artifact_ids: Vec::new(),
+        claim_ids: Vec::new(),
+        constraints: Vec::new(),
+    };
+    let config = WorkerConfig {
+        executable: SIMULATOR.to_owned(),
+        model: "gpt-5.6-luna".to_owned(),
+        reasoning: "medium".to_owned(),
+        service_tier: Some("default".to_owned()),
+        timeout_seconds: 10,
+        evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
+        role_profile_provenance: None,
+    };
+    let store = RuntimeStore::new(data.join("needle.sqlite3"));
+    store
+        .initialize_defaults(&RuntimeSettings {
+            codex_executable: SIMULATOR.to_owned(),
+            worker_model: config.model.clone(),
+            worker_reasoning: config.reasoning.clone(),
+            worker_timeout_seconds: config.timeout_seconds,
+            evidence_failure_policy: config.evidence_failure_policy,
+            trusted_test_execution: false,
+            multi_need_policy: MultiNeedPolicy::default(),
+        })
+        .unwrap();
+    let (_, snapshot) = capture_git_snapshot(&repository).unwrap();
+    let change_id = needle_core::ChangeId::from_digest(request.digest(snapshot.source_digest));
+    let operation_id = Digest::blake3(b"rejected-patcher-operation");
+
+    let error = CodexPatchWorker::with_codex_home(&data, &codex_home)
+        .propose_action(
+            &config,
+            &repository,
+            &ProposeActionBinding {
+                operation_id,
+                change_id: change_id.clone(),
+                source_snapshot: snapshot.source_digest,
+            },
+            &request,
+            &[],
+        )
+        .unwrap_err();
+    assert!(error.contains("each acceptance criterion exactly once"));
+    let attempts = store.change_attempts(&change_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].patch_id, None);
+    assert_eq!(attempts[0].attempt["operation_id"], serde_json::json!(operation_id));
+    assert_eq!(attempts[0].attempt["outcome"], "rejected");
+    assert_eq!(attempts[0].usage["output_tokens"], 20);
+    assert!(store.prepared_change(&change_id).unwrap().is_none());
+    assert_eq!(
+        fs::read_to_string(repository.join("fixture.txt")).unwrap(),
+        "original active content\n"
+    );
+    assert!(data.join("change-runs").read_dir().unwrap().next().is_none());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn patcher_changes_only_disposable_checkout_and_persists_filesystem_patch() {
@@ -117,6 +203,7 @@ fn patcher_changes_only_disposable_checkout_and_persists_filesystem_patch() {
         .begin_change_apply(
             &ChangeApplyRecord {
                 id: recovery_id,
+                operation_id: None,
                 change_id: outcome.change_id.clone(),
                 patch_id: outcome.patch_id,
                 repository_root: fs::canonicalize(&repository)

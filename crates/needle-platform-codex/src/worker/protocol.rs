@@ -778,12 +778,19 @@ pub(super) fn worker_output_schema(requested: &[ArtifactKind]) -> Value {
                     "additionalProperties": false,
                     "required": ["runner", "argv", "identifier"],
                     "properties": {
-                        "runner": {"type": "string", "const": "cargo"},
+                        "runner": {
+                            "type": "string", "minLength": 1, "maxLength": 512,
+                            "description": "Direct executable recorded as argv[0]. Derive it from observed repository test configuration."
+                        },
                         "argv": {
                             "type": "array", "minItems": 2, "maxItems": 16,
-                            "items": {"type": "string", "minLength": 1, "maxLength": 512}
+                            "items": {"type": "string", "minLength": 1, "maxLength": 512},
+                            "description": "Complete direct process vector. argv[0] must equal runner and one argument must identify the focused test."
                         },
-                        "identifier": {"type": "string", "minLength": 1, "maxLength": 512}
+                        "identifier": {
+                            "type": "string", "minLength": 1, "maxLength": 512,
+                            "description": "Safe focused-test identifier present in argv, or a qualified identifier whose final segment is present in argv."
+                        }
                     }
                 }
             ]
@@ -870,18 +877,29 @@ pub(super) fn semantic_worker_output_schema_for_scenario(
                 "kind": {"type": "string", "const": "test-plan"},
                 "runner": {
                     "type": "string",
-                    "const": "cargo",
-                    "description": "Logical test runner. Needle stores this as cargo."
+                    "minLength": 1,
+                    "maxLength": 512,
+                    "description": "Direct executable recorded as argv[0]. Derive it from observed repository test configuration."
                 },
                 "argv": {
                     "type": "array",
                     "minItems": 2,
                     "maxItems": 16,
                     "items": {"type": "string", "minLength": 1, "maxLength": 512},
-                    "description": "Complete process argv. It must include cargo as argv[0] and test as argv[1], even though runner is also present."
+                    "description": "Complete direct process vector. argv[0] must equal runner and one argument must identify the focused test."
                 },
                 "cwd_relative": {"type": "string", "const": "."},
-                "identifiers": bounded_strings(1, 1, 512),
+                "identifiers": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                        "description": "Safe focused-test identifier present in argv, or a qualified identifier whose final segment is present in argv."
+                    }
+                },
                 "selection": {"type": "string", "const": "representative"},
                 "evidence_paths": bounded_strings(1, 8, 512)
             }
@@ -1028,6 +1046,7 @@ mod tests {
         assert!(schema["properties"].get("facts").is_none());
         assert!(schema["properties"].get("sources").is_none());
         assert!(schema["properties"].get("refs").is_none());
+        assert!(!schema.to_string().to_ascii_lowercase().contains("cargo"));
     }
 
     #[test]
@@ -1064,6 +1083,9 @@ mod tests {
         assert_eq!(properties["identifiers"]["minItems"], json!(1));
         assert_eq!(properties["identifiers"]["maxItems"], json!(1));
         assert_eq!(properties["selection"]["const"], json!("representative"));
+        assert_eq!(properties["runner"]["type"], json!("string"));
+        assert!(properties["runner"].get("const").is_none());
+        assert!(!schema.to_string().to_ascii_lowercase().contains("cargo"));
     }
 
     #[test]
@@ -1165,6 +1187,32 @@ mod tests {
     }
 
     #[test]
+    fn semantic_test_plan_accepts_a_language_agnostic_node_command() {
+        let root = repository();
+        let response: SemanticCompactWorkerResponse = serde_json::from_value(json!({
+            "schema": "needle.artifact-result/2",
+            "artifacts": [{
+                "kind": "test-plan",
+                "runner": "node",
+                "argv": ["node", "--test", "src/lib.rs"],
+                "cwd_relative": ".",
+                "identifiers": ["src/lib.rs"],
+                "selection": "representative",
+                "evidence_paths": ["src/lib.rs"]
+            }]
+        }))
+        .unwrap();
+
+        let normalized = normalize_semantic_response(response, &root);
+        assert!(normalized.diagnostics.is_empty());
+        let plan = normalized.test_plan.as_ref().expect("normalized Node test plan");
+        assert_eq!(plan.runner, "node");
+        assert_eq!(plan.argv, ["node", "--test", "src/lib.rs"]);
+        assert!(plan.test_command().is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn semantic_test_plan_canonicalizes_runner_relative_argv_from_r112() {
         let root = repository();
         let response: SemanticCompactWorkerResponse = serde_json::from_value(json!({
@@ -1208,14 +1256,13 @@ mod tests {
 
         let normalized = normalize_semantic_response(response, &root);
         let diagnostic = &normalized.diagnostics[0].code;
-        assert!(diagnostic.contains("argv_not_direct_cargo_test"));
         assert!(diagnostic.contains("identifier_invalid_or_unsafe"));
         assert!(diagnostic.contains("identifier_not_in_argv"));
         assert!(diagnostic.contains(r#""argv":["cargo","check","answer"]"#));
         assert!(!diagnostic.contains("@@need"));
         assert!(diagnostic.len() <= 900);
         let repair = repair_prompt(&normalized.diagnostics);
-        assert!(repair.contains("argv_not_direct_cargo_test"));
+        assert!(repair.contains("identifier_invalid_or_unsafe"));
         assert!(repair.contains("identifier_not_in_argv"));
         let _ = fs::remove_dir_all(root);
     }
@@ -1249,7 +1296,9 @@ mod tests {
         .expect("bounded diagnostic must retain complete structured JSON");
         assert_eq!(summary["argv_count"], json!(36));
         assert_eq!(summary["identifier_count"], json!(2));
-        assert!(summary["reasons"].as_array().is_some_and(|reasons| reasons.len() >= 9));
+        let reasons = summary["reasons"].as_array().expect("reasons array");
+        assert_eq!(reasons.len(), 8);
+        assert!(!reasons.iter().any(|reason| reason == "runner_unsupported"));
     }
 
     #[test]

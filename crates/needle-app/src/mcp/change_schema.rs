@@ -1,10 +1,9 @@
 use needle_core::{
     AcceptanceCoverage, AllowedPath, AllowedPathScope, ArtifactId, CanonicalHasher, ChangeId,
     ChangeRequest, ClaimId, Digest, MAX_ACCEPTANCE_CRITERIA, MAX_ALLOWED_PATHS,
-    MAX_CHANGE_ARTIFACTS, MAX_CHANGE_CLAIMS, MAX_CHANGE_TASK_BYTES, MAX_PATCH_FILES,
-    PatchOperation, VerificationPlanResult, VerificationStatus,
+    MAX_CHANGE_ARTIFACTS, MAX_CHANGE_CLAIMS, MAX_CHANGE_TASK_BYTES, MAX_PATCH_FILES, PatchArtifact,
+    PatchOperation, VerificationArtifact, VerificationPlanResult, VerificationStatus,
 };
-use needle_platform_codex::{PrepareChangeOutcome, VerifyChangeOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -169,31 +168,33 @@ pub(crate) struct McpChangeDiscovery {
 }
 
 impl McpPrepareChangeResponse {
-    pub(crate) fn from_outcome(
-        outcome: PrepareChangeOutcome,
+    pub(crate) fn from_action(
+        patch: PatchArtifact,
         provided_artifacts: usize,
         provided_claims: usize,
+        observed_repository_files: u32,
+        observation_gaps: u32,
     ) -> Self {
         Self {
             status: "prepared",
-            change_id: outcome.change_id.to_string(),
-            patch_id: outcome.patch_id.to_string(),
-            summary: outcome.summary,
-            changed_files: outcome
-                .changed_files
+            change_id: patch.change_id.to_string(),
+            patch_id: patch.id.to_string(),
+            summary: patch.summary,
+            changed_files: patch
+                .files
                 .into_iter()
                 .map(|file| McpChangedFile { path: file.path, operation: file.operation })
                 .collect(),
-            acceptance_coverage: outcome.acceptance_coverage,
+            acceptance_coverage: patch.acceptance_coverage,
             discovery: McpChangeDiscovery {
                 provided_artifacts: provided_artifacts.try_into().unwrap_or(u32::MAX),
                 provided_claims: provided_claims.try_into().unwrap_or(u32::MAX),
                 cache_only_context_calls: 0,
-                observed_repository_files: outcome.observed_repository_files,
-                observation_gaps: outcome.observation_gaps,
+                observed_repository_files,
+                observation_gaps,
             },
-            residual_risks: outcome.residual_risks,
-            verification_status: outcome.verification_status,
+            residual_risks: patch.residual_risks,
+            verification_status: VerificationStatus::NotRequested,
         }
     }
 
@@ -339,23 +340,24 @@ pub(crate) struct McpVerifyChangeResponse {
 }
 
 impl McpVerifyChangeResponse {
-    pub(crate) fn from_outcome(
-        outcome: VerifyChangeOutcome,
+    pub(crate) fn from_action(
+        artifact: VerificationArtifact,
+        verifier_started: bool,
         repair_attempted: bool,
         repair_performed: bool,
         verification_attempts: u8,
     ) -> Self {
         Self {
-            status: outcome.artifact.verdict,
-            change_id: outcome.artifact.change_id.to_string(),
-            patch_id: outcome.artifact.patch_id.to_string(),
-            verification_id: outcome.artifact.id.to_string(),
-            acceptance_coverage: outcome.artifact.acceptance_coverage,
-            findings: outcome.artifact.findings,
-            test_evidence_ids: outcome.artifact.test_evidence_ids,
-            test_plan_results: outcome.artifact.test_plan_results,
-            test_plans_over_cap: outcome.artifact.test_plans_over_cap,
-            verifier_started: outcome.verifier_started,
+            status: artifact.verdict,
+            change_id: artifact.change_id.to_string(),
+            patch_id: artifact.patch_id.to_string(),
+            verification_id: artifact.id.to_string(),
+            acceptance_coverage: artifact.acceptance_coverage,
+            findings: artifact.findings,
+            test_evidence_ids: artifact.test_evidence_ids,
+            test_plan_results: artifact.test_plan_results,
+            test_plans_over_cap: artifact.test_plans_over_cap,
+            verifier_started,
             repair_attempted,
             repair_performed,
             verification_attempts,

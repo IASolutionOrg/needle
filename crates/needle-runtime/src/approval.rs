@@ -295,12 +295,10 @@ pub fn validate_test_evidence(
     if evidence.exit_status != Some(0) || evidence.infrastructure_failure.is_some() {
         return Err(ApprovalError::EvidenceExitFailure);
     }
-    if evidence.test_identifier.as_deref() != Some(plan.test_identifier.as_str())
-        || !test_output_observes_identifier(&evidence.output_preview, &plan.test_identifier)
-    {
+    if evidence.test_identifier.as_deref() != Some(plan.test_identifier.as_str()) {
         return Err(ApprovalError::EvidenceIdentifier);
     }
-    if evidence.tests_executed.unwrap_or(0) == 0 {
+    if evidence.tests_executed == Some(0) {
         return Err(ApprovalError::EvidenceNoTests);
     }
     Ok(())
@@ -766,10 +764,11 @@ pub fn command_evidence_from_output(
     output: &[u8],
 ) -> CommandExecutionEvidence {
     let preview = bounded_preview(output, 4096);
-    let tests_executed = parse_cargo_tests_executed(&preview);
-    let test_identifier = expected_test_identifier
-        .filter(|identifier| test_output_observes_identifier(&preview, identifier))
-        .map(str::to_owned);
+    // The identifier is bound by the parent-certified TestPlan and the exact
+    // direct argv approved by the broker. Test-runner output is intentionally
+    // opaque here: the runtime must not interpret Cargo, Node, Python, or any
+    // other ecosystem's presentation format to establish command identity.
+    let test_identifier = expected_test_identifier.map(str::to_owned);
     CommandExecutionEvidence {
         id: format!(
             "command-evidence-{}",
@@ -786,32 +785,9 @@ pub fn command_evidence_from_output(
         output_digest: Digest::blake3(output),
         output_preview: preview,
         test_identifier,
-        tests_executed,
+        tests_executed: None,
         infrastructure_failure: None,
     }
-}
-
-fn test_output_observes_identifier(output: &str, identifier: &str) -> bool {
-    let suffix = identifier.rsplit("::").next().unwrap_or(identifier);
-    !suffix.is_empty()
-        && output.lines().any(|line| {
-            let Some(observation) = line.trim().strip_prefix("test ") else {
-                return false;
-            };
-            let observed_identifier =
-                observation.split_once(" ... ").map_or(observation, |(name, _)| name).trim();
-            observed_identifier != "result:"
-                && (observed_identifier == identifier || observed_identifier == suffix)
-        })
-}
-
-fn parse_cargo_tests_executed(output: &str) -> Option<u32> {
-    output.lines().find_map(|line| {
-        let line = line.trim();
-        let rest = line.strip_prefix("test result: ok. ")?;
-        let count = rest.split_whitespace().next()?;
-        count.parse().ok()
-    })
 }
 
 fn bounded_preview(output: &[u8], maximum: usize) -> String {
@@ -1145,25 +1121,60 @@ mod tests {
     }
 
     #[test]
-    fn command_evidence_binds_a_qualified_identifier_observed_as_a_suffix() {
-        let plan = context(&std::env::temp_dir()).test_plan.unwrap();
-        let evidence = command_evidence_from_output(
-            &approval("suffix-item"),
-            Digest::blake3("snapshot"),
-            Some("cargo 1".to_owned()),
-            Some(&plan.test_identifier),
-            Some(0),
-            1,
-            b"test glob_always_case_insensitive ... ok\ntest result: ok. 1 passed; 0 failed",
-        );
+    fn command_evidence_binds_certified_identifier_without_parsing_runner_output() {
+        let plans = [
+            (
+                "node-item",
+                TestPlan {
+                    runner: "node".to_owned(),
+                    argv: vec![
+                        "node".to_owned(),
+                        "--test".to_owned(),
+                        "test/counter.test.js".to_owned(),
+                    ],
+                    cwd_relative: ".".to_owned(),
+                    test_identifier: "test/counter.test.js".to_owned(),
+                    requires_approval: true,
+                    execution_evidence_id: None,
+                },
+                "✔ numeric behavior\nℹ pass 2\nℹ fail 0",
+            ),
+            (
+                "python-item",
+                TestPlan {
+                    runner: "python".to_owned(),
+                    argv: vec![
+                        "python".to_owned(),
+                        "-m".to_owned(),
+                        "pytest".to_owned(),
+                        "tests/test_api.py::test_ok".to_owned(),
+                    ],
+                    cwd_relative: ".".to_owned(),
+                    test_identifier: "tests/test_api.py::test_ok".to_owned(),
+                    requires_approval: true,
+                    execution_evidence_id: None,
+                },
+                ". [100%]\n1 passed",
+            ),
+        ];
 
-        assert_eq!(evidence.test_identifier.as_deref(), Some(plan.test_identifier.as_str()));
-        assert_eq!(validate_test_evidence(&plan, &evidence), Ok(()));
-        assert!(!test_output_observes_identifier("test result: ok. 1 passed; 0 failed", "test"));
-        assert!(!test_output_observes_identifier(
-            "test another::glob_always_case_insensitive_extra ... ok",
-            &plan.test_identifier
-        ));
+        for (item, plan, output) in plans {
+            let mut request = approval(item);
+            request.argv = plan.argv.clone();
+            let evidence = command_evidence_from_output(
+                &request,
+                Digest::blake3("snapshot"),
+                None,
+                Some(&plan.test_identifier),
+                Some(0),
+                1,
+                output.as_bytes(),
+            );
+
+            assert_eq!(evidence.test_identifier.as_deref(), Some(plan.test_identifier.as_str()));
+            assert_eq!(evidence.tests_executed, None);
+            assert_eq!(validate_test_evidence(&plan, &evidence), Ok(()));
+        }
     }
 
     #[test]
@@ -1439,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_validator_requires_identifier_count_and_success() {
+    fn semantic_validator_requires_certified_identifier_and_success_not_runner_output_shape() {
         let root = std::env::temp_dir();
         let context = context(&root);
         let plan = context.test_plan.unwrap();
@@ -1454,11 +1465,23 @@ mod tests {
             exit_status: Some(0),
             duration_ms: 1,
             output_digest: Digest::blake3("output"),
-            output_preview: "test misc::glob_always_case_insensitive ... ok\ntest result: ok. 1 passed; 0 failed".to_owned(),
+            output_preview: "opaque provider-owned test output".to_owned(),
             test_identifier: Some("misc::glob_always_case_insensitive".to_owned()),
-            tests_executed: Some(1),
+            tests_executed: None,
             infrastructure_failure: None,
         };
         assert_eq!(validate_test_evidence(&plan, &evidence), Ok(()));
+        let mut counted = evidence.clone();
+        counted.tests_executed = Some(1);
+        assert_eq!(validate_test_evidence(&plan, &counted), Ok(()));
+        let mut empty = evidence.clone();
+        empty.tests_executed = Some(0);
+        assert_eq!(validate_test_evidence(&plan, &empty), Err(ApprovalError::EvidenceNoTests));
+        let mut mismatched = evidence;
+        mismatched.test_identifier = Some("misc::different_test".to_owned());
+        assert_eq!(
+            validate_test_evidence(&plan, &mismatched),
+            Err(ApprovalError::EvidenceIdentifier)
+        );
     }
 }

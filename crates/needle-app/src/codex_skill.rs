@@ -136,34 +136,54 @@ fn render_skill(executable: &Path) -> String {
     format!(
         r#"---
 name: needle
-description: In Codex Desktop, use Needle for repository tasks that require locating an implementation, tracing runtime or state flow, or identifying relevant tests.
+description: In Codex Desktop, use Needle for repository resolution, standalone typed patch/test/review/verify/apply actions, or a complete bounded change lifecycle with explicit Apply approval.
 ---
 
-# Needle repository exploration
+# Needle repository execution
 
 {MANAGED_MARKER}
 
-Use this skill only in Codex Desktop. Codex CLI uses Needle lifecycle hooks instead and must not also invoke this skill. In Desktop, invoke Needle before native repository exploration whenever the current task requires locating an implementation, tracing runtime behavior or state transitions, or identifying relevant tests. Do not skip Needle merely because native exploration could answer the same question. Do not invoke it for general questions, trivial file reads, or work outside a Git repository.
+Use this skill only in Codex Desktop. Codex CLI uses Needle lifecycle hooks instead and must not also invoke this skill. Use Needle for bounded repository resolution, one typed action, or a complete change lifecycle. Do not invoke it for general questions, trivial file reads, or work outside a Git repository.
 
-Needle is opt-in and repository-aware. The exploration command checks activation itself. Make one Needle invocation for the selected route. Continue natively only if Needle reports that it is disabled, unavailable, or unsuccessful.
+Choose `execution.kind` explicitly from the user's requested operation. Never infer it from keywords such as "implement", "review", or "test":
 
-Choose exactly one route:
+- `resolve`: resolve one Need without starting or modifying a change.
+- `action`: execute exactly one typed action contract. A standalone Review or Verify stays standalone and never creates a lifecycle halfway through.
+- `lifecycle`: start or resume the complete `Explore -> Implement -> Test -> Review -> Verify` flow. A lifecycle always starts at Explore and stops at `AwaitingApproval`; it never applies a patch automatically.
 
-- `locate.implementation` to find the primary implementation and its important callers or dependencies.
-- `trace.state-flow` to trace runtime behavior, control flow, or state transitions.
-- `tests.relevant` to identify the smallest relevant tests and what they cover.
+Construct one closed `needle.need-execution/1` JSON envelope and pass it on stdin to:
 
-Identify one exact exploration subject and classify it as `symbol`, `cli-option`, `configuration-key`, `test`, `file`, `module`, or `behavior`. Use a stable canonical name that appears literally in the target source, not the full user prompt or a descriptive phrase. Prefer an exact symbol when one is known. For a state or control-flow question without a narrower symbol, use `behavior` with one short source token, such as `activation`, rather than a phrase such as `activation precedence`.
+`{executable} run --request-stdin --repository <absolute-repository-path>`
 
-Invoke the executable at `{executable}` with this argument shape:
+The envelope has exactly these top-level fields: `schema`, `operation_id`, `need`, and `execution`. Use `schema: "needle.need-execution/1"`. Generate a fresh non-zero `b3:` digest for a new invocation; reuse the exact same `operation_id` only to resume that same invocation. Never reuse it for changed semantic input.
 
-`explore --route <route> --subject-kind <subject-kind> --subject <canonical-subject> --repository <absolute-repository-path>`
+Build `need` as canonical NeedIR revision 1 with exactly: `route_hint`, `subjects`, `required`, `preferred`, `semantic_constraints`, `world`, `input_artifacts`, `projection`, `body`, and `format_revision`. Keep repeated fields deterministically ordered. For repository exploration use exactly one route and its predicate:
 
-Do not add `--query`. Needle derives a deterministic route-specific exploration request from the structured route and subject so equivalent invocations can safely reuse an exact local result. The original user prompt remains with you and is not replaced by Needle's canonical exploration request.
+- `locate.implementation` with `implementation-location`;
+- `trace.state-flow` with `runtime-flow`;
+- `tests.relevant` with `focused-tests`.
+
+Use stable subject kinds `symbol`, `cli-option`, `configuration-key`, `test`, `file`, `module`, or `behavior`. The canonical name must identify the source subject, not repeat the full prompt.
+
+For `resolve`, set `execution` to `{{"kind":"resolve"}}`.
+
+For `lifecycle`, set `execution` to `{{"kind":"lifecycle","lifecycle":{{"change":{{"task":...,"acceptance_criteria":[...],"allowed_paths":[{{"path":...,"scope":"exact|subtree"}}],"artifact_ids":[],"claim_ids":[],"constraints":[]}}}}}}`. `acceptance_criteria` and `allowed_paths` are mandatory. Use only repository-relative forward-slash paths and the narrowest write scope authorized by the user. Never widen allowed paths to the repository root. An optional `budget_override` may only reduce active limits.
+
+Do not preselect, guess, or execute a test command for a lifecycle. When Test has no bound plan, the Needle parent resolves `needle.tests.plan` through the configured provider, certifies the returned direct command against the exact source, binds it durably, and then executes only that certified plan in isolation. Ecosystem discovery belongs to the provider; the Needle kernel remains language-neutral.
+
+For `action`, set `execution` to `{{"kind":"action","action":{{"contract":<contract>,"input":<typed-input>}}}}`. The typed input `kind` must match the contract exactly:
+
+- `needle.patch.propose` -> `patch_propose` with `change`; add both `prior_patch` and `repair_verification` only for Repair.
+- `needle.tests.execute` -> `tests_execute` with `change_id`, `requirements_digest`, exact `patch`, and certified `test_plan_artifact`.
+- `needle.review.diff` -> `review_diff` with `change_id`, `requirements_digest`, exact `patch`, and optional `prior_review_artifacts`.
+- `needle.patch.verify` -> `patch_verify` with `change_id`, `requirements_digest`, exact `patch`, and at least one certified `test_evidence_artifacts` entry.
+- `needle.patch.apply` -> `patch_apply` with the exact binding returned by an `AwaitingApproval` lifecycle or prior actions. Set `confirm: true` only after the user explicitly approves Apply in the current conversation.
+
+Artifact references are closed objects: patch references contain `artifact` and `patch`; verification references contain `artifact` and `verification`. Copy typed identifiers and digests verbatim from Needle output. Never fabricate, guess, or substitute legacy IDs.
 
 Quote every argument for the active shell. Set the shell execution timeout to at least 360 seconds and wait until the Needle process exits; a first uncached exploration can take more than one minute. If the shell tool yields a running process or cell, keep waiting for that same process instead of starting another invocation. Needle writes progress to stderr and emits the bounded context on stdout only after resolution completes.
 
-Never ask the user to write an internal marker and never expose Needle's internal marker protocol. Treat stdout as bounded repository context, verify critical claims against source when necessary, and then continue the original task. If Needle exits unsuccessfully, report only the actionable failure and continue with native exploration when safe.
+Treat the versioned JSON stdout as the only machine-readable result. Do not reconstruct lifecycle state from prose. At `AwaitingApproval`, show the user the result and ask whether to Apply; if approved, issue a separate `needle.patch.apply` action using the exact returned binding and a fresh operation ID. If Needle reports disabled, unavailable, inconclusive, or unsuccessful, report the actionable state and continue natively only when safe.
 "#
     )
 }
@@ -195,13 +215,17 @@ mod tests {
         let contents = fs::read_to_string(updated.path).unwrap();
         assert!(contents.contains(MANAGED_MARKER));
         assert!(contents.contains(&second_executable.display().to_string()));
-        assert!(contents.contains("--subject-kind <subject-kind>"));
-        assert!(contents.contains("Do not add `--query`"));
-        assert!(contents.contains("one short source token"));
+        assert!(contents.contains("run --request-stdin"));
+        assert!(contents.contains("Never infer it from keywords"));
+        assert!(contents.contains("A lifecycle always starts at Explore"));
+        assert!(contents.contains("standalone and never creates a lifecycle"));
+        assert!(contents.contains("needle.patch.apply"));
+        assert!(contents.contains("explicitly approves Apply"));
+        assert!(contents.contains("Never widen allowed paths"));
+        assert!(contents.contains("Do not preselect, guess, or execute a test command"));
+        assert!(contents.contains("kernel remains language-neutral"));
         assert!(contents.contains("timeout to at least 360 seconds"));
         assert!(contents.contains("keep waiting for that same process"));
-        assert!(contents.contains("invoke Needle before native repository exploration"));
-        assert!(contents.contains("Do not skip Needle merely because native exploration"));
         assert!(!contents.contains("@@need"));
         fs::remove_dir_all(root).unwrap();
     }

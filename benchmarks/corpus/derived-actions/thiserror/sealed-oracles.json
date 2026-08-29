@@ -1,0 +1,149 @@
+{
+  "format_revision": 1,
+  "schema": "needle.derived-action-study-oracles/1",
+  "tasks": [
+    {
+      "task_id": "architecture-assemble",
+      "required_findings": [
+        "The assembled result contains all three workspace packages exactly once and preserves supported cross-package dependency assertions.",
+        "The root thiserror package exposes the public derive-facing library and depends on thiserror-impl.",
+        "The thiserror-impl package is the proc-macro implementation package.",
+        "The thiserror_no_std_test package is a non-published no-std validation consumer of thiserror."
+      ],
+      "required_evidence_paths": [
+        "Cargo.toml",
+        "impl/Cargo.toml",
+        "impl/src/lib.rs",
+        "src/lib.rs",
+        "tests/no-std/Cargo.toml",
+        "tests/no-std/test.rs"
+      ],
+      "forbidden_claims": [
+        "Model-authored architecture assertions are mechanically proven facts.",
+        "The assembled output may omit a package represented by one of the committed slices.",
+        "The thiserror_no_std_test package is published as part of thiserror."
+      ],
+      "reviewer_checks": [
+        "All model-authored assertions remain explicitly distinguishable from current digest-bound evidence.",
+        "Assembly introduces no duplicate package, unsupported assertion, or evidence reference.",
+        "The assembled answer is semantically equivalent to a fresh whole-workspace answer for the committed scope."
+      ]
+    },
+    {
+      "task_id": "architecture-exact",
+      "required_findings": [
+        "The root thiserror package exposes the public derive-facing library and depends on thiserror-impl.",
+        "The thiserror-impl package is the proc-macro implementation package.",
+        "The thiserror_no_std_test package is a non-published no-std validation consumer of thiserror."
+      ],
+      "required_evidence_paths": [
+        "Cargo.toml",
+        "impl/Cargo.toml",
+        "impl/src/lib.rs",
+        "src/lib.rs",
+        "tests/no-std/Cargo.toml",
+        "tests/no-std/test.rs"
+      ],
+      "forbidden_claims": [
+        "Model-authored architecture assertions are mechanically proven facts.",
+        "The thiserror_no_std_test package is published as part of thiserror.",
+        "The workspace contains only one package."
+      ],
+      "reviewer_checks": [
+        "Every material responsibility, entry-point, boundary, and dependency assertion cites current repository evidence.",
+        "Gaps are explicit where the selected evidence does not establish completeness.",
+        "The answer covers exactly the three-package committed universe."
+      ]
+    },
+    {
+      "task_id": "architecture-project",
+      "required_findings": [
+        "The projected scope contains thiserror-impl and no other package brief.",
+        "The thiserror-impl package is the proc-macro implementation package.",
+        "Workspace evidence may support the projection without expanding the requested package scope."
+      ],
+      "required_evidence_paths": [
+        "Cargo.toml",
+        "impl/Cargo.toml",
+        "impl/src/expand.rs",
+        "impl/src/lib.rs"
+      ],
+      "forbidden_claims": [
+        "Model-authored architecture assertions are mechanically proven facts.",
+        "The projected result includes the root thiserror package as an in-scope package brief.",
+        "The projected result includes thiserror_no_std_test as an in-scope package brief."
+      ],
+      "reviewer_checks": [
+        "Evidence retained by projection supports only the selected package or necessary workspace context.",
+        "No assertion belonging exclusively to an omitted package survives projection.",
+        "The projected answer is semantically equivalent to a fresh answer for thiserror-impl alone."
+      ]
+    },
+    {
+      "task_id": "change-impact-assemble",
+      "required_findings": [
+        "The assembled result contains the implementation and lint-regression components exactly once.",
+        "The generated From implementation is first built with quote_spanned and then wrapped by quote carrying the lint allow attribute.",
+        "The new test denies clippy::allow_attributes and derives Error for a From conversion to exercise the generated code."
+      ],
+      "required_evidence_paths": [
+        "impl/src/expand.rs",
+        "tests/test_lints.rs"
+      ],
+      "forbidden_claims": [
+        "Assembly establishes an unrelated public API change.",
+        "Assembly may silently drop one of the committed impact components.",
+        "Model-authored impact assessments are mechanically proven facts."
+      ],
+      "reviewer_checks": [
+        "Assembly introduces no duplicate component, unsupported assessment, or dangling evidence reference.",
+        "The assembled answer is semantically equivalent to a fresh full-patch assessment.",
+        "Uncertainty is retained for effects outside the generated From implementation and focused lint regression."
+      ]
+    },
+    {
+      "task_id": "change-impact-exact",
+      "required_findings": [
+        "The focused validation command is cargo test --test test_lints.",
+        "The generated From implementation is first built with quote_spanned and then wrapped by quote carrying the lint allow attribute.",
+        "The new test denies clippy::allow_attributes and derives Error for a From conversion to exercise the generated code."
+      ],
+      "required_evidence_paths": [
+        "impl/src/expand.rs",
+        "tests/test_lints.rs"
+      ],
+      "forbidden_claims": [
+        "Model-authored impact assessments are mechanically proven facts.",
+        "The patch establishes an unrelated public API change.",
+        "The patch removes the lint allowances from generated From implementations."
+      ],
+      "reviewer_checks": [
+        "Both changed files are represented by before and after evidence.",
+        "Every impact disposition is scoped to the committed requirement and subject.",
+        "Uncertainty is retained for effects outside the generated From implementation and focused lint regression."
+      ]
+    },
+    {
+      "task_id": "change-impact-project",
+      "required_findings": [
+        "The generated From implementation is first built with quote_spanned and then wrapped by quote carrying the lint allow attribute.",
+        "The lint test may remain supporting evidence without becoming a second in-scope assessment component.",
+        "The projected assessment contains only the from-impl-expansion component."
+      ],
+      "required_evidence_paths": [
+        "impl/src/expand.rs",
+        "tests/test_lints.rs"
+      ],
+      "forbidden_claims": [
+        "Model-authored impact assessments are mechanically proven facts.",
+        "The projected result includes lint-regression-test as an in-scope assessment component.",
+        "The projection establishes an unrelated public API change."
+      ],
+      "reviewer_checks": [
+        "Evidence retained by projection supports the implementation component or its focused validation.",
+        "No assessment belonging exclusively to the omitted test component survives projection.",
+        "The projected answer is semantically equivalent to a fresh assessment of from-impl-expansion alone."
+      ]
+    }
+  ]
+}

@@ -1,12 +1,18 @@
 //! Codex hook transport adapter.  Inputs deliberately accept unknown fields,
 //! while outputs are small, strict protocol objects.
 
+mod action_provider;
 mod app_server;
 mod debug_log;
+mod lifecycle_adapter;
+mod lifecycle_test_plan;
 mod patcher;
+mod reviewer;
+mod test_executor;
 mod verifier;
 mod worker;
 
+pub use action_provider::{CodexChangeActionProvider, codex_change_action_provider_definition};
 pub use app_server::{
     ActiveTurnInterruption, CodexMainSession, ContinueWorkingResult, MainContinuationDiagnostics,
     MainDirectFailure, MainFinalTurn, MainNeedDiagnostics, MainNeedRelation, MainNeedTurn,
@@ -15,7 +21,11 @@ pub use app_server::{
 pub use debug_log::{
     DebugLoggingStatus, debug_logging_status, disable_debug_logging, enable_debug_logging,
 };
-pub use patcher::{CodexPatchWorker, PatchContextItem, PrepareChangeOutcome};
+pub use lifecycle_adapter::CodexLifecycleActionAdapter;
+pub use patcher::{
+    CodexPatchWorker, PatchContextItem, PrepareChangeOutcome, ProposeActionBinding,
+    ProposeActionOutcome,
+};
 pub use verifier::{CodexVerifier, VerifyChangeOutcome};
 pub use worker::{
     CodexWorker, IsolationReport, TransportPreflightReport, WorkerDiagnosticContract,

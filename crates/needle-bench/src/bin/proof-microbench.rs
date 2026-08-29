@@ -1,13 +1,15 @@
 use needle_core::{
-    ArtifactId, ArtifactRequest, ArtifactValidationCertificateId, BorrowedNeedIr, CacheResolution,
-    CanonicalHasher, CapabilityMode, Digest, EvidenceFailurePolicy, Facet, FlowStepRole,
-    LocationRole, Need, NeedFragment, NeedId, NeedIr, NeedKey, Obligation, PredicateKind,
-    ProofBudget, ReuseUnit, SemanticFlowStep, SemanticLocation, SemanticWorkerArtifact,
-    SemanticWorld, SubjectId, built_in_route_contracts, compile_need, need_fragment,
+    ActionRequest, ArtifactId, ArtifactKind, ArtifactRequest, ArtifactValidationCertificateId,
+    BorrowedNeedIr, CacheResolution, CanonicalHasher, CapabilityMode, Digest,
+    EvidenceFailurePolicy, Facet, FlowStepRole, LocationRole, Need, NeedFragment, NeedFragmentId,
+    NeedId, NeedIr, NeedKey, Obligation, PredicateKind, ProofBudget, ReuseUnit, SemanticFlowStep,
+    SemanticLocation, SemanticWorkerArtifact, SemanticWorld, SubjectId, built_in_route_contracts,
+    compile_need, need_fragment,
 };
 use needle_runtime::{
     NeedShadowWrite, ProofCandidate, ProofPlanner, RuntimeSettings, RuntimeStore,
-    SemanticCostEstimates, SemanticResolver, validate_semantic_artifact,
+    SemanticCostEstimates, SemanticResolver, built_in_action_for_artifact_kind,
+    validate_semantic_artifact,
 };
 use serde::Serialize;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -76,6 +78,7 @@ fn main() {
         parse_observation("parse_16k", &large, iterations),
         hash_observation(iterations),
         request_hash_observation(iterations),
+        action_request_hash_observation(iterations),
         artifact_hash_observation(iterations),
         planner_observation(25),
         replay_observation(iterations),
@@ -98,7 +101,13 @@ fn main() {
     let hash_allocations = observations
         .iter()
         .filter(|item| {
-            matches!(item.name, "canonical_hash" | "artifact_request_hash" | "artifact_hash")
+            matches!(
+                item.name,
+                "canonical_hash"
+                    | "artifact_request_hash"
+                    | "action_request_hash"
+                    | "artifact_hash"
+            )
         })
         .map(|item| item.allocations)
         .sum::<u64>();
@@ -249,6 +258,48 @@ fn request_hash_observation(iterations: usize) -> Observation {
     summarize(
         "artifact_request_hash",
         request.normalized_request.len(),
+        durations,
+        allocations,
+        allocated_bytes,
+    )
+}
+
+fn action_request_hash_observation(iterations: usize) -> Observation {
+    let action =
+        built_in_action_for_artifact_kind(&ArtifactKind::code_location()).expect("built-in action");
+    let mut inputs = vec![Digest::blake3(b"left"), Digest::blake3(b"right")];
+    inputs.sort_unstable();
+    let request = ActionRequest::new(
+        &action.contract,
+        ArtifactRequest {
+            contract_id: action.output_contract_id.to_owned(),
+            contract_revision: action.output_contract_revision,
+            repository_id: Digest::blake3(b"repository"),
+            source_snapshot_digest: Digest::blake3(b"source"),
+            route_key: NeedKey::new("locate.implementation").expect("valid route"),
+            normalized_request: "Locate the implementation.\r\nUse exact evidence.".to_owned(),
+            semantic_fragment_id: Some(NeedFragmentId::new(Digest::blake3(b"fragment"))),
+            input_artifact_ids: inputs,
+        },
+        action.contract.default_dispatch_policy,
+        NeedKey::new("locate.implementation").expect("valid route"),
+        NeedId::new(Digest::blake3(b"root-need")),
+    )
+    .expect("valid action request");
+    let _ = request.semantic_id();
+    let mut durations = Vec::with_capacity(iterations);
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        black_box(request.semantic_id());
+        durations.push(started.elapsed().as_nanos());
+    }
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    summarize(
+        "action_request_hash",
+        request.artifact_request.input_artifact_ids.len(),
         durations,
         allocations,
         allocated_bytes,

@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
     ClaimAdvisoryResolutionKind, NeedShadowWrite, RuntimeSettings,
-    validate_semantic_artifact_with_trace, validate_semantic_test_plan,
+    artifact_and_certificate_are_fresh, validate_semantic_artifact_with_trace,
+    validate_semantic_test_plan,
 };
 use needle_core::{
     ArtifactRequest, CacheResolution, CapabilityMode, Digest, EvidenceBrief, EvidenceFailurePolicy,
@@ -336,7 +337,7 @@ fn promoted_runtime_flow_claim_reuse_is_authoritative_only_with_fresh_claim_depe
 }
 
 #[test]
-fn promoted_focused_test_claim_reuse_prefers_fresh_narrow_certificate() {
+fn provider_declared_test_evidence_scopes_do_not_collapse_into_one_claim() {
     let root = std::env::temp_dir().join(format!(
         "needle-focused-test-claim-authority-{}-{}",
         std::process::id(),
@@ -406,7 +407,15 @@ fn promoted_focused_test_claim_reuse_prefers_fresh_narrow_certificate() {
         "--".to_owned(),
         "--exact".to_owned(),
     ];
-    let worker_artifact = SemanticWorkerArtifact::TestPlan {
+    let broad_worker_artifact = SemanticWorkerArtifact::TestPlan {
+        runner: "cargo".to_owned(),
+        argv: argv.clone(),
+        cwd_relative: ".".to_owned(),
+        identifiers: vec!["answer".to_owned()],
+        selection: "representative".to_owned(),
+        evidence_paths: vec!["Cargo.toml".to_owned(), "tests/answer.rs".to_owned()],
+    };
+    let narrow_worker_artifact = SemanticWorkerArtifact::TestPlan {
         runner: "cargo".to_owned(),
         argv: argv.clone(),
         cwd_relative: ".".to_owned(),
@@ -435,7 +444,7 @@ fn promoted_focused_test_claim_reuse_prefers_fresh_narrow_certificate() {
 
     let validated_broad = validate_semantic_artifact_with_trace(
         &fragment,
-        &worker_artifact,
+        &broad_worker_artifact,
         &root,
         request.semantic_id().digest(),
         None,
@@ -453,14 +462,14 @@ fn promoted_focused_test_claim_reuse_prefers_fresh_narrow_certificate() {
 
     let validated_narrow = validate_semantic_test_plan(
         &fragment,
-        &worker_artifact,
+        &narrow_worker_artifact,
         &root,
         request.semantic_id().digest(),
         None,
         &declared_plan,
     )
     .unwrap();
-    assert_eq!(validated_broad.artifact.id, validated_narrow.artifact.id);
+    assert_ne!(validated_broad.artifact.id, validated_narrow.artifact.id);
     assert_ne!(validated_broad.certificate.id, validated_narrow.certificate.id);
     assert_eq!(
         validated_narrow
@@ -472,7 +481,7 @@ fn promoted_focused_test_claim_reuse_prefers_fresh_narrow_certificate() {
             .collect::<Vec<_>>(),
         vec!["Cargo.toml"]
     );
-    assert_eq!(validated_broad.claims.claims, validated_narrow.claims.claims);
+    assert_ne!(validated_broad.claims.claims, validated_narrow.claims.claims);
     assert_eq!(validated_broad.claims.certificates.len(), 1);
     assert_eq!(validated_narrow.claims.certificates.len(), 1);
     let broad_claim_certificate_id = validated_broad.claims.certificates[0].id;
@@ -557,106 +566,8 @@ fn promoted_focused_test_claim_reuse_prefers_fresh_narrow_certificate() {
         .resolve_for_route(&need, &route.route, &root, source_snapshot_digest, costs, &[])
         .unwrap();
     assert!(!shadow_claim.authoritative);
-    assert!(matches!(shadow_claim.resolution, CacheResolution::Stale { .. }));
-    assert_eq!(
-        shadow_claim.claim_advisory.as_ref().map(|advisory| advisory.resolution),
-        Some(ClaimAdvisoryResolutionKind::ClaimHit)
-    );
-
-    let claim_class = store
-        .capability_classes()
-        .unwrap()
-        .into_iter()
-        .find(|class| {
-            class.reuse_unit == ReuseUnit::Claim && class.predicate == PredicateKind::FocusedTests
-        })
-        .expect("focused-test claim capability");
-    assert_eq!(claim_class.mode, CapabilityMode::Shadow);
-    store
-        .set_capability_mode(
-            &claim_class.id,
-            claim_class.definition_digest,
-            CapabilityMode::Authoritative,
-            Some(Digest::blake3(b"focused-test-claim-offline-evidence")),
-        )
-        .unwrap();
-    let authoritative = resolver
-        .resolve_for_route(&need, &route.route, &root, source_snapshot_digest, costs, &[])
-        .unwrap();
-    assert!(authoritative.authoritative);
-    assert!(authoritative.artifacts.is_empty());
-    let claim_material = authoritative.claim_material.as_ref().expect("claim material");
-    assert_eq!(claim_material.claims.len(), 1);
-    let selected_claim_certificate = authoritative
-        .claim_certificate
-        .as_ref()
-        .expect("claim-set certificate")
-        .validation_certificates
-        .first()
-        .copied()
-        .expect("selected claim certificate");
-    assert_eq!(selected_claim_certificate, narrow_claim_certificate.id);
-    assert_ne!(selected_claim_certificate, broad_claim_certificate_id);
-    let selected_certificate = claim_material
-        .certificates
-        .iter()
-        .find(|certificate| certificate.id == selected_claim_certificate)
-        .expect("selected narrow claim certificate");
-    assert_eq!(
-        selected_certificate
-            .dependencies
-            .iter()
-            .map(|dependency| dependency.path.as_str())
-            .collect::<Vec<_>>(),
-        vec!["Cargo.toml"]
-    );
-    assert_eq!(
-        authoritative.plan.as_ref().and_then(|plan| plan.economics.expected_net_microusd),
-        Some(99)
-    );
-    match &authoritative.resolution {
-        CacheResolution::ClaimHit {
-            artifact_ids,
-            claim_ids,
-            claim_set_certificate_id,
-            selected_plan_id,
-            ..
-        } => {
-            assert_eq!(artifact_ids, &vec![validated_broad.artifact.id]);
-            assert_eq!(claim_ids, &vec![validated_narrow.claims.claims[0].id]);
-            assert_eq!(
-                Some(*claim_set_certificate_id),
-                authoritative.claim_certificate.as_ref().map(|certificate| certificate.id)
-            );
-            assert_eq!(Some(*selected_plan_id), authoritative.plan.as_ref().map(|plan| plan.id));
-        }
-        other => panic!("expected claim-only ClaimHit, got {other:?}"),
-    }
-
-    let request = needle_core::NeedRequest::parse(
-        "@@need:tests.relevant\nFind the relevant focused test.\n@@end",
-    )
-    .unwrap()
-    .unwrap();
-    let projected = crate::semantic_claim_projection::project_claim_brief(
-        &request,
-        need.world.repository_lineage,
-        source_snapshot_digest,
-        &root,
-        claim_material,
-        EvidenceBrief {
-            summary: "focused test".to_owned(),
-            locations: Vec::new(),
-            behavior: None,
-            test_plan: None,
-            claims: Default::default(),
-        },
-        &authoritative.artifacts,
-    )
-    .unwrap();
-    let brief: EvidenceBrief = serde_json::from_value(projected.payload).unwrap();
-    assert_eq!(brief.test_plan, Some(declared_plan));
-    assert!(brief.claims.contains_key("answer"));
+    assert!(matches!(shadow_claim.resolution, CacheResolution::Bypass { .. }));
+    assert!(shadow_claim.claim_advisory.is_none());
 
     fs::write(
         root.join("Cargo.toml"),
@@ -669,5 +580,10 @@ fn promoted_focused_test_claim_reuse_prefers_fresh_narrow_certificate() {
     assert!(!stale.authoritative);
     assert!(matches!(stale.resolution, CacheResolution::Stale { .. }));
     assert!(stale.claim_advisory.is_none());
+    assert!(!artifact_and_certificate_are_fresh(
+        &validated_narrow.artifact,
+        &validated_narrow.certificate,
+        &root
+    ));
     let _ = fs::remove_dir_all(root);
 }

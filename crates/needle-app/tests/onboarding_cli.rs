@@ -85,6 +85,19 @@ impl Fixture {
         self.command().args(arguments).output().unwrap()
     }
 
+    fn run_with_stdin(&self, arguments: &[&str], input: &[u8]) -> Output {
+        let mut child = self
+            .command()
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
     fn run_json(&self, arguments: &[&str]) -> Value {
         let output = self.run(arguments);
         assert!(
@@ -171,6 +184,21 @@ fn companion_commands_are_process_level_idempotent_persistent_and_bounded() {
     assert!(ui_invalid.stdout.is_empty());
     assert!(String::from_utf8(ui_invalid.stderr).unwrap().contains("unknown ui argument `--json`"));
 
+    let run_help = fixture.run(&["run", "--help"]);
+    assert!(run_help.status.success());
+    assert!(run_help.stderr.is_empty());
+    assert!(String::from_utf8(run_help.stdout).unwrap().contains("run --request-stdin"));
+    let run_invalid = fixture.run(&["run", "--request-stdin", "--json"]);
+    assert!(!run_invalid.status.success());
+    assert!(run_invalid.stdout.is_empty());
+    assert!(
+        String::from_utf8(run_invalid.stderr).unwrap().contains("unknown run argument `--json`")
+    );
+    let malformed = fixture.run_with_stdin(&["run", "--request-stdin"], br#"{}"#);
+    assert!(!malformed.status.success());
+    assert!(malformed.stdout.is_empty());
+    assert!(String::from_utf8(malformed.stderr).unwrap().contains("runtime failed"));
+
     let stdout_path = fixture.root.join("serve.stdout");
     let stderr_path = fixture.root.join("serve.stderr");
     let mut server = fixture.command();
@@ -212,7 +240,9 @@ fn companion_commands_are_process_level_idempotent_persistent_and_bounded() {
     let mut response = String::new();
     connection.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 200"));
-    assert!(response.contains(r#""schema":"needle.runtime-health/1""#));
+    assert!(response.contains(r#""schema":"needle.runtime-health/2""#));
+    assert!(response.contains(r#""schema":"needle.repository-watcher-health/1""#));
+    assert!(response.contains(r#""schema":"needle.action-safety-health/1""#));
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(fs::read_to_string(&stderr_path).unwrap().is_empty());

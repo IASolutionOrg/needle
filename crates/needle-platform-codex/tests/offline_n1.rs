@@ -12,12 +12,12 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const SIMULATOR: &str = env!("CARGO_BIN_EXE_needle-sim-codex");
-const EXPECTED_FAILURES: [(&str, &str); 4] = [
-    ("wrong_test_identifier", "test_evidence_invalid"),
-    ("no_test_executed", "test_evidence_invalid"),
+const EXPECTED_FAILURES: [(&str, &str); 2] = [
     ("test_exit_failure", "test_evidence_invalid"),
     ("incomplete_after_repair", "artifact_protocol_incomplete"),
 ];
+
+const OPAQUE_TEST_OUTPUT_SCENARIOS: [&str; 2] = ["opaque_id_output", "opaque_zero_output"];
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -74,6 +74,19 @@ fn completed_command_payload_mismatch_is_rejected_end_to_end() {
 }
 
 #[test]
+fn test_runner_output_is_opaque_to_parent_bound_evidence() {
+    for scenario in OPAQUE_TEST_OUTPUT_SCENARIOS {
+        let simulation = Simulation::run(scenario, 0);
+        assert!(simulation.frontier.contains("[NEEDLE_CONTEXT]"), "{scenario}");
+        assert_eq!(simulation.worker_status, "completed", "{scenario}");
+        assert_eq!(simulation.command_evidence_count, 1, "{scenario}");
+        assert!(simulation.no_pending_approvals, "{scenario}");
+        assert!(simulation.checkout_clean, "{scenario}");
+        assert!(simulation.sandboxes_cleaned, "{scenario}");
+    }
+}
+
+#[test]
 fn declared_test_plan_does_not_require_the_worker_to_execute_it() {
     let simulation = Simulation::run("test_not_invoked", 0);
     assert!(simulation.frontier.contains("[NEEDLE_CONTEXT]"), "{}", simulation.frontier);
@@ -122,7 +135,7 @@ fn transport_preflight_reports_optional_runner_unavailable_without_a_model_turn(
         report
             .test_execution_unavailable_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("not supported"))
+            .is_some_and(|reason| reason.contains("unavailable"))
     );
     assert!(report.app_server_initialized);
     assert!(report.ephemeral_thread_cleanup_completed);

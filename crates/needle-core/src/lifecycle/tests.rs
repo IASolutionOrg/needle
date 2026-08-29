@@ -29,6 +29,8 @@ fn spec() -> LifecycleSpec {
             max_cost_microusd: 100_000,
             max_concurrent_workers: 1,
         },
+        explore_action_plan: None,
+        action_phase_plans: None,
         test_plans: vec![LifecycleTestPlanBinding {
             plan: TestPlan {
                 runner: "cargo".to_owned(),
@@ -126,6 +128,7 @@ fn advance_to_verify(mut state: DevelopmentLifecycle) -> DevelopmentLifecycle {
                     executed: true,
                     passed: true,
                     evidence_id: Some("evidence:focused".to_owned()),
+                    action_evidence_artifact: None,
                     failure_code: None,
                 }],
             },
@@ -147,6 +150,7 @@ fn advance_to_verify(mut state: DevelopmentLifecycle) -> DevelopmentLifecycle {
             LifecycleTransition::CompleteReview {
                 worker: worker(&state.spec.profiles.review),
                 review,
+                report_artifact: Some(ArtifactId::new(Digest::blake3(b"review-report-1"))),
             },
             5,
         )
@@ -205,6 +209,7 @@ fn candidate_worker_transition(
                     executed: true,
                     passed: true,
                     evidence_id: Some("evidence:candidate".to_owned()),
+                    action_evidence_artifact: None,
                     failure_code: None,
                 }],
             }
@@ -221,6 +226,7 @@ fn candidate_worker_transition(
                 state.updated_unix_ms,
             )
             .unwrap(),
+            report_artifact: None,
         },
         LifecyclePhase::Verify => LifecycleTransition::CompleteVerify {
             worker: worker(&state.spec.profiles.verify),
@@ -270,6 +276,7 @@ fn exact_phase_order_and_distinct_review_verifier_reach_approval() {
                     executed: true,
                     passed: true,
                     evidence_id: Some("evidence:focused".to_owned()),
+                    action_evidence_artifact: None,
                     failure_code: None,
                 }],
             },
@@ -291,6 +298,7 @@ fn exact_phase_order_and_distinct_review_verifier_reach_approval() {
             LifecycleTransition::CompleteReview {
                 worker: worker(&state.spec.profiles.review),
                 review,
+                report_artifact: None,
             },
             5,
         )
@@ -466,6 +474,7 @@ fn unavailable_test_evidence_is_terminal_inconclusive() {
                     executed: false,
                     passed: false,
                     evidence_id: None,
+                    action_evidence_artifact: None,
                     failure_code: Some("unavailable".to_owned()),
                 }],
             },
@@ -550,6 +559,10 @@ fn one_repair_is_consumed_and_second_request_fails_terminally() {
     (state, _) = state.transition(LifecycleTransition::ConsumeRepair, 7).unwrap();
     assert_eq!(state.phase, LifecyclePhase::Implement);
     assert!(state.repair_consumed);
+    assert_eq!(
+        state.review_report_artifacts,
+        vec![ArtifactId::new(Digest::blake3(b"review-report-1"))]
+    );
 
     let patch_id = PatchId(Digest::blake3(b"repaired-patch"));
     (state, _) = state
@@ -573,6 +586,7 @@ fn one_repair_is_consumed_and_second_request_fails_terminally() {
                     executed: true,
                     passed: true,
                     evidence_id: Some("evidence:repair".to_owned()),
+                    action_evidence_artifact: None,
                     failure_code: None,
                 }],
             },
@@ -594,10 +608,12 @@ fn one_repair_is_consumed_and_second_request_fails_terminally() {
             LifecycleTransition::CompleteReview {
                 worker: worker(&state.spec.profiles.review),
                 review,
+                report_artifact: Some(ArtifactId::new(Digest::blake3(b"review-report-2"))),
             },
             10,
         )
         .unwrap();
+    assert_eq!(state.review_report_artifacts.len(), 2);
     (state, _) = state
         .transition(verify_transition(&state, VerificationStatus::Repairable, b"repair-2"), 11)
         .unwrap();
@@ -689,6 +705,9 @@ fn review_artifact_cannot_be_substituted_for_verification() {
         id: VerificationArtifactId(review.id),
         change_id: review.change_id.clone(),
         patch_id,
+        action_request: None,
+        requirements_digest: None,
+        input_test_evidence_artifacts: Vec::new(),
         verdict: VerificationStatus::Verified,
         acceptance_coverage: verification_coverage(),
         findings: Vec::new(),
@@ -711,4 +730,68 @@ fn review_artifact_cannot_be_substituted_for_verification() {
         created_unix_ms: 1,
     };
     assert!(!verification.is_canonical());
+}
+
+#[test]
+fn discovered_test_plans_account_for_the_test_worker_and_keep_legacy_wire_compatible() {
+    let mut lifecycle_spec = spec();
+    let binding = lifecycle_spec.test_plans.remove(0);
+    let mut state = DevelopmentLifecycle::new(
+        ChangeId::from_digest(Digest::blake3(b"discovered-plan-change")),
+        Digest::blake3(b"source"),
+        lifecycle_spec,
+        1,
+    )
+    .unwrap();
+    let source_snapshot = state.source_snapshot;
+    (state, _) = state
+        .transition(
+            LifecycleTransition::CompleteExplore {
+                worker: worker(&state.spec.profiles.explore),
+                artifacts: vec![LifecycleArtifactRef {
+                    kind: LifecycleArtifactKind::Exploration,
+                    id: Digest::blake3(b"exploration"),
+                    source_snapshot,
+                }],
+            },
+            2,
+        )
+        .unwrap();
+    (state, _) = state
+        .transition(
+            LifecycleTransition::CompleteImplement {
+                worker: worker(&state.spec.profiles.implement),
+                patch: LifecyclePatchRef {
+                    patch_id: PatchId(Digest::blake3(b"patch")),
+                    revision: 1,
+                },
+            },
+            3,
+        )
+        .unwrap();
+    let plan = LifecycleResolvedTestPlan {
+        artifact: ArtifactId::new(Digest::blake3(b"test-plan-artifact")),
+        binding,
+    };
+    let discovery_worker = worker(&state.spec.profiles.test);
+    (state, _) = state
+        .transition(
+            LifecycleTransition::BindTestPlans {
+                worker: Some(discovery_worker.clone()),
+                plans: vec![plan.clone()],
+            },
+            4,
+        )
+        .unwrap();
+    assert_eq!(state.usage.worker_turns, 3);
+    assert_eq!(state.resolved_test_plans, vec![plan.clone()]);
+
+    let legacy = serde_json::json!({
+        "kind": "bind_test_plans",
+        "plans": [plan]
+    });
+    let decoded: LifecycleTransition = serde_json::from_value(legacy).unwrap();
+    assert!(matches!(decoded, LifecycleTransition::BindTestPlans { worker: None, .. }));
+    let encoded = serde_json::to_value(decoded).unwrap();
+    assert!(encoded.get("worker").is_none());
 }

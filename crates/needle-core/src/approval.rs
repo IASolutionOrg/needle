@@ -123,6 +123,24 @@ pub struct TestCommandPolicy {
 }
 
 impl TestCommandPolicy {
+    pub fn certified_direct(repository_id: Digest, executable: impl Into<String>) -> Self {
+        let executable = executable.into();
+        Self {
+            id: format!(
+                "certified-direct-{}",
+                Digest::blake3(format!("{repository_id}\n{executable}\n")).to_hex()
+            ),
+            repository_id,
+            trusted: true,
+            argv_prefix: vec![executable.clone()],
+            executable,
+            maximum_executions_per_worker: 1,
+        }
+    }
+
+    /// Legacy convenience constructor retained for existing callers. New
+    /// action-native execution derives a direct policy from each certified
+    /// TestPlan instead of recognizing an ecosystem in the kernel.
     pub fn cargo_test(repository_id: Digest) -> Self {
         Self {
             id: "cargo-test-direct-v1".to_owned(),

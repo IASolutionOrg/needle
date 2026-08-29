@@ -53,12 +53,19 @@ fn test_state() -> (AppState, PathBuf) {
     (
         AppState {
             store,
+            data_directory: path.with_extension("data"),
+            lifecycle_step_host: std::sync::Arc::new(
+                super::super::lifecycle_host::UnavailableLifecycleStepHost,
+            ),
+            lifecycle_step_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             authority: "127.0.0.1:43210".to_owned(),
             launch_token: "launch".to_owned(),
             session_token: "session".to_owned(),
             csrf_token: "csrf".to_owned(),
             ipc_endpoint: "test".to_owned(),
             repository_root: PathBuf::from("."),
+            repository_watcher_health:
+                super::super::runtime_health::RepositoryRuntimeHealth::unavailable(),
             apply_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             launch_consumed: std::sync::Arc::new(std::sync::Mutex::new(false)),
         },

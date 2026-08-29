@@ -34,6 +34,38 @@ impl ArtifactKind {
     pub fn evidence_brief() -> Self {
         Self("evidence-brief".to_owned())
     }
+
+    pub fn test_target_inventory() -> Self {
+        Self("test-target-inventory".to_owned())
+    }
+
+    pub fn architecture_brief() -> Self {
+        Self("architecture-brief".to_owned())
+    }
+
+    pub fn change_impact() -> Self {
+        Self("change-impact".to_owned())
+    }
+
+    pub fn patch_proposal() -> Self {
+        Self("patch-proposal".to_owned())
+    }
+
+    pub fn test_execution() -> Self {
+        Self("test-execution".to_owned())
+    }
+
+    pub fn review_report() -> Self {
+        Self("review-report".to_owned())
+    }
+
+    pub fn patch_verification() -> Self {
+        Self("patch-verification".to_owned())
+    }
+
+    pub fn apply_receipt() -> Self {
+        Self("apply-receipt".to_owned())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -76,8 +108,24 @@ impl ArtifactContract {
         kind: ArtifactKind,
         cache_scope: CacheScope,
     ) -> Self {
+        Self::semantic_with_schema(
+            id,
+            revision,
+            kind,
+            SEMANTIC_ARTIFACT_RESULT_SCHEMA_ID,
+            cache_scope,
+        )
+    }
+
+    pub fn semantic_with_schema(
+        id: impl Into<String>,
+        revision: u32,
+        kind: ArtifactKind,
+        schema_id: impl Into<String>,
+        cache_scope: CacheScope,
+    ) -> Self {
         let id = id.into();
-        let schema_id = SEMANTIC_ARTIFACT_RESULT_SCHEMA_ID.to_owned();
+        let schema_id = schema_id.into();
         let mut hasher = crate::CanonicalHasher::new(b"artifact-contract");
         hasher.field_str(&id);
         hasher.field_u32(revision);
@@ -125,6 +173,8 @@ impl ArtifactRequest {
         clone.id()
     }
 
+    /// Frozen v0.4 semantic identity retained for persisted compatibility.
+    /// New action-native requests use [`crate::ActionRequest::semantic_id`].
     pub fn semantic_id(&self) -> ArtifactRequestId {
         self.semantic_id_with_source(self.source_snapshot_digest)
     }
@@ -747,6 +797,10 @@ pub enum TestCommandInputForm {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestCommandViolation {
+    RunnerInvalidOrUnsafe,
+    ArgvNotDirect,
+    // Retained for wire compatibility with diagnostics emitted before the
+    // language-agnostic command contract.
     RunnerNotCargo,
     ArgvNotDirectCargoTest,
     ArgvNotCanonical,
@@ -760,6 +814,8 @@ pub enum TestCommandViolation {
 impl TestCommandViolation {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::RunnerInvalidOrUnsafe => "runner_invalid_or_unsafe",
+            Self::ArgvNotDirect => "argv_not_direct",
             Self::RunnerNotCargo => "runner_not_cargo",
             Self::ArgvNotDirectCargoTest => "argv_not_direct_cargo_test",
             Self::ArgvNotCanonical => "argv_not_canonical",
@@ -772,10 +828,14 @@ impl TestCommandViolation {
     }
 }
 
-/// Canonical, statically safe focused-test command. Worker transports may omit
-/// the executable from `argv` because they already carry `runner`; Needle
-/// accepts that representation only at ingress and immediately restores the
-/// complete process vector used by identity, approval and execution evidence.
+/// Canonical, bounded focused-test command. Worker transports may omit the
+/// executable from `argv` because they already carry `runner`; Needle accepts
+/// that representation only at ingress and immediately restores the complete
+/// direct process vector used by identity, approval and execution evidence.
+///
+/// The kernel intentionally does not recognize Cargo, npm, Python, or any
+/// other ecosystem. Discovery and ecosystem-specific policy belong to the
+/// provider that certifies the plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestCommand {
     runner: String,
@@ -789,31 +849,28 @@ impl TestCommand {
         argv: &[String],
         test_identifier: &str,
     ) -> Result<(Self, TestCommandInputForm), Vec<TestCommandViolation>> {
-        let form = if argv.first().map(String::as_str) == Some("cargo")
-            && argv.get(1).map(String::as_str) == Some("test")
-        {
-            Some(TestCommandInputForm::CompleteArgv)
-        } else if argv.first().map(String::as_str) == Some("test") {
-            Some(TestCommandInputForm::RunnerRelativeArgv)
+        let form = if argv.first().map(String::as_str) == Some(runner) {
+            TestCommandInputForm::CompleteArgv
         } else {
-            None
+            TestCommandInputForm::RunnerRelativeArgv
         };
-        let mut canonical_argv = Vec::with_capacity(argv.len().saturating_add(usize::from(
-            matches!(form, Some(TestCommandInputForm::RunnerRelativeArgv)),
-        )));
-        if matches!(form, Some(TestCommandInputForm::RunnerRelativeArgv)) {
-            canonical_argv.push("cargo".to_owned());
+        let mut canonical_argv = Vec::with_capacity(
+            argv.len()
+                .saturating_add(usize::from(form == TestCommandInputForm::RunnerRelativeArgv)),
+        );
+        if form == TestCommandInputForm::RunnerRelativeArgv {
+            canonical_argv.push(runner.to_owned());
         }
         canonical_argv.extend_from_slice(argv);
 
         let mut violations = Vec::new();
-        if runner != "cargo" {
-            violations.push(TestCommandViolation::RunnerNotCargo);
+        if runner.trim().is_empty()
+            || runner.len() > MAX_TEST_COMMAND_ARGUMENT_BYTES
+            || test_command_text_is_unsafe(runner)
+        {
+            violations.push(TestCommandViolation::RunnerInvalidOrUnsafe);
         }
-        if form.is_none() {
-            violations.push(TestCommandViolation::ArgvNotDirectCargoTest);
-        }
-        if canonical_argv.len() < 3
+        if canonical_argv.len() < 2
             || canonical_argv.len() > MAX_TEST_COMMAND_ARGV
             || canonical_argv.iter().any(|argument| {
                 argument.trim().is_empty()
@@ -822,14 +879,6 @@ impl TestCommand {
             })
         {
             violations.push(TestCommandViolation::ArgvInvalidOrUnsafe);
-        }
-        if canonical_argv.iter().any(|argument| {
-            matches!(
-                argument.as_str(),
-                "--workspace" | "--all" | "--all-targets" | "--manifest-path" | "--config"
-            )
-        }) {
-            violations.push(TestCommandViolation::ArgvScopeNotFocused);
         }
         if canonical_argv
             .iter()
@@ -862,11 +911,11 @@ impl TestCommand {
 
         Ok((
             Self {
-                runner: "cargo".to_owned(),
+                runner: runner.to_owned(),
                 argv: canonical_argv,
                 test_identifier: test_identifier.to_owned(),
             },
-            form.expect("a valid command has a recognized argv form"),
+            form,
         ))
     }
 
@@ -877,7 +926,7 @@ impl TestCommand {
     ) -> Result<Self, Vec<TestCommandViolation>> {
         let (command, form) = Self::from_worker_parts(runner, argv, test_identifier)?;
         if form == TestCommandInputForm::RunnerRelativeArgv {
-            return Err(vec![TestCommandViolation::ArgvNotCanonical]);
+            return Err(vec![TestCommandViolation::ArgvNotDirect]);
         }
         Ok(command)
     }
@@ -1059,6 +1108,10 @@ mod tests {
     #[test]
     fn v04_artifact_request_identity_excludes_route_and_normalizes_lines() {
         let left = request();
+        assert_eq!(
+            left.semantic_id().to_string(),
+            "b3:1ad5ca89025bd7b9d04e173e76e52f4832124c20ca22ffa77dad48c806cda0d8"
+        );
         let mut right = request();
         right.route_key = NeedKey::new("trace.state-flow").unwrap();
         right.normalized_request = "find\nimplementation".to_owned();
@@ -1174,17 +1227,23 @@ mod tests {
     }
 
     #[test]
-    fn focused_test_command_rejects_unsafe_broad_or_unbound_inputs() {
-        let violations = TestCommand::from_worker_parts(
-            "cargo",
-            &["test".to_owned(), "--workspace".to_owned(), ";".to_owned()],
-            "--workspace",
+    fn focused_test_command_is_language_agnostic_and_rejects_unsafe_or_unbound_inputs() {
+        let (pytest, form) = TestCommand::from_worker_parts(
+            "python",
+            &["-m".to_owned(), "pytest".to_owned(), "tests/test_api.py::test_ok".to_owned()],
+            "tests/test_api.py::test_ok",
         )
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(form, TestCommandInputForm::RunnerRelativeArgv);
+        assert_eq!(pytest.argv().first().map(String::as_str), Some("python"));
 
-        assert!(violations.contains(&TestCommandViolation::ArgvScopeNotFocused));
+        let violations =
+            TestCommand::from_worker_parts("cargo", &["test".to_owned(), ";".to_owned()], "--bad")
+                .unwrap_err();
+
         assert!(violations.contains(&TestCommandViolation::ArgvContainsShellSyntax));
         assert!(violations.contains(&TestCommandViolation::IdentifierInvalidOrUnsafe));
+        assert!(violations.contains(&TestCommandViolation::IdentifierNotInArgv));
     }
 
     #[test]

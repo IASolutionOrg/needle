@@ -1,14 +1,19 @@
 use needle_core::{
-    CanonicalHasher, Digest, NeedResult, REPOSITORY_SNAPSHOT_IDENTITY_REVISION, RepositorySnapshot,
+    CanonicalHasher, DependencyLocator, Digest, MAX_STATE_DELTA_LOCATORS, NeedResult,
+    REPOSITORY_SNAPSHOT_IDENTITY_REVISION, RepositorySnapshot,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 const MAX_LINEAGE_CACHE_ENTRIES: usize = 64;
+const MAX_GIT_SNAPSHOT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_GIT_CHANGED_PATH_BYTES: usize =
+    MAX_STATE_DELTA_LOCATORS * (needle_core::MAX_REPOSITORY_PATH_BYTES + 1);
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {
@@ -39,6 +44,41 @@ pub enum SnapshotError {
 }
 
 pub fn capture_git_snapshot(root: &Path) -> Result<(PathBuf, RepositorySnapshot), SnapshotError> {
+    let observed = capture_git_snapshot_inner(root, false)?;
+    Ok((observed.top, observed.snapshot))
+}
+
+pub(crate) fn discover_git_repository_root(root: &Path) -> Result<PathBuf, SnapshotError> {
+    if !root.is_dir() {
+        return Err(SnapshotError::NotDirectory);
+    }
+    discover_git_layout(root).map(|(top, _, _)| top)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitSnapshotObservation {
+    pub top: PathBuf,
+    pub snapshot: RepositorySnapshot,
+    pub dirty_locators: Vec<DependencyLocator>,
+    pub locators_complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitChangedLocators {
+    pub locators: Vec<DependencyLocator>,
+    pub complete: bool,
+}
+
+pub(crate) fn capture_git_observation(
+    root: &Path,
+) -> Result<GitSnapshotObservation, SnapshotError> {
+    capture_git_snapshot_inner(root, true)
+}
+
+fn capture_git_snapshot_inner(
+    root: &Path,
+    collect_locators: bool,
+) -> Result<GitSnapshotObservation, SnapshotError> {
     if !root.is_dir() {
         return Err(SnapshotError::NotDirectory);
     }
@@ -47,15 +87,27 @@ pub fn capture_git_snapshot(root: &Path) -> Result<(PathBuf, RepositorySnapshot)
     if head_sha.len() != 40 || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(SnapshotError::Git("HEAD is not a 40-character SHA".to_owned()));
     }
-    let status = git_bytes(&top, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    let status = git_bytes_required_bounded(
+        &top,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        MAX_GIT_SNAPSHOT_OUTPUT_BYTES,
+        "Git status",
+    )?;
     let mut tracked_hasher = blake3::Hasher::new();
     tracked_hasher.update(b"needle-tracked-changes\n");
     // Hash semantic index entries rather than the raw index file. Git's index
     // contains worktree-specific stat data, so byte hashing would make an
     // otherwise identical detached worktree impossible to reproduce.
-    tracked_hasher.update(&git_bytes(&top, &["ls-files", "--stage", "-z"])?);
+    tracked_hasher.update(&git_bytes_required_bounded(
+        &top,
+        &["ls-files", "--stage", "-z"],
+        MAX_GIT_SNAPSHOT_OUTPUT_BYTES,
+        "Git index",
+    )?);
     let mut untracked_hasher = blake3::Hasher::new();
     untracked_hasher.update(b"needle-untracked\n");
+    let mut dirty_locators = BTreeSet::new();
+    let mut locators_complete = true;
     let mut records = status.split(|byte| *byte == 0).filter(|record| !record.is_empty());
     while let Some(record) = records.next() {
         if record.len() < 4 || record[2] != b' ' {
@@ -66,6 +118,19 @@ pub fn capture_git_snapshot(root: &Path) -> Result<(PathBuf, RepositorySnapshot)
             std::str::from_utf8(&record[3..]).map_err(|_| SnapshotError::Utf8)?.to_owned();
         let rename_or_copy = state.iter().any(|byte| matches!(byte, b'R' | b'C'));
         let original = rename_or_copy.then(|| records.next()).flatten();
+        if collect_locators {
+            collect_repository_locator(&relative, &mut dirty_locators, &mut locators_complete);
+            if let Some(original) = original {
+                match std::str::from_utf8(original) {
+                    Ok(original) => collect_repository_locator(
+                        original,
+                        &mut dirty_locators,
+                        &mut locators_complete,
+                    ),
+                    Err(_) => locators_complete = false,
+                }
+            }
+        }
         let hasher = if state == b"??" { &mut untracked_hasher } else { &mut tracked_hasher };
         hasher.update(record);
         hasher.update(b"\0");
@@ -80,7 +145,7 @@ pub fn capture_git_snapshot(root: &Path) -> Result<(PathBuf, RepositorySnapshot)
             if !canonical.starts_with(&top) || !canonical.is_file() {
                 return Err(SnapshotError::UnsafeEvidence(relative));
             }
-            hasher.update(&fs::read(canonical)?);
+            hash_file_contents(hasher, &canonical)?;
         }
         hasher.update(b"\0");
     }
@@ -94,9 +159,9 @@ pub fn capture_git_snapshot(root: &Path) -> Result<(PathBuf, RepositorySnapshot)
     source_hasher.field_digest(tracked_changes_digest);
     source_hasher.field_digest(untracked_content_digest);
     let source_digest = source_hasher.finish();
-    Ok((
+    Ok(GitSnapshotObservation {
         top,
-        RepositorySnapshot {
+        snapshot: RepositorySnapshot {
             identity_revision: REPOSITORY_SNAPSHOT_IDENTITY_REVISION,
             repository_id,
             head_sha,
@@ -104,7 +169,73 @@ pub fn capture_git_snapshot(root: &Path) -> Result<(PathBuf, RepositorySnapshot)
             untracked_content_digest,
             source_digest,
         },
-    ))
+        dirty_locators: dirty_locators.into_iter().collect(),
+        locators_complete,
+    })
+}
+
+pub(crate) fn git_changed_locators(
+    root: &Path,
+    from_head: &str,
+    to_head: &str,
+) -> Result<GitChangedLocators, SnapshotError> {
+    validate_git_object_id(from_head)?;
+    validate_git_object_id(to_head)?;
+    if from_head == to_head {
+        return Ok(GitChangedLocators { locators: Vec::new(), complete: true });
+    }
+    let Some(output) = git_bytes_bounded(
+        root,
+        &["diff", "--name-only", "-z", "--no-renames", from_head, to_head, "--"],
+        MAX_GIT_CHANGED_PATH_BYTES,
+    )?
+    else {
+        return Ok(GitChangedLocators { locators: Vec::new(), complete: false });
+    };
+    let mut locators = BTreeSet::new();
+    let mut complete = true;
+    for path in output.split(|byte| *byte == 0).filter(|path| !path.is_empty()) {
+        match std::str::from_utf8(path) {
+            Ok(path) => collect_repository_locator(path, &mut locators, &mut complete),
+            Err(_) => complete = false,
+        }
+    }
+    Ok(GitChangedLocators { locators: locators.into_iter().collect(), complete })
+}
+
+fn collect_repository_locator(
+    path: &str,
+    locators: &mut BTreeSet<DependencyLocator>,
+    complete: &mut bool,
+) {
+    let Ok(locator) = DependencyLocator::repository_path(path) else {
+        *complete = false;
+        return;
+    };
+    if !locators.contains(&locator) && locators.len() == MAX_STATE_DELTA_LOCATORS {
+        *complete = false;
+        return;
+    }
+    locators.insert(locator);
+}
+
+fn hash_file_contents(hasher: &mut blake3::Hasher, path: &Path) -> Result<(), SnapshotError> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn validate_git_object_id(value: &str) -> Result<(), SnapshotError> {
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SnapshotError::Git("Git object id is not a 40-character SHA".to_owned()));
+    }
+    Ok(())
 }
 
 fn repository_lineage_id(
@@ -429,6 +560,7 @@ fn git_bytes(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, SnapshotError> 
         .arg("-C")
         .arg(root)
         .args(arguments)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .map_err(SnapshotError::Io)?;
     if !output.status.success() {
@@ -436,6 +568,55 @@ fn git_bytes(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, SnapshotError> 
         return Err(SnapshotError::Git(diagnostic));
     }
     Ok(output.stdout)
+}
+
+fn git_bytes_bounded(
+    root: &Path,
+    arguments: &[&str],
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, SnapshotError> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(SnapshotError::Io)?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(SnapshotError::Git("Git stdout is unavailable".to_owned()));
+    };
+    let read_limit = maximum.saturating_add(1).try_into().unwrap_or(u64::MAX);
+    let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
+    if let Err(error) = stdout.take(read_limit).read_to_end(&mut bytes) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(SnapshotError::Io(error));
+    }
+    if bytes.len() > maximum {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    }
+    let status = child.wait().map_err(SnapshotError::Io)?;
+    if !status.success() {
+        return Err(SnapshotError::Git("bounded Git command failed".to_owned()));
+    }
+    Ok(Some(bytes))
+}
+
+fn git_bytes_required_bounded(
+    root: &Path,
+    arguments: &[&str],
+    maximum: usize,
+    label: &'static str,
+) -> Result<Vec<u8>, SnapshotError> {
+    git_bytes_bounded(root, arguments, maximum)?.ok_or_else(|| {
+        SnapshotError::Git(format!("{label} output exceeds the {maximum}-byte safety bound"))
+    })
 }
 
 #[cfg(test)]
@@ -499,6 +680,20 @@ mod tests {
 
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(clone);
+    }
+
+    #[test]
+    fn bounded_git_capture_rejects_output_before_unbounded_retention() {
+        let root = committed_repository();
+        fs::write(root.join("untracked-with-a-long-name.txt"), b"content").unwrap();
+        let output = git_bytes_bounded(
+            &root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            8,
+        )
+        .unwrap();
+        assert!(output.is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

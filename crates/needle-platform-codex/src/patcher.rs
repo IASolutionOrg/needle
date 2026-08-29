@@ -1,4 +1,4 @@
-use crate::app_server::AppServerSession;
+use crate::app_server::{AppServerSession, AppServerTurn};
 use crate::worker::CodexWorker;
 use needle_core::{
     AcceptanceCoverage, AllowedPathScope, ChangeId, ChangeRequest, Digest, MAX_ACCEPTANCE_CRITERIA,
@@ -37,8 +37,26 @@ struct PatchRunContext<'a> {
     started: Instant,
     change_id: ChangeId,
     request_digest: Digest,
+    operation_id: Option<Digest>,
     repair: Option<&'a RepairSeed>,
     codex_version: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct PatchAttemptUsage {
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+impl From<&AppServerTurn> for PatchAttemptUsage {
+    fn from(turn: &AppServerTurn) -> Self {
+        Self {
+            input_tokens: turn.input_tokens,
+            cached_input_tokens: turn.cached_input_tokens,
+            output_tokens: turn.output_tokens,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +82,19 @@ pub struct PrepareChangeOutcome {
     pub observed_repository_files: u32,
     pub observation_gaps: u32,
     pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposeActionOutcome {
+    pub patch: PatchArtifact,
+    pub usage: PrepareChangeOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposeActionBinding {
+    pub operation_id: Digest,
+    pub change_id: ChangeId,
+    pub source_snapshot: Digest,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +172,7 @@ impl CodexPatchWorker {
                 started,
                 change_id: change_id.clone(),
                 request_digest,
+                operation_id: None,
                 repair: None,
                 codex_version: &isolation.codex_version,
             },
@@ -148,11 +180,109 @@ impl CodexPatchWorker {
         record_failed_patch_run(&store, &change_id, outcome)
     }
 
+    pub fn propose_action(
+        &self,
+        config: &WorkerConfig,
+        repository_root: &Path,
+        binding: &ProposeActionBinding,
+        request: &ChangeRequest,
+        context: &[PatchContextItem],
+    ) -> Result<ProposeActionOutcome, String> {
+        let started = Instant::now();
+        validate_change_request(request, context)?;
+        let isolation = CodexWorker::verify_isolation(&config.executable)?;
+        if !isolation.verified() {
+            return Err(format!(
+                "patch worker isolation is not verified for Codex {}",
+                isolation.codex_version
+            ));
+        }
+        let repository_root = fs::canonicalize(repository_root)
+            .map_err(|error| format!("cannot resolve change repository: {error}"))?;
+        let sandbox = IsolatedCheckout::materialize(
+            &repository_root,
+            &self.data_directory.join("change-runs"),
+        )
+        .map_err(|error| error.to_string())?;
+        if sandbox.snapshot().source_digest != binding.source_snapshot {
+            return cleanup_sandbox_after_error(
+                sandbox,
+                "active source snapshot differs from the action request".to_owned(),
+            );
+        }
+        let request_digest = request.digest(binding.source_snapshot);
+        if ChangeId::from_digest(request_digest) != binding.change_id {
+            return cleanup_sandbox_after_error(
+                sandbox,
+                "action change identity differs from the canonical request".to_owned(),
+            );
+        }
+        let store = RuntimeStore::new(self.data_directory.join("needle.sqlite3"));
+        if let Err(error) = store.initialize().and_then(|()| {
+            store.record_change_request_with_provenance(
+                &binding.change_id,
+                sandbox.snapshot().repository_id,
+                sandbox.snapshot().source_digest,
+                request_digest,
+                request,
+                config.role_profile_provenance.as_ref(),
+            )
+        }) {
+            return cleanup_sandbox_after_error(sandbox, error.to_string());
+        }
+        let outcome = self.prepare_in_sandbox(
+            config,
+            request,
+            context,
+            sandbox,
+            PatchRunContext {
+                started,
+                change_id: binding.change_id.clone(),
+                request_digest,
+                operation_id: Some(binding.operation_id),
+                repair: None,
+                codex_version: &isolation.codex_version,
+            },
+        );
+        let usage = record_failed_patch_run(&store, &binding.change_id, outcome)?;
+        let prepared = store
+            .prepared_change(&binding.change_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "action patch was not persisted".to_owned())?;
+        if prepared.patch.id != usage.patch_id
+            || prepared.patch.change_id != binding.change_id
+            || prepared.patch.source_snapshot != binding.source_snapshot
+        {
+            return Err("persisted action patch binding is invalid".to_owned());
+        }
+        Ok(ProposeActionOutcome { patch: prepared.patch, usage })
+    }
+
     pub fn repair(
         &self,
         config: &WorkerConfig,
         repository_root: &Path,
         change_id: &ChangeId,
+    ) -> Result<PrepareChangeOutcome, String> {
+        self.repair_with_operation(config, repository_root, change_id, None)
+    }
+
+    pub fn repair_action(
+        &self,
+        config: &WorkerConfig,
+        repository_root: &Path,
+        change_id: &ChangeId,
+        operation_id: Digest,
+    ) -> Result<PrepareChangeOutcome, String> {
+        self.repair_with_operation(config, repository_root, change_id, Some(operation_id))
+    }
+
+    fn repair_with_operation(
+        &self,
+        config: &WorkerConfig,
+        repository_root: &Path,
+        change_id: &ChangeId,
+        operation_id: Option<Digest>,
     ) -> Result<PrepareChangeOutcome, String> {
         let started = Instant::now();
         let store = RuntimeStore::new(self.data_directory.join("needle.sqlite3"));
@@ -212,6 +342,7 @@ impl CodexPatchWorker {
                 started,
                 change_id: change_id.clone(),
                 request_digest: prepared.request_digest,
+                operation_id,
                 repair: Some(&seed),
                 codex_version: &isolation.codex_version,
             },
@@ -227,7 +358,15 @@ impl CodexPatchWorker {
         sandbox: IsolatedCheckout,
         run: PatchRunContext<'_>,
     ) -> Result<PrepareChangeOutcome, String> {
-        let PatchRunContext { started, change_id, request_digest, repair, codex_version } = run;
+        let PatchRunContext {
+            started,
+            change_id,
+            request_digest,
+            operation_id,
+            repair,
+            codex_version,
+        } = run;
+        let revision = repair.map_or(1, |_| 2);
         let baseline = match capture_tree(sandbox.checkout_root()) {
             Ok(baseline) => baseline,
             Err(error) => return cleanup_sandbox_after_error(sandbox, error),
@@ -275,21 +414,49 @@ impl CodexPatchWorker {
         session.fail_fast_on_pending_approvals();
         let turn = match session.run_turn_cancellable(
             &patcher_prompt(request, context, repair),
-            &patcher_output_schema(),
+            &patcher_output_schema(request),
             Duration::from_secs(config.timeout_seconds),
             self.cancellation.as_deref(),
         ) {
             Ok(turn) => turn,
             Err(failure) => {
+                let error = record_rejected_patch_attempt(
+                    &store,
+                    &change_id,
+                    config,
+                    operation_id,
+                    codex_version,
+                    revision,
+                    PatchAttemptUsage {
+                        input_tokens: failure.input_tokens,
+                        cached_input_tokens: failure.cached_input_tokens,
+                        output_tokens: failure.output_tokens,
+                    },
+                    started,
+                    "turn_failed",
+                    &failure.diagnostic,
+                );
                 let cleanup = session.cleanup();
                 return cleanup_all_after_error(
                     sandbox,
                     cleanup,
-                    format!("patch worker turn failed: {}", failure.diagnostic),
+                    format!("patch worker turn failed: {error}"),
                 );
             }
         };
         if let Err(error) = session.cleanup() {
+            let error = record_rejected_patch_attempt(
+                &store,
+                &change_id,
+                config,
+                operation_id,
+                codex_version,
+                revision,
+                (&turn).into(),
+                started,
+                "session_cleanup_failed",
+                &error.to_string(),
+            );
             return cleanup_sandbox_after_error(
                 sandbox,
                 format!("patch worker session cleanup failed: {error}"),
@@ -298,6 +465,18 @@ impl CodexPatchWorker {
         let declared = match serde_json::from_value::<DeclaredPatchOutput>(turn.response.clone()) {
             Ok(declared) => declared,
             Err(error) => {
+                let error = record_rejected_patch_attempt(
+                    &store,
+                    &change_id,
+                    config,
+                    operation_id,
+                    codex_version,
+                    revision,
+                    (&turn).into(),
+                    started,
+                    "output_decode_failed",
+                    &error.to_string(),
+                );
                 return cleanup_sandbox_after_error(
                     sandbox,
                     format!("patch worker output is invalid: {error}"),
@@ -305,17 +484,52 @@ impl CodexPatchWorker {
             }
         };
         if turn.file_change_approvals_granted != 1 {
-            return cleanup_sandbox_after_error(
-                sandbox,
-                "patch worker did not use exactly one file-change approval".to_owned(),
+            let error = record_rejected_patch_attempt(
+                &store,
+                &change_id,
+                config,
+                operation_id,
+                codex_version,
+                revision,
+                (&turn).into(),
+                started,
+                "file_change_approval_mismatch",
+                "patch worker did not use exactly one file-change approval",
             );
+            return cleanup_sandbox_after_error(sandbox, error);
         }
         if let Err(error) = validate_declared_output(request, &declared) {
+            let error = record_rejected_patch_attempt(
+                &store,
+                &change_id,
+                config,
+                operation_id,
+                codex_version,
+                revision,
+                (&turn).into(),
+                started,
+                "declared_output_rejected",
+                &error,
+            );
             return cleanup_sandbox_after_error(sandbox, error);
         }
         let observed = match capture_tree(sandbox.checkout_root()) {
             Ok(observed) => observed,
-            Err(error) => return cleanup_sandbox_after_error(sandbox, error),
+            Err(error) => {
+                let error = record_rejected_patch_attempt(
+                    &store,
+                    &change_id,
+                    config,
+                    operation_id,
+                    codex_version,
+                    revision,
+                    (&turn).into(),
+                    started,
+                    "post_turn_observation_failed",
+                    &error,
+                );
+                return cleanup_sandbox_after_error(sandbox, error);
+            }
         };
         let (files, blobs) = match observe_patch(
             sandbox.checkout_root(),
@@ -325,14 +539,28 @@ impl CodexPatchWorker {
             &baseline_blobs,
         ) {
             Ok(patch) => patch,
-            Err(error) => return cleanup_sandbox_after_error(sandbox, error),
+            Err(error) => {
+                let error = record_rejected_patch_attempt(
+                    &store,
+                    &change_id,
+                    config,
+                    operation_id,
+                    codex_version,
+                    revision,
+                    (&turn).into(),
+                    started,
+                    "filesystem_patch_rejected",
+                    &error,
+                );
+                return cleanup_sandbox_after_error(sandbox, error);
+            }
         };
         let patch_id = PatchArtifact::compute_id(sandbox.snapshot().source_digest, &files);
         let discrepancies = declared_discrepancies(&declared.changed_files, &files);
         let patch = PatchArtifact {
             id: patch_id,
             change_id: change_id.clone(),
-            revision: repair.map_or(1, |_| 2),
+            revision,
             source_snapshot: sandbox.snapshot().source_digest,
             files: files.clone(),
             summary: declared.summary.clone(),
@@ -352,10 +580,20 @@ impl CodexPatchWorker {
             &blobs,
             config.role_profile_provenance.as_ref(),
         ) {
-            return cleanup_sandbox_after_error(
-                sandbox,
-                format!("cannot persist patch before cleanup: {error}"),
+            let diagnostic = format!("cannot persist patch before cleanup: {error}");
+            let error = record_rejected_patch_attempt(
+                &store,
+                &change_id,
+                config,
+                operation_id,
+                codex_version,
+                revision,
+                (&turn).into(),
+                started,
+                "patch_publication_failed",
+                &diagnostic,
             );
+            return cleanup_sandbox_after_error(sandbox, error);
         }
         if let Err(error) = store.record_patch_attempt_with_provenance(
             &change_id,
@@ -365,7 +603,9 @@ impl CodexPatchWorker {
                 "reasoning": config.reasoning,
                 "service_tier": config.service_tier,
                 "codex_version": codex_version,
-                "revision": patch.revision
+                "revision": patch.revision,
+                "operation_id": operation_id,
+                "outcome": "accepted"
             }),
             &json!({
                 "input_tokens": turn.input_tokens,
@@ -434,6 +674,50 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn record_rejected_patch_attempt(
+    store: &RuntimeStore,
+    change_id: &ChangeId,
+    config: &WorkerConfig,
+    operation_id: Option<Digest>,
+    codex_version: &str,
+    revision: u32,
+    usage: PatchAttemptUsage,
+    started: Instant,
+    failure_code: &str,
+    diagnostic: &str,
+) -> String {
+    let persistence = store.record_rejected_patch_attempt_with_provenance(
+        change_id,
+        &json!({
+            "model": config.model,
+            "reasoning": config.reasoning,
+            "service_tier": config.service_tier,
+            "codex_version": codex_version,
+            "revision": revision,
+            "operation_id": operation_id,
+            "outcome": "rejected",
+            "failure_code": failure_code,
+            "failure_detail_digest": Digest::blake3(diagnostic.as_bytes())
+        }),
+        &json!({
+            "input_tokens": usage.input_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "output_tokens": usage.output_tokens,
+            "duration_ms": started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+        }),
+        None,
+        current_unix_ms(),
+        config.role_profile_provenance.as_ref(),
+    );
+    match persistence {
+        Ok(()) => diagnostic.to_owned(),
+        Err(error) => {
+            format!("{diagnostic}; cannot persist rejected patch attempt accounting: {error}")
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DeclaredPatchOutput {
@@ -475,6 +759,11 @@ fn validate_change_request(
         || request.acceptance_criteria.iter().any(|item| item.trim().is_empty())
     {
         return Err("change requires 1 to 8 non-empty acceptance criteria".to_owned());
+    }
+    if request.acceptance_criteria.iter().collect::<BTreeSet<_>>().len()
+        != request.acceptance_criteria.len()
+    {
+        return Err("change acceptance criteria must be unique".to_owned());
     }
     if request.allowed_paths.is_empty() || request.allowed_paths.len() > MAX_ALLOWED_PATHS {
         return Err("change requires 1 to 16 allowed paths".to_owned());
@@ -547,7 +836,7 @@ fn validate_declared_output(
 
 fn patcher_instructions(request: &ChangeRequest, repair: bool) -> String {
     format!(
-        "You are Needle's isolated {}patch worker. Work only inside the disposable checkout. Modify only the explicitly allowed path scopes. Never access the network, credentials, Git metadata, external tools, hooks, plugins, MCP, project instructions, or other agents. Read-only repository inspection commands are allowed when necessary. Do not run tests unless the request explicitly requires a supplied certified command; no test command is supplied in this turn. Make the smallest complete UTF-8 text change satisfying the task. The runtime, not your response, determines the authoritative filesystem patch. Return only JSON matching the output schema. Allowed path scopes: {}",
+        "You are Needle's isolated {}patch worker. Work only inside the disposable checkout. Modify only the explicitly allowed path scopes. Never access the network, credentials, Git metadata, external tools, hooks, plugins, MCP, project instructions, or other agents. Read-only repository inspection commands are allowed when necessary. Do not run tests unless the request explicitly requires a supplied certified command; no test command is supplied in this turn. Make the smallest complete UTF-8 text change satisfying the task. The runtime, not your response, determines the authoritative filesystem patch. Return only JSON matching the output schema. In acceptance_coverage, copy every supplied acceptance criterion byte-for-byte exactly once; never paraphrase, combine, omit, or duplicate criteria. Allowed path scopes: {}",
         if repair { "one-shot repair " } else { "" },
         request
             .allowed_paths
@@ -602,7 +891,8 @@ fn patcher_prompt(
     prompt
 }
 
-fn patcher_output_schema() -> Value {
+fn patcher_output_schema(request: &ChangeRequest) -> Value {
+    let acceptance_count = request.acceptance_criteria.len();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -621,12 +911,19 @@ fn patcher_output_schema() -> Value {
                 }
             },
             "acceptance_coverage": {
-                "type": "array", "minItems": 1, "maxItems": MAX_ACCEPTANCE_CRITERIA,
+                "type": "array",
+                "description": "One entry per supplied acceptance criterion, copied byte-for-byte exactly once.",
+                "minItems": acceptance_count,
+                "maxItems": acceptance_count,
                 "items": {
                     "type": "object", "additionalProperties": false,
                     "required": ["criterion", "status", "evidence"],
                     "properties": {
-                        "criterion": {"type": "string", "minLength": 1, "maxLength": 2048},
+                        "criterion": {
+                            "type": "string",
+                            "description": "Copy one supplied acceptance criterion byte-for-byte without paraphrasing.",
+                            "enum": request.acceptance_criteria
+                        },
                         "status": {"type": "string", "enum": ["addressed", "partial", "unaddressed"]},
                         "evidence": {"type": "string", "maxLength": 2048}
                     }
@@ -1003,6 +1300,70 @@ mod tests {
         assert!(validate_change_request(&request("../outside"), &[]).is_err());
         assert!(validate_change_request(&request(".git/config"), &[]).is_err());
         assert!(validate_change_request(&request("src/lib.rs"), &[]).is_ok());
+    }
+
+    #[test]
+    fn patcher_schema_binds_exact_acceptance_criteria_and_count() {
+        let request = ChangeRequest {
+            acceptance_criteria: vec![
+                "increment(1) returns 2.".to_owned(),
+                "increment('1') throws TypeError.".to_owned(),
+            ],
+            ..request("src/lib.rs")
+        };
+        let schema = patcher_output_schema(&request);
+        let coverage = schema.pointer("/properties/acceptance_coverage").unwrap();
+        assert_eq!(coverage.get("minItems"), Some(&json!(2)));
+        assert_eq!(coverage.get("maxItems"), Some(&json!(2)));
+        assert_eq!(
+            coverage.pointer("/items/properties/criterion/enum"),
+            Some(&json!(request.acceptance_criteria))
+        );
+        let instructions = patcher_instructions(&request, false);
+        assert!(instructions.contains("byte-for-byte exactly once"));
+    }
+
+    #[test]
+    fn declared_output_accepts_exact_criteria_and_rejects_paraphrases() {
+        let request = ChangeRequest {
+            acceptance_criteria: vec![
+                "increment(1) returns 2.".to_owned(),
+                "increment('1') throws TypeError.".to_owned(),
+            ],
+            ..request("src/lib.rs")
+        };
+        let exact: DeclaredPatchOutput = serde_json::from_value(json!({
+            "summary": "Update increment.",
+            "changed_files": [{"path": "src/lib.rs", "operation": "update"}],
+            "acceptance_coverage": request.acceptance_criteria.iter().map(|criterion| json!({
+                "criterion": criterion,
+                "status": "addressed",
+                "evidence": "Implemented in src/lib.rs."
+            })).collect::<Vec<_>>(),
+            "residual_risks": []
+        }))
+        .unwrap();
+        assert_eq!(validate_declared_output(&request, &exact), Ok(()));
+
+        let mut paraphrased = exact;
+        paraphrased.acceptance_coverage[1].criterion = "Strings must raise a TypeError.".to_owned();
+        assert!(
+            validate_declared_output(&request, &paraphrased)
+                .unwrap_err()
+                .contains("each acceptance criterion exactly once")
+        );
+    }
+
+    #[test]
+    fn request_rejects_duplicate_acceptance_criteria() {
+        let request = ChangeRequest {
+            acceptance_criteria: vec!["Same criterion.".to_owned(), "Same criterion.".to_owned()],
+            ..request("src/lib.rs")
+        };
+        assert_eq!(
+            validate_change_request(&request, &[]),
+            Err("change acceptance criteria must be unique".to_owned())
+        );
     }
 
     #[test]

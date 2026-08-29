@@ -1,0 +1,279 @@
+{
+  "format_revision": 1,
+  "schema": "needle.derived-action-study/1",
+  "source": {
+    "repository_url": "https://github.com/dtolnay/thiserror.git",
+    "base_sha": "485c2b7eed2702c4a109be3cf42bb4be27fe16bd",
+    "change_target_sha": "2deec96fc0de605d114d3860f29d1d066ad4151e"
+  },
+  "execution_profile": {
+    "id": "accepted-shadow.external-model-local-reuse.v1",
+    "fresh_execution": "external_model",
+    "reuse_execution": "offline_validated_reuse",
+    "pair_seeds": [
+      7
+    ]
+  },
+  "tasks": [
+    {
+      "id": "architecture-assemble",
+      "action": "architecture_brief",
+      "scenario": "assemble",
+      "prompt": "Describe the responsibilities, entry points, public boundaries, and package dependencies for the requested Cargo workspace scope. Cite repository-relative evidence for every material assertion and state unsupported or incomplete areas as gaps.",
+      "fixture": {
+        "kind": "architecture_brief",
+        "workspace_manifest": "Cargo.toml",
+        "package_universe": [
+          {
+            "name": "thiserror",
+            "manifest_path": "Cargo.toml"
+          },
+          {
+            "name": "thiserror-impl",
+            "manifest_path": "impl/Cargo.toml"
+          },
+          {
+            "name": "thiserror_no_std_test",
+            "manifest_path": "tests/no-std/Cargo.toml"
+          }
+        ],
+        "requested_packages": [],
+        "reuse_source_packages": [
+          [
+            "thiserror"
+          ],
+          [
+            "thiserror-impl"
+          ],
+          [
+            "thiserror_no_std_test"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "architecture-exact",
+      "action": "architecture_brief",
+      "scenario": "exact",
+      "prompt": "Describe the responsibilities, entry points, public boundaries, and package dependencies for the requested Cargo workspace scope. Cite repository-relative evidence for every material assertion and state unsupported or incomplete areas as gaps.",
+      "fixture": {
+        "kind": "architecture_brief",
+        "workspace_manifest": "Cargo.toml",
+        "package_universe": [
+          {
+            "name": "thiserror",
+            "manifest_path": "Cargo.toml"
+          },
+          {
+            "name": "thiserror-impl",
+            "manifest_path": "impl/Cargo.toml"
+          },
+          {
+            "name": "thiserror_no_std_test",
+            "manifest_path": "tests/no-std/Cargo.toml"
+          }
+        ],
+        "requested_packages": [],
+        "reuse_source_packages": [
+          []
+        ]
+      }
+    },
+    {
+      "id": "architecture-project",
+      "action": "architecture_brief",
+      "scenario": "project",
+      "prompt": "Describe the responsibilities, entry points, public boundaries, and package dependencies for the requested Cargo workspace scope. Cite repository-relative evidence for every material assertion and state unsupported or incomplete areas as gaps.",
+      "fixture": {
+        "kind": "architecture_brief",
+        "workspace_manifest": "Cargo.toml",
+        "package_universe": [
+          {
+            "name": "thiserror",
+            "manifest_path": "Cargo.toml"
+          },
+          {
+            "name": "thiserror-impl",
+            "manifest_path": "impl/Cargo.toml"
+          },
+          {
+            "name": "thiserror_no_std_test",
+            "manifest_path": "tests/no-std/Cargo.toml"
+          }
+        ],
+        "requested_packages": [
+          "thiserror-impl"
+        ],
+        "reuse_source_packages": [
+          []
+        ]
+      }
+    },
+    {
+      "id": "change-impact-assemble",
+      "action": "change_impact",
+      "scenario": "assemble",
+      "prompt": "Assess every requested requirement and subject against the pinned patch. Classify impact, cite before and after repository evidence, identify the focused validation target, and preserve uncertainty where the evidence does not establish an effect.",
+      "fixture": {
+        "kind": "change_impact",
+        "requirements": [
+          {
+            "id": "generated-from-allow-attributes",
+            "text": "Generated From implementations must preserve the intended lint allowances without emitting a Clippy allow-attributes violation."
+          }
+        ],
+        "subjects": [
+          {
+            "id": "from-impl-expansion",
+            "kind": "implementation",
+            "canonical_name": "impl/src/expand.rs generated From implementations"
+          },
+          {
+            "id": "lint-regression-test",
+            "kind": "test",
+            "canonical_name": "tests/test_lints.rs test_allow_attributes"
+          }
+        ],
+        "components": [
+          {
+            "id": "from-impl-expansion",
+            "requirement_id": "generated-from-allow-attributes",
+            "subject_id": "from-impl-expansion"
+          },
+          {
+            "id": "lint-regression-test",
+            "requirement_id": "generated-from-allow-attributes",
+            "subject_id": "lint-regression-test"
+          }
+        ],
+        "changed_paths": [
+          "impl/src/expand.rs",
+          "tests/test_lints.rs"
+        ],
+        "focused_test_command": [
+          "cargo",
+          "test",
+          "--test",
+          "test_lints"
+        ],
+        "requested_components": [],
+        "reuse_source_components": [
+          [
+            "from-impl-expansion"
+          ],
+          [
+            "lint-regression-test"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "change-impact-exact",
+      "action": "change_impact",
+      "scenario": "exact",
+      "prompt": "Assess every requested requirement and subject against the pinned patch. Classify impact, cite before and after repository evidence, identify the focused validation target, and preserve uncertainty where the evidence does not establish an effect.",
+      "fixture": {
+        "kind": "change_impact",
+        "requirements": [
+          {
+            "id": "generated-from-allow-attributes",
+            "text": "Generated From implementations must preserve the intended lint allowances without emitting a Clippy allow-attributes violation."
+          }
+        ],
+        "subjects": [
+          {
+            "id": "from-impl-expansion",
+            "kind": "implementation",
+            "canonical_name": "impl/src/expand.rs generated From implementations"
+          },
+          {
+            "id": "lint-regression-test",
+            "kind": "test",
+            "canonical_name": "tests/test_lints.rs test_allow_attributes"
+          }
+        ],
+        "components": [
+          {
+            "id": "from-impl-expansion",
+            "requirement_id": "generated-from-allow-attributes",
+            "subject_id": "from-impl-expansion"
+          },
+          {
+            "id": "lint-regression-test",
+            "requirement_id": "generated-from-allow-attributes",
+            "subject_id": "lint-regression-test"
+          }
+        ],
+        "changed_paths": [
+          "impl/src/expand.rs",
+          "tests/test_lints.rs"
+        ],
+        "focused_test_command": [
+          "cargo",
+          "test",
+          "--test",
+          "test_lints"
+        ],
+        "requested_components": [],
+        "reuse_source_components": [
+          []
+        ]
+      }
+    },
+    {
+      "id": "change-impact-project",
+      "action": "change_impact",
+      "scenario": "project",
+      "prompt": "Assess every requested requirement and subject against the pinned patch. Classify impact, cite before and after repository evidence, identify the focused validation target, and preserve uncertainty where the evidence does not establish an effect.",
+      "fixture": {
+        "kind": "change_impact",
+        "requirements": [
+          {
+            "id": "generated-from-allow-attributes",
+            "text": "Generated From implementations must preserve the intended lint allowances without emitting a Clippy allow-attributes violation."
+          }
+        ],
+        "subjects": [
+          {
+            "id": "from-impl-expansion",
+            "kind": "implementation",
+            "canonical_name": "impl/src/expand.rs generated From implementations"
+          },
+          {
+            "id": "lint-regression-test",
+            "kind": "test",
+            "canonical_name": "tests/test_lints.rs test_allow_attributes"
+          }
+        ],
+        "components": [
+          {
+            "id": "from-impl-expansion",
+            "requirement_id": "generated-from-allow-attributes",
+            "subject_id": "from-impl-expansion"
+          },
+          {
+            "id": "lint-regression-test",
+            "requirement_id": "generated-from-allow-attributes",
+            "subject_id": "lint-regression-test"
+          }
+        ],
+        "changed_paths": [
+          "impl/src/expand.rs",
+          "tests/test_lints.rs"
+        ],
+        "focused_test_command": [
+          "cargo",
+          "test",
+          "--test",
+          "test_lints"
+        ],
+        "requested_components": [
+          "from-impl-expansion"
+        ],
+        "reuse_source_components": [
+          []
+        ]
+      }
+    }
+  ]
+}

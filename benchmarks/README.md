@@ -11,6 +11,7 @@ savings claim.
 
 ```text
 benchmarks/
+  corpus/derived-actions/ protocol-only Gate A3 manifest and synthetic paired observations
   corpus/router-cache/   answer-free manifest, schedule, synthetic plan, campaign, and cost model
     oracles/             legacy synthetic evaluator fixtures only (not public handles)
   fixtures/              structured protocol and worker fixtures
@@ -37,6 +38,46 @@ are documented in [Benchmarking](../docs/BENCHMARKING.md).
 | [Claim reuse performance](results/offline/claim-reuse-performance.md) | Claim authority, freshness isolation, mixed planning, and host-specific warm timings |
 | [Multi-task quality replay](results/offline/multi-task-quality-replay.md) | Bounded semantic oracle and canonical scenario behavior |
 | [End-to-end proof replay](results/offline/end-to-end-proof-replay.md) | Exact, coverage, composite, partial, mutation, and application-simulator closure |
+
+The [derived-action Gate A3 preflight corpus](corpus/derived-actions/README.md)
+exercises the bounded Exact, Project, and Assemble evaluation protocol for
+`ArchitectureBrief` and `ChangeImpact`. It is synthetic and therefore cannot
+close Gate A3 or support a provider-economics claim.
+
+The Phase 6B `test-target-inventory-refresh-microbench` is likewise an offline
+Shadow preflight. It includes targeted current-manifest acquisition, verifies
+exact agreement with deterministic fresh enumeration, and selects full compute
+when refresh has no positive net value. A positive result applies only to that
+bounded synthetic case; it does not close Gate A4 by itself.
+
+The [frozen Gate A4 multi-mutation corpus](corpus/test-target-refresh/README.md)
+extends that preflight across manifest, explicit-target, metadata, conventional
+discovery, workspace, unmapped-path, and incomplete-delta changes. It checks
+exact fresh-oracle agreement, zero stale retained partitions, precise fallback
+reasons, positive refresh economics, and a bounded p95. It remains synthetic
+fixed-Shadow evidence and cannot authorize live refresh by itself.
+
+The `test-target-inventory-refresh-live` runner adds provider-inclusive paired
+latency calibration on one exact clean worktree. It applies and restores one
+bounded inert Cargo-manifest mutation, alternates Fresh and Refresh samples,
+includes Cargo subprocess transport in both arms, and writes a digest-bound
+fixed-Shadow report under `target/`. Optional monetary values require explicit
+pricing and evidence digests; elapsed time is never converted into money by
+Needle. Locally eligible reports are still unaccepted observations and cannot
+close Gate A4 or promote capability authority by themselves.
+
+`test-target-inventory-refresh-live-accept` implements the bounded review layer
+for those reports. It binds one to eight validated reports to exact clean
+source checkouts, reviewer label, timestamp, latency-primary decision, and
+explicit limitations, then creates a new immutable acceptance JSON. The
+protocol is implemented, but no acceptance should be inferred merely from its
+availability; the resulting artifact remains Shadow-only and cannot approve
+capability promotion or close Gate A4.
+
+The current worktree additionally records a separate action-native capability decision for
+`TestTargetInventory + Refresh`. It closes Gate A4 only in operator-invoked `Shadow`: authoritative
+promotion and automatic resolver/lifecycle consumption remain explicitly unapproved. Phase 7 must
+earn and record those stronger authorities separately.
 
 ## Historical calibration
 

@@ -1,0 +1,39 @@
+{
+  "schema": "needle.lifecycle-explore-live-fixture/1",
+  "repository_sha": "485c2b7eed2702c4a109be3cf42bb4be27fe16bd",
+  "need_ir": "@@need\n@route locate.implementation\n@subject symbol:\"derive\"\n@require implementation-location granularity=exact-location polarity=positive selection=primary\n@world source=current features=default\n@project detail=compact\n\nLocate the primary implementation of the `derive` entry point in thiserror and return the minimal exact source evidence.\n@@end",
+  "change": {
+    "task": "Dogfood the Phase 7 Fresh/Shadow Explore lifecycle against the pinned thiserror source without modifying it.",
+    "acceptance_criteria": [
+      "The Explore step publishes one validated implementation-location artifact.",
+      "The source checkout remains byte-for-byte unchanged and clean."
+    ],
+    "allowed_paths": [
+      {
+        "path": "impl/src/expand.rs",
+        "scope": "exact"
+      }
+    ],
+    "constraints": [
+      "Read-only provider execution.",
+      "No implementation, test execution, commit, push, or publication."
+    ]
+  },
+  "test_plan": {
+    "runner": "cargo",
+    "argv": [
+      "cargo",
+      "test",
+      "--test",
+      "test_lints",
+      "test_unused_qualifications"
+    ],
+    "cwd_relative": ".",
+    "test_identifier": "test_unused_qualifications",
+    "requires_approval": true,
+    "execution_evidence_id": null
+  },
+  "test_evidence_paths": [
+    "tests/test_lints.rs"
+  ]
+}

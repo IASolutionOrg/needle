@@ -239,6 +239,73 @@ impl AppServerSession {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_test_executor(
+        config: &WorkerConfig,
+        codex_home: Option<&Path>,
+        instructions: &str,
+        checkout_root: &Path,
+        target_root: &Path,
+        temp_root: &Path,
+        snapshot_digest: Digest,
+        repository_id: Digest,
+        test_plan: TestPlan,
+        store: RuntimeStore,
+    ) -> Result<Self, String> {
+        Self::start_with_access(
+            config,
+            codex_home,
+            true,
+            instructions,
+            checkout_root,
+            target_root,
+            temp_root,
+            snapshot_digest,
+            repository_id,
+            "execute.test",
+            None,
+            Some(vec![test_plan]),
+            true,
+            false,
+            store,
+            "workspace-write",
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_reviewer(
+        config: &WorkerConfig,
+        codex_home: Option<&Path>,
+        instructions: &str,
+        checkout_root: &Path,
+        target_root: &Path,
+        temp_root: &Path,
+        snapshot_digest: Digest,
+        repository_id: Digest,
+        store: RuntimeStore,
+    ) -> Result<Self, String> {
+        Self::start_with_access(
+            config,
+            codex_home,
+            true,
+            instructions,
+            checkout_root,
+            target_root,
+            temp_root,
+            snapshot_digest,
+            repository_id,
+            "review.diff",
+            None,
+            None,
+            false,
+            true,
+            store,
+            "read-only",
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn start_with_access(
         config: &WorkerConfig,
         codex_home: Option<&Path>,
@@ -260,6 +327,7 @@ impl AppServerSession {
     ) -> Result<Self, String> {
         let WorkerProcessEnvironment { variables: mut process_environment, test_execution } =
             worker_process_environment(
+                checkout_root,
                 target_root,
                 temp_root,
                 verifier_test_plans
@@ -352,6 +420,20 @@ impl AppServerSession {
             }
             let _ = stderr_reader.join();
         });
+        let declared_plans = verifier_test_plans.as_deref().unwrap_or(test_plan.as_slice());
+        let mut test_policies = BTreeMap::new();
+        if test_execution.available {
+            for plan in declared_plans {
+                let policy = test_policies.entry(plan.runner.clone()).or_insert_with(|| {
+                    let mut policy =
+                        TestCommandPolicy::certified_direct(repository_id, plan.runner.clone());
+                    policy.maximum_executions_per_worker = 0;
+                    policy
+                });
+                policy.maximum_executions_per_worker =
+                    policy.maximum_executions_per_worker.saturating_add(1);
+            }
+        }
         let approval_context = ApprovalContext {
             route: route.to_owned(),
             repository_id,
@@ -362,23 +444,13 @@ impl AppServerSession {
             verifier_test_plans: verifier_test_plans.clone(),
             test_execution_available: test_execution.available,
         };
-        let mut test_policy = TestCommandPolicy::cargo_test(repository_id);
-        if let Some(plans) = verifier_test_plans.as_ref() {
-            test_policy.maximum_executions_per_worker = plans.len().try_into().unwrap_or(u32::MAX);
-        }
-        let broker = ApprovalBroker::new(
-            (test_execution.available
-                && verifier_test_plans.as_ref().is_none_or(|plans| !plans.is_empty()))
-            .then_some(test_policy)
-            .into_iter()
-            .collect(),
-        )
-        .with_read_only_policies(
-            read_only_commands_allowed
-                .then(|| ReadOnlyCommandPolicy::repository_inspection(repository_id))
-                .into_iter()
-                .collect(),
-        );
+        let broker = ApprovalBroker::new(test_policies.into_values().collect())
+            .with_read_only_policies(
+                read_only_commands_allowed
+                    .then(|| ReadOnlyCommandPolicy::repository_inspection(repository_id))
+                    .into_iter()
+                    .collect(),
+            );
         let shell_environment =
             worker_shell_environment(&process_environment, target_root, temp_root);
         let mut session = Self {
@@ -1333,18 +1405,17 @@ fn remaining_turn_time(
 }
 
 fn worker_process_environment(
+    checkout_root: &Path,
     target_root: &Path,
     temp_root: &Path,
     test_plan: Option<&TestPlan>,
     trusted_test_execution: bool,
 ) -> WorkerProcessEnvironment {
     let mut environment = crate::worker::sanitized_environment();
-    let test_execution = initial_test_execution_availability(test_plan, trusted_test_execution);
-    #[cfg(all(windows, target_env = "msvc"))]
-    let mut test_execution = test_execution;
+    let mut test_execution = initial_test_execution_availability(test_plan, trusted_test_execution);
     #[cfg(all(windows, target_env = "msvc"))]
     {
-        if test_execution.available {
+        if test_execution.available && test_plan.is_some_and(|plan| plan.runner == "cargo") {
             let discovered = discover_windows_msvc_environment(&environment);
             apply_windows_msvc_environment(
                 &mut environment,
@@ -1355,7 +1426,10 @@ fn worker_process_environment(
         }
     }
     let _ = (test_plan, trusted_test_execution);
-    environment.insert("CARGO_TARGET_DIR".to_owned(), target_root.to_string_lossy().into_owned());
+    if test_plan.is_some_and(|plan| plan.runner == "cargo") {
+        environment
+            .insert("CARGO_TARGET_DIR".to_owned(), target_root.to_string_lossy().into_owned());
+    }
     for key in ["TEMP", "TMP", "TMPDIR"] {
         insert_environment_case_insensitive(
             &mut environment,
@@ -1363,7 +1437,51 @@ fn worker_process_environment(
             temp_root.to_string_lossy().into_owned(),
         );
     }
+    if test_execution.available
+        && let Some(plan) = test_plan
+        && !declared_test_runner_available(plan, checkout_root, &environment)
+    {
+        test_execution.available = false;
+        test_execution.unavailable_reason =
+            Some("the declared test runner is unavailable in the isolated environment".to_owned());
+    }
     WorkerProcessEnvironment { variables: environment, test_execution }
+}
+
+fn declared_test_runner_available(
+    plan: &TestPlan,
+    checkout_root: &Path,
+    environment: &BTreeMap<String, String>,
+) -> bool {
+    let runner = Path::new(&plan.runner);
+    if runner.is_absolute() || runner.components().count() > 1 {
+        let candidate = if runner.is_absolute() {
+            runner.to_path_buf()
+        } else {
+            checkout_root.join(&plan.cwd_relative).join(runner)
+        };
+        return candidate.is_file();
+    }
+
+    let Some(path) = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value)
+    else {
+        return false;
+    };
+    let extensions = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATHEXT"))
+        .map(|(_, value)| {
+            value.split(';').filter(|extension| !extension.is_empty()).collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![""]);
+    env::split_paths(path).any(|directory| {
+        extensions
+            .iter()
+            .any(|extension| directory.join(format!("{}{extension}", plan.runner)).is_file())
+    })
 }
 
 fn initial_test_execution_availability(
@@ -2359,7 +2477,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_or_untrusted_test_plan_is_unavailable_without_affecting_worker_startup() {
+    fn untrusted_test_execution_is_disabled_while_provider_runners_remain_language_neutral() {
         let cargo = TestPlan {
             runner: "cargo".to_owned(),
             argv: vec!["cargo".to_owned(), "test".to_owned(), "focused".to_owned()],
@@ -2372,12 +2490,12 @@ mod tests {
         assert!(!untrusted.available);
         assert!(untrusted.unavailable_reason.is_some());
 
-        let mut unsupported = cargo;
-        unsupported.runner = "pytest".to_owned();
-        unsupported.argv = vec!["pytest".to_owned(), "focused".to_owned()];
-        let unsupported = initial_test_execution_availability(Some(&unsupported), true);
-        assert!(!unsupported.available);
-        assert!(unsupported.unavailable_reason.is_some());
+        let mut provider_defined = cargo;
+        provider_defined.runner = "pytest".to_owned();
+        provider_defined.argv = vec!["pytest".to_owned(), "focused".to_owned()];
+        let provider_defined = initial_test_execution_availability(Some(&provider_defined), true);
+        assert!(provider_defined.available);
+        assert!(provider_defined.unavailable_reason.is_none());
     }
 
     #[cfg(all(windows, target_env = "msvc"))]

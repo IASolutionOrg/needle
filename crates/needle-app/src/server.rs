@@ -29,10 +29,24 @@ use std::time::Duration;
 
 use crate::runtime_instance::InstanceGuard;
 
+#[path = "server/action_contracts.rs"]
+mod action_contracts;
+#[path = "server/lifecycle_apply.rs"]
+mod lifecycle_apply;
+#[path = "server/lifecycle_host.rs"]
+mod lifecycle_host;
+#[path = "server/lifecycle_start.rs"]
+mod lifecycle_start;
 #[path = "server/lifecycles.rs"]
 mod lifecycles;
+#[path = "server/partition_manifests.rs"]
+mod partition_manifests;
+#[path = "server/refresh_economics.rs"]
+mod refresh_economics;
 #[path = "server/role_profiles.rs"]
 mod role_profiles;
+#[path = "server/runtime_health.rs"]
+mod runtime_health;
 
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
@@ -41,12 +55,16 @@ struct WebAssets;
 #[derive(Clone)]
 struct AppState {
     store: RuntimeStore,
+    data_directory: PathBuf,
+    lifecycle_step_host: Arc<dyn lifecycle_host::LifecycleStepHost>,
+    lifecycle_step_lock: Arc<tokio::sync::Mutex<()>>,
     authority: String,
     launch_token: String,
     session_token: String,
     csrf_token: String,
     ipc_endpoint: String,
     repository_root: PathBuf,
+    repository_watcher_health: runtime_health::RepositoryRuntimeHealth,
     apply_lock: Arc<tokio::sync::Mutex<()>>,
     launch_consumed: Arc<Mutex<bool>>,
 }
@@ -177,6 +195,8 @@ pub(crate) fn run(
                 .map_err(|error| error.to_string())?,
             Err(error) => return Err(error.to_string()),
         }
+        let repository_watcher =
+            runtime_health::ResidentRepositoryWatcher::start(store.clone(), &repository_root);
         let listener =
             tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
                 .await
@@ -198,14 +218,23 @@ pub(crate) fn run(
             return Err(format!("resident runtime IPC health handshake failed: {error}"));
         }
         instance.publish(&authority, &ipc_endpoint, &ipc_token)?;
+        let lifecycle_step_host = Arc::new(lifecycle_host::CodexLifecycleStepHost::new(
+            store.clone(),
+            data_directory.clone(),
+            repository_root.clone(),
+        ));
         let state = AppState {
             store,
+            data_directory,
+            lifecycle_step_host,
+            lifecycle_step_lock: Arc::new(tokio::sync::Mutex::new(())),
             authority: authority.clone(),
             launch_token: random_token()?,
             session_token: random_token()?,
             csrf_token: random_token()?,
             ipc_endpoint,
             repository_root,
+            repository_watcher_health: repository_watcher.health(),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             launch_consumed: Arc::new(Mutex::new(false)),
         };
@@ -236,10 +265,12 @@ pub(crate) fn run(
             .route("/api/v1/changes/{id}/apply", post(apply_change))
             .route("/api/v1/activation", post(set_activation))
             .route("/api/v1/control-plane", get(control_plane));
-        let app = lifecycles::routes(role_profiles::routes(app))
-            .fallback(get(static_asset))
-            .with_state(state.clone())
-            .layer(middleware::from_fn_with_state(state.clone(), security));
+        let app = refresh_economics::routes(partition_manifests::routes(lifecycles::routes(
+            role_profiles::routes(app),
+        )))
+        .fallback(get(static_asset))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state.clone(), security));
         let launch_url = format!("http://{authority}/?launch_token={}", state.launch_token);
         println!("Needle control plane: {launch_url}");
         if open_browser && let Err(error) = open_control_plane(&launch_url) {
@@ -261,6 +292,7 @@ pub(crate) fn run(
             },
         };
         ipc_task.abort();
+        drop(repository_watcher);
         result
     })
 }
@@ -340,8 +372,12 @@ fn embedded_index(csrf_token: &str) -> Response {
     Html(template.replace("__NEEDLE_CSRF__", csrf_token)).into_response()
 }
 
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok", "schema": "needle.runtime-health/1"}))
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(
+        state
+            .repository_watcher_health
+            .response_with_action_safety(state.store.action_safety_metrics().ok()),
+    )
 }
 
 async fn list_approvals(
@@ -469,6 +505,15 @@ async fn control_plane(State(state): State<AppState>) -> Response {
     let stale_candidates =
         proof_accounting.iter().map(|record| record.stale_candidates).sum::<u64>();
     let active_contradictions = state.store.active_contradiction_count().unwrap_or_default();
+    let action_contracts = action_contracts::control_plane_envelope();
+    let partition_manifests = match partition_manifests::control_plane_envelope(&state.store) {
+        Ok(manifests) => manifests,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    };
+    let refresh_economics = match refresh_economics::control_plane_envelope(&state.store) {
+        Ok(economics) => economics,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    };
     let activation = match state.store.activation_status(&state.repository_root) {
         Ok(activation) => activation,
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -541,6 +586,9 @@ async fn control_plane(State(state): State<AppState>) -> Response {
         "changes": change_workflows,
         "semantic": {
             "format_revision": 1,
+            "action_contracts": action_contracts,
+            "partition_manifests": partition_manifests,
+            "refresh_economics": refresh_economics,
             "needs": needs,
             "subjects": subjects,
             "capabilities": capabilities,
@@ -1060,9 +1108,10 @@ fn change_apply_error_response(error: ChangeApplyError) -> Response {
         ChangeApplyError::DigestMismatch => {
             api_error(StatusCode::PRECONDITION_FAILED, &error.to_string())
         }
-        ChangeApplyError::NotVerified | ChangeApplyError::SnapshotDrift => {
-            api_error(StatusCode::CONFLICT, &error.to_string())
-        }
+        ChangeApplyError::NotVerified
+        | ChangeApplyError::SnapshotDrift
+        | ChangeApplyError::InProgress
+        | ChangeApplyError::DuplicateEffect => api_error(StatusCode::CONFLICT, &error.to_string()),
         ChangeApplyError::Materialization(_) | ChangeApplyError::Recovery(_) => {
             api_error(StatusCode::CONFLICT, &error.to_string())
         }

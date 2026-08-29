@@ -1,10 +1,16 @@
 use super::*;
+use crate::{ShadowActionResolutionAuthority, compile_lifecycle_explore_action_plan};
 use needle_core::{
-    AcceptanceCoverage, AcceptanceStatus, ChangeRequest, LifecycleAcceptanceReview,
-    LifecycleArtifactKind, LifecycleArtifactRef, LifecycleBudget, LifecyclePatchRef,
+    AcceptanceCoverage, AcceptanceStatus, ActionAssuranceEvidenceId, ActionCapabilityClassId,
+    ActionCapabilityDecisionId, ArtifactId, ArtifactValidationCertificateId, ChangeRequest,
+    CoverageEntry, CoverageManifest, Facet, LifecycleAcceptanceReview, LifecycleArtifactKind,
+    LifecycleArtifactRef, LifecycleBudget, LifecycleExploreActionPlan,
+    LifecycleExploreReuseAuthority, LifecycleExploreReuseCompletion, LifecyclePatchRef,
     LifecycleReviewVerdict, LifecycleSpec, LifecycleTestPlanBinding, LifecycleTestResult,
-    LifecycleVerificationRef, LifecycleWorkerCompletion, LifecycleWorkerProfiles, ReviewArtifact,
-    RoleProfileId, TestPlan,
+    LifecycleVerificationRef, LifecycleWorkerCompletion, LifecycleWorkerProfiles, Need, NeedId,
+    NeedRequest, Obligation, PredicateKind, ReuseDescriptor, ReuseDescriptorInput,
+    ReuseSufficiencyCertificateId, ReviewArtifact, RoleProfileId, SelectedPlanId, SemanticWorld,
+    Subject, SubjectKind, TestPlan, need_fragment,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -36,6 +42,8 @@ fn lifecycle_spec(max_worker_turns: u32) -> LifecycleSpec {
             max_cost_microusd: 100,
             max_concurrent_workers: 1,
         },
+        explore_action_plan: None,
+        action_phase_plans: None,
         test_plans: vec![LifecycleTestPlanBinding {
             plan: TestPlan {
                 runner: "cargo".to_owned(),
@@ -79,6 +87,10 @@ struct FakeStore {
     fail_next_parent_commit: Cell<bool>,
     concurrent_transition: RefCell<Option<LifecycleTransition>>,
     corrupt_replay: Cell<bool>,
+    explore_action_observations: RefCell<Vec<LifecycleExploreShadowObservation>>,
+    fail_explore_action_observation: Cell<bool>,
+    explore_reuse_authority: RefCell<Option<(LifecycleExploreReuseAuthority, bool)>>,
+    explore_reuse_attempts: Cell<u32>,
 }
 
 impl FakeStore {
@@ -101,6 +113,10 @@ impl FakeStore {
                 fail_next_parent_commit: Cell::new(false),
                 concurrent_transition: RefCell::new(None),
                 corrupt_replay: Cell::new(false),
+                explore_action_observations: RefCell::new(Vec::new()),
+                fail_explore_action_observation: Cell::new(false),
+                explore_reuse_authority: RefCell::new(None),
+                explore_reuse_attempts: Cell::new(0),
             },
             change_id,
         )
@@ -113,6 +129,26 @@ impl FakeStore {
         let next = projection(next);
         *self.projection.borrow_mut() = next.clone();
         Ok(next)
+    }
+
+    fn install_explore_action_plan(&self, plan: LifecycleExploreActionPlan) {
+        let mut current = self.projection.borrow().clone();
+        current.lifecycle.spec.explore_action_plan = Some(plan);
+        current.lifecycle.validate().unwrap();
+        current.state_digest = current.lifecycle.state_digest();
+        *self.projection.borrow_mut() = current;
+    }
+
+    fn authorize_explore_reuse(&self, lifecycle_consumption: bool) {
+        self.explore_reuse_authority.replace(Some((
+            LifecycleExploreReuseAuthority {
+                capability_class: ActionCapabilityClassId::new(Digest::blake3(b"capability")),
+                capability_definition_digest: Digest::blake3(b"capability-definition"),
+                evidence: ActionAssuranceEvidenceId::new(Digest::blake3(b"evidence")),
+                decision: ActionCapabilityDecisionId::new(Digest::blake3(b"decision")),
+            },
+            lifecycle_consumption,
+        )));
     }
 }
 
@@ -185,16 +221,104 @@ impl LifecycleKernelStore for FakeStore {
         Ok(next)
     }
 
-    fn begin_repair(&self, change_id: &ChangeId, patch_id: PatchId) -> Result<(), StoreError> {
+    fn test_plan_candidates(
+        &self,
+        _source_snapshot: Digest,
+    ) -> Result<Vec<crate::LifecycleStartTestPlanCandidate>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn bind_test_plans(
+        &self,
+        change_id: &ChangeId,
+        expected_state_digest: Digest,
+        worker: Option<LifecycleWorkerCompletion>,
+        plans: Vec<needle_core::LifecycleResolvedTestPlan>,
+    ) -> Result<LifecycleProjection, StoreError> {
+        self.parent_transition(
+            change_id,
+            expected_state_digest,
+            LifecycleTransition::BindTestPlans { worker, plans },
+        )
+    }
+
+    fn begin_repair(
+        &self,
+        change_id: &ChangeId,
+        action_change_id: &ChangeId,
+        patch_id: PatchId,
+    ) -> Result<(), StoreError> {
         self.repair_calls.set(self.repair_calls.get() + 1);
         let current = self.projection.borrow().clone();
-        if current.lifecycle.patch.as_ref().map(|patch| patch.patch_id) != Some(patch_id) {
+        if current.lifecycle.patch.as_ref().map(|patch| patch.patch_id) != Some(patch_id)
+            || *action_change_id != ChangeId::from_digest(self.context.request_digest)
+        {
             return Err(StoreError::ChangeConflict(format!(
                 "{change_id}: injected repair patch mismatch"
             )));
         }
         self.apply(LifecycleTransition::ConsumeRepair)?;
         Ok(())
+    }
+
+    fn record_explore_action_observation(
+        &self,
+        observation: &LifecycleExploreShadowObservation,
+    ) -> Result<(), StoreError> {
+        if self.fail_explore_action_observation.get() {
+            return Err(StoreError::ConnectionLock);
+        }
+        let mut observations = self.explore_action_observations.borrow_mut();
+        if !observations.contains(observation) {
+            observations.push(observation.clone());
+        }
+        Ok(())
+    }
+
+    fn try_complete_explore_from_reuse(
+        &self,
+        _change_id: &ChangeId,
+        expected_state_digest: Digest,
+        summary: &crate::ShadowActionResolutionSummary,
+    ) -> Result<LifecycleExploreReuseCommit, StoreError> {
+        self.explore_reuse_attempts.set(self.explore_reuse_attempts.get() + 1);
+        let Some((authority, lifecycle_consumption)) =
+            self.explore_reuse_authority.borrow().clone()
+        else {
+            return Ok(LifecycleExploreReuseCommit::Ineligible);
+        };
+        if !lifecycle_consumption {
+            return Ok(LifecycleExploreReuseCommit::ResolverAuthorized(authority));
+        }
+        let current = self.projection.borrow().clone();
+        if current.state_digest != expected_state_digest {
+            return Err(StoreError::LifecycleConflict("injected reuse state conflict".to_owned()));
+        }
+        let completion = LifecycleExploreReuseCompletion {
+            authority,
+            action_request: summary.request,
+            origin_request: summary.artifact_origin_requests[0],
+            artifact: summary.artifacts[0],
+            validation_certificate: summary.validation_certificates[0],
+            selected_plan: summary.selected_plan,
+            sufficiency_certificate: summary.sufficiency_certificate.unwrap(),
+            repository_id: self.context.repository_id,
+            source_snapshot: self.context.source_snapshot,
+            resolution_definition_digest: summary.definition_digest,
+        };
+        let artifacts = vec![LifecycleArtifactRef {
+            kind: LifecycleArtifactKind::Exploration,
+            id: completion.artifact.digest(),
+            source_snapshot: completion.source_snapshot,
+        }];
+        let projection = self.apply(LifecycleTransition::CompleteExploreFromReuse {
+            reuse: completion.clone(),
+            artifacts,
+        })?;
+        Ok(LifecycleExploreReuseCommit::Committed {
+            projection: Box::new(projection),
+            completion: Box::new(completion),
+        })
     }
 }
 
@@ -375,6 +499,7 @@ fn completion_transition(
                     executed: true,
                     passed: true,
                     evidence_id: Some("fake:test-evidence".to_owned()),
+                    action_evidence_artifact: None,
                     failure_code: None,
                 }],
             }
@@ -395,7 +520,7 @@ fn completion_transition(
                 request.lifecycle.updated_unix_ms,
             )
             .unwrap();
-            LifecycleTransition::CompleteReview { worker, review }
+            LifecycleTransition::CompleteReview { worker, review, report_artifact: None }
         }
         LifecyclePhase::Verify => {
             let verification =
@@ -418,6 +543,7 @@ fn verification_artifact(
     request: &ChangeRequest,
     verdict: VerificationStatus,
 ) -> VerificationArtifact {
+    let action_change_id = ChangeId::from_digest(request.digest(lifecycle.source_snapshot));
     let patch_id = lifecycle.patch.as_ref().unwrap().patch_id;
     let acceptance_coverage = vec![AcceptanceCoverage {
         criterion: request.acceptance_criteria[0].clone(),
@@ -432,7 +558,7 @@ fn verification_artifact(
     let test_evidence_ids = Vec::new();
     let verifier_definition = lifecycle.spec.profiles.verify.definition_digest;
     let id = VerificationArtifact::compute_id(
-        &lifecycle.change_id,
+        &action_change_id,
         patch_id,
         verdict,
         &acceptance_coverage,
@@ -442,8 +568,11 @@ fn verification_artifact(
     );
     let artifact = VerificationArtifact {
         id,
-        change_id: lifecycle.change_id.clone(),
+        change_id: action_change_id,
         patch_id,
+        action_request: None,
+        requirements_digest: None,
+        input_test_evidence_artifacts: Vec::new(),
         verdict,
         acceptance_coverage,
         findings,
@@ -473,7 +602,152 @@ fn step(
     cancellation: &dyn LifecycleCancellation,
     change_id: &ChangeId,
 ) -> Result<LifecycleExecutionOutcome, LifecycleExecutionError> {
-    execute_step(store, &adapters(adapter), cancellation, change_id)
+    execute_step(
+        store,
+        &adapters(adapter),
+        cancellation,
+        &NOOP_LIFECYCLE_EXPLORE_ACTION_RESOLVER,
+        change_id,
+    )
+}
+
+fn explore_action_plan(change: &LifecycleChangeContext) -> LifecycleExploreActionPlan {
+    let subject = Subject::exact(change.repository_id, SubjectKind::CliOption, "--kernel");
+    let required = vec![Obligation::new(
+        PredicateKind::ImplementationLocation,
+        subject.id,
+        vec![Facet { key: "selection".to_owned(), value: "primary".to_owned() }],
+    )];
+    let request = NeedRequest {
+        key: needle_core::NeedKey::new("locate.implementation").unwrap(),
+        body: "Locate the lifecycle kernel implementation.".to_owned(),
+    };
+    let need = Need {
+        id: NeedId::new(Digest::blake3(b"kernel-explore-need")),
+        subjects: vec![subject],
+        required,
+        preferred: Vec::new(),
+        semantic_constraints: Vec::new(),
+        world: SemanticWorld {
+            repository_lineage: change.repository_id,
+            source_selector: "worktree".to_owned(),
+            platform: "windows".to_owned(),
+            features: "default".to_owned(),
+            configuration: None,
+            toolchain: None,
+        },
+        input_artifacts: Vec::new(),
+        residual: None,
+        body_digest: Digest::blake3(request.body.as_bytes()),
+        format_revision: needle_core::NEED_IR_FORMAT_REVISION,
+    };
+    let fragment = need_fragment(&need, need.required.clone(), Vec::new());
+    compile_lifecycle_explore_action_plan(
+        &request,
+        &need,
+        &fragment,
+        change.repository_id,
+        change.source_snapshot,
+    )
+    .unwrap()
+}
+
+struct RecordingExploreResolver {
+    calls: Cell<u32>,
+    empty_resolved: bool,
+}
+
+struct ExactExploreResolver {
+    summary: crate::ShadowActionResolutionSummary,
+    calls: Cell<u32>,
+}
+
+impl LifecycleExploreActionResolver for ExactExploreResolver {
+    fn resolve(
+        &self,
+        _plan: &LifecycleExploreActionPlan,
+        _change: &LifecycleChangeContext,
+    ) -> LifecycleExploreActionResolverOutcome {
+        self.calls.set(self.calls.get() + 1);
+        LifecycleExploreActionResolverOutcome::Resolved(vec![self.summary.clone()])
+    }
+}
+
+fn exact_action_summary(plan: &LifecycleExploreActionPlan) -> crate::ShadowActionResolutionSummary {
+    let request = &plan.actions[0];
+    let action = crate::built_in_action_contracts()
+        .iter()
+        .find(|definition| definition.contract.id == request.contract)
+        .unwrap();
+    let descriptor = ReuseDescriptor::new(ReuseDescriptorInput {
+        artifact: ArtifactId::new(Digest::blake3(b"reuse-artifact")),
+        exact_request: request.semantic_id(),
+        action_contract: action.contract.id.clone(),
+        action_semantic_definition_digest: action.contract.semantic_definition_digest,
+        action_validation_definition_digest: action.contract.validation_definition_digest,
+        output_contract_definition_digest: action.output_contract_definition_digest,
+        validator_definition_digest: action.validator_definition_digest,
+        validation_certificate: ArtifactValidationCertificateId::new(Digest::blake3(
+            b"reuse-certificate",
+        )),
+        coverage: CoverageManifest {
+            entries: plan
+                .fragment
+                .obligations
+                .iter()
+                .cloned()
+                .map(|obligation| CoverageEntry {
+                    obligation,
+                    evidence: vec!["src/lib.rs:item".to_owned()],
+                })
+                .collect(),
+            world: plan.fragment.world.clone(),
+            dependency_manifest_digest: Digest::blake3(b"reuse-manifest"),
+        },
+    })
+    .unwrap();
+    crate::ShadowActionResolutionSummary::new(crate::ShadowActionResolutionInput {
+        request,
+        action,
+        resolution: crate::ShadowActionResolutionKind::Exact,
+        descriptors: &[descriptor],
+        selected_plan: SelectedPlanId::new(Digest::blake3(b"reuse-plan")),
+        sufficiency_certificate: Some(ReuseSufficiencyCertificateId::new(Digest::blake3(
+            b"reuse-sufficiency",
+        ))),
+        covered_mask: 1,
+        missing_mask: 0,
+    })
+    .unwrap()
+}
+
+impl LifecycleExploreActionResolver for RecordingExploreResolver {
+    fn resolve(
+        &self,
+        _plan: &LifecycleExploreActionPlan,
+        _change: &LifecycleChangeContext,
+    ) -> LifecycleExploreActionResolverOutcome {
+        self.calls.set(self.calls.get() + 1);
+        if self.empty_resolved {
+            LifecycleExploreActionResolverOutcome::Resolved(Vec::new())
+        } else {
+            LifecycleExploreActionResolverOutcome::Miss
+        }
+    }
+}
+
+struct PreflightAwareAdapter<'a> {
+    inner: &'a FakeAdapter,
+    resolver_calls: &'a Cell<u32>,
+    observations: &'a RefCell<Vec<LifecycleExploreShadowObservation>>,
+}
+
+impl LifecyclePhaseAdapter for PreflightAwareAdapter<'_> {
+    fn invoke(&self, request: &LifecyclePhaseAdapterRequest) -> LifecyclePhaseAdapterOutcome {
+        assert_eq!(self.resolver_calls.get(), 1, "Explore preflight must precede the adapter");
+        assert_eq!(self.observations.borrow().len(), 1, "Shadow persistence must precede adapter");
+        self.inner.invoke(request)
+    }
 }
 
 struct CancelOnCheck {
@@ -520,6 +794,196 @@ fn success_invokes_one_adapter_per_phase_and_stops_at_approval() {
     let stopped = step(&store, &adapter, &NeverCancel, &change_id).unwrap();
     assert_eq!(stopped.disposition, LifecycleExecutionDisposition::AwaitingApproval);
     assert_eq!(adapter.calls.get(), 5);
+}
+
+#[test]
+fn explore_shadow_preflight_runs_before_adapter_without_bypassing_it() {
+    let (store, change_id) = FakeStore::new(10);
+    let plan = explore_action_plan(&store.context);
+    store.install_explore_action_plan(plan.clone());
+    let adapter = FakeAdapter::new(FakeAdapterMode::Success);
+    let resolver = RecordingExploreResolver { calls: Cell::new(0), empty_resolved: false };
+    let guarded_adapter = PreflightAwareAdapter {
+        inner: &adapter,
+        resolver_calls: &resolver.calls,
+        observations: &store.explore_action_observations,
+    };
+    let phase_adapters = LifecyclePhaseAdapters {
+        explore: &guarded_adapter,
+        implement: &guarded_adapter,
+        test: &guarded_adapter,
+        review: &guarded_adapter,
+        verify: &guarded_adapter,
+    };
+
+    let outcome =
+        execute_step(&store, &phase_adapters, &NeverCancel, &resolver, &change_id).unwrap();
+
+    assert_eq!(resolver.calls.get(), 1);
+    assert_eq!(adapter.calls.get(), 1);
+    assert_eq!(outcome.disposition, LifecycleExecutionDisposition::Advanced);
+    assert_eq!(outcome.projection.lifecycle.phase, LifecyclePhase::Implement);
+    assert_eq!(
+        outcome.explore_action_observation_persistence,
+        Some(LifecycleExploreShadowObservationPersistence::Stored)
+    );
+    let observation = outcome.explore_action_observation.as_ref().unwrap();
+    assert_eq!(observation.resolution, LifecycleExploreShadowResolutionKind::Miss);
+    assert_eq!(observation.authority, ShadowActionResolutionAuthority::Shadow);
+    assert!(observation.adapter_invocation_required);
+    observation
+        .validate_for_execution(
+            observation.lifecycle,
+            Digest::blake3(b"wrong-expected-state"),
+            &plan,
+        )
+        .unwrap_err();
+    observation
+        .validate_for_execution(observation.lifecycle, observation.expected_state_digest, &plan)
+        .unwrap();
+}
+
+#[test]
+fn exact_resolution_without_authority_falls_back_to_fresh_adapter() {
+    let (store, change_id) = FakeStore::new(10);
+    let plan = explore_action_plan(&store.context);
+    let summary = exact_action_summary(&plan);
+    store.install_explore_action_plan(plan);
+    let adapter = FakeAdapter::new(FakeAdapterMode::Success);
+    let resolver = ExactExploreResolver { summary, calls: Cell::new(0) };
+
+    let outcome =
+        execute_step(&store, &adapters(&adapter), &NeverCancel, &resolver, &change_id).unwrap();
+
+    assert_eq!(resolver.calls.get(), 1);
+    assert_eq!(store.explore_reuse_attempts.get(), 1);
+    assert_eq!(adapter.calls.get(), 1);
+    assert!(outcome.explore_reuse.is_none());
+    assert_eq!(outcome.projection.lifecycle.usage.worker_turns, 1);
+    assert!(outcome.projection.lifecycle.explore_reuse.is_none());
+}
+
+#[test]
+fn resolver_only_authority_is_visible_but_still_invokes_fresh_adapter() {
+    let (store, change_id) = FakeStore::new(10);
+    let plan = explore_action_plan(&store.context);
+    let summary = exact_action_summary(&plan);
+    store.install_explore_action_plan(plan);
+    store.authorize_explore_reuse(false);
+    let adapter = FakeAdapter::new(FakeAdapterMode::Success);
+    let resolver = ExactExploreResolver { summary, calls: Cell::new(0) };
+
+    let outcome =
+        execute_step(&store, &adapters(&adapter), &NeverCancel, &resolver, &change_id).unwrap();
+
+    assert_eq!(adapter.calls.get(), 1);
+    assert!(matches!(
+        outcome.explore_reuse,
+        Some(LifecycleExploreReuseOutcome::ResolverAuthorized { .. })
+    ));
+    assert_eq!(outcome.projection.lifecycle.usage.worker_turns, 1);
+    assert!(outcome.projection.lifecycle.explore_reuse.is_none());
+}
+
+#[test]
+fn lifecycle_authority_commits_exact_reuse_without_adapter_or_worker_accounting() {
+    let (store, change_id) = FakeStore::new(10);
+    let plan = explore_action_plan(&store.context);
+    let summary = exact_action_summary(&plan);
+    store.install_explore_action_plan(plan);
+    store.authorize_explore_reuse(true);
+    let adapter = FakeAdapter::new(FakeAdapterMode::Success);
+    let resolver = ExactExploreResolver { summary: summary.clone(), calls: Cell::new(0) };
+
+    let outcome =
+        execute_step(&store, &adapters(&adapter), &NeverCancel, &resolver, &change_id).unwrap();
+
+    assert_eq!(adapter.calls.get(), 0);
+    assert!(adapter.side_effects.borrow().is_empty());
+    assert_eq!(outcome.disposition, LifecycleExecutionDisposition::Advanced);
+    assert_eq!(outcome.projection.lifecycle.phase, LifecyclePhase::Implement);
+    assert_eq!(outcome.projection.lifecycle.usage, LifecycleUsage::default());
+    assert!(outcome.invocation_id.is_none());
+    assert!(outcome.cleanup.is_none());
+    assert!(matches!(
+        outcome.explore_reuse,
+        Some(LifecycleExploreReuseOutcome::Consumed { ref completion })
+            if completion.resolution_definition_digest == summary.definition_digest
+    ));
+    let persisted = outcome.projection.lifecycle.explore_reuse.as_ref().unwrap();
+    assert_eq!(persisted.resolution_definition_digest, summary.definition_digest);
+    assert_eq!(persisted.artifact, summary.artifacts[0]);
+    let encoded = serde_json::to_vec(&outcome).unwrap();
+    assert_eq!(serde_json::from_slice::<LifecycleExecutionOutcome>(&encoded).unwrap(), outcome);
+}
+
+#[test]
+fn invalid_shadow_resolution_is_diagnostic_and_adapter_still_advances() {
+    let (store, change_id) = FakeStore::new(10);
+    store.install_explore_action_plan(explore_action_plan(&store.context));
+    let adapter = FakeAdapter::new(FakeAdapterMode::Success);
+    let resolver = RecordingExploreResolver { calls: Cell::new(0), empty_resolved: true };
+
+    let outcome =
+        execute_step(&store, &adapters(&adapter), &NeverCancel, &resolver, &change_id).unwrap();
+
+    assert_eq!(resolver.calls.get(), 1);
+    assert_eq!(adapter.calls.get(), 1);
+    assert_eq!(outcome.disposition, LifecycleExecutionDisposition::Advanced);
+    assert_eq!(
+        outcome.explore_action_observation.as_ref().unwrap().resolution,
+        LifecycleExploreShadowResolutionKind::Invalid
+    );
+    assert_eq!(
+        outcome.explore_action_observation_persistence,
+        Some(LifecycleExploreShadowObservationPersistence::Stored)
+    );
+}
+
+#[test]
+fn shadow_persistence_failure_is_reported_without_blocking_adapter() {
+    let (store, change_id) = FakeStore::new(10);
+    store.install_explore_action_plan(explore_action_plan(&store.context));
+    store.fail_explore_action_observation.set(true);
+    let adapter = FakeAdapter::new(FakeAdapterMode::Success);
+    let resolver = RecordingExploreResolver { calls: Cell::new(0), empty_resolved: false };
+
+    let outcome =
+        execute_step(&store, &adapters(&adapter), &NeverCancel, &resolver, &change_id).unwrap();
+
+    assert_eq!(resolver.calls.get(), 1);
+    assert_eq!(adapter.calls.get(), 1);
+    assert_eq!(outcome.disposition, LifecycleExecutionDisposition::Advanced);
+    assert!(outcome.explore_action_observation.is_some());
+    assert_eq!(
+        outcome.explore_action_observation_persistence,
+        Some(LifecycleExploreShadowObservationPersistence::Failed)
+    );
+    assert!(store.explore_action_observations.borrow().is_empty());
+}
+
+#[test]
+fn lifecycle_without_typed_plan_does_not_call_shadow_resolver() {
+    let (store, change_id) = FakeStore::new(10);
+    let adapter = FakeAdapter::new(FakeAdapterMode::Success);
+    let resolver = RecordingExploreResolver { calls: Cell::new(0), empty_resolved: false };
+
+    let outcome =
+        execute_step(&store, &adapters(&adapter), &NeverCancel, &resolver, &change_id).unwrap();
+
+    assert_eq!(resolver.calls.get(), 0);
+    assert_eq!(adapter.calls.get(), 1);
+    assert!(outcome.explore_action_observation.is_none());
+    assert!(outcome.explore_action_observation_persistence.is_none());
+
+    let outcome_json = serde_json::to_value(&outcome).unwrap();
+    assert!(outcome_json.get("explore_action_observation").is_none());
+    assert_eq!(serde_json::from_value::<LifecycleExecutionOutcome>(outcome_json).unwrap(), outcome);
+
+    let spec = lifecycle_spec(10);
+    let spec_json = serde_json::to_value(&spec).unwrap();
+    assert!(spec_json.get("explore_action_plan").is_none());
+    assert_eq!(serde_json::from_value::<LifecycleSpec>(spec_json).unwrap(), spec);
 }
 
 #[test]

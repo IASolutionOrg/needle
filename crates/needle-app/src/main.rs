@@ -39,13 +39,22 @@ mod artifact_cache_main_replay;
 mod codex_hooks;
 mod codex_skill;
 mod debug;
+mod execution_run;
 mod explore;
+mod lifecycle_explore_authority;
+mod lifecycle_explore_authority_acceptance;
+mod lifecycle_explore_lifecycle_authority;
+mod lifecycle_explore_lifecycle_authority_acceptance;
+mod lifecycle_explore_live;
+mod lifecycle_explore_zero_adapter_live;
+mod lifecycle_gate_a7;
 mod mcp;
 mod mcp_live_pilot;
 mod minimal_live_pilot;
 mod onboarding;
 mod partial_tests_live;
 mod product_resolver;
+mod test_target_refresh_shadow;
 mod uninstall;
 mod worker_live_diagnostic;
 
@@ -91,6 +100,7 @@ fn run() -> Result<(), AppError> {
         "status" => onboarding::run_status(arguments.collect()),
         "debug" => debug::run(arguments.collect()),
         "explore" => explore::run(arguments.collect()),
+        "run" => execution_run::run(arguments.collect()),
         "ui" => onboarding::run_ui(arguments.collect()),
         "uninstall" => uninstall::run(arguments.collect()),
         "init" => run_init(arguments.collect()),
@@ -118,7 +128,7 @@ fn run() -> Result<(), AppError> {
 
 fn print_usage() {
     println!(
-        "Needle {VERSION}\n\nUsage: needle <command> [options]\n\nCompanion commands:\n  enable      Enable Needle for this repository\n  disable     Disable Needle without deleting data\n  status      Show effective activation and compatibility\n  debug       Manage bounded local worker diagnostics\n  explore     Request bounded repository context\n  ui          Open the local control plane\n  uninstall   Remove the managed Windows installation\n\nRun `needle <command> --help` for command options."
+        "Needle {VERSION}\n\nUsage: needle <command> [options]\n\nCompanion commands:\n  enable      Enable Needle for this repository\n  disable     Disable Needle without deleting data\n  status      Show effective activation and compatibility\n  debug       Manage bounded local worker diagnostics\n  explore     Request bounded repository context\n  run         Execute a versioned request envelope from stdin\n  ui          Open the local control plane\n  uninstall   Remove the managed Windows installation\n\nRun `needle <command> --help` for command options."
     );
 }
 
@@ -883,11 +893,29 @@ fn run_experiment(arguments: Vec<String>) -> Result<(), AppError> {
         "pilot" => product_pilot_run(&arguments[1..]),
         "transport-preflight" => transport_preflight_run(&arguments[1..]),
         "mcp-live" => mcp_live_pilot::run(&arguments[1..]),
+        "lifecycle-explore-authority-preflight" => {
+            lifecycle_explore_authority::run(&arguments[1..])
+        }
+        "lifecycle-explore-authority-accept" => {
+            lifecycle_explore_authority_acceptance::run(&arguments[1..])
+        }
+        "lifecycle-explore-lifecycle-authority-preflight" => {
+            lifecycle_explore_lifecycle_authority::run(&arguments[1..])
+        }
+        "lifecycle-explore-lifecycle-authority-accept" => {
+            lifecycle_explore_lifecycle_authority_acceptance::run(&arguments[1..])
+        }
+        "lifecycle-explore-zero-adapter-live" => {
+            lifecycle_explore_zero_adapter_live::run(&arguments[1..])
+        }
+        "lifecycle-explore-live" => lifecycle_explore_live::run(&arguments[1..]),
+        "lifecycle-gate-a7" => lifecycle_gate_a7::run(&arguments[1..]),
         "partial-tests-live" => partial_tests_live::run(&arguments[1..]),
         "mcp-contract-microbench" => mcp_contract_microbench_run(&arguments[1..]),
         "minimal-pilot-live" => minimal_live_pilot::run(&arguments[1..]),
         "quality-oracle-replay" => quality_oracle_replay(&arguments[1..]),
         "artifact-cache-main-replay" => artifact_cache_main_replay::run(&arguments[1..]),
+        "test-target-refresh-shadow" => test_target_refresh_shadow::run(&arguments[1..]),
         "worker-diagnostic-live" => worker_live_diagnostic::run(&arguments[1..]),
         "cache-pilot" => product_cache_pilot_run(&arguments[1..]),
         "cache-pilot-report" => cache_pilot_report(&arguments[1..]),
@@ -896,7 +924,7 @@ fn run_experiment(arguments: Vec<String>) -> Result<(), AppError> {
         "final-report" => final_gate_report(&arguments[1..]),
         "report" => experiment_report(&arguments[1..]),
         _ => Err(AppError::Usage(
-            "experiment run|transport-preflight|mcp-live|partial-tests-live|mcp-contract-microbench|minimal-pilot-live|quality-oracle-replay|artifact-cache-main-replay|worker-diagnostic-live|pilot|cache-pilot|cache-pilot-report|report|product-report|power-plan|final-report"
+            "experiment run|transport-preflight|mcp-live|lifecycle-explore-authority-preflight|lifecycle-explore-authority-accept|lifecycle-explore-lifecycle-authority-preflight|lifecycle-explore-lifecycle-authority-accept|lifecycle-explore-zero-adapter-live|lifecycle-explore-live|lifecycle-gate-a7|partial-tests-live|mcp-contract-microbench|minimal-pilot-live|quality-oracle-replay|artifact-cache-main-replay|test-target-refresh-shadow|worker-diagnostic-live|pilot|cache-pilot|cache-pilot-report|report|product-report|power-plan|final-report"
                 .to_owned(),
         )),
     }

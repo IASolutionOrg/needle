@@ -8,6 +8,7 @@ use needle_core::{
 };
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Component, Path};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,7 +22,7 @@ pub use claims::ValidatedClaimSet;
 use claims::extract_validated_claims;
 use test_plan::{TestPlanProof, validate_test_plan_proof};
 
-pub const SEMANTIC_VALIDATOR_REVISION: u32 = 12;
+pub const SEMANTIC_VALIDATOR_REVISION: u32 = 13;
 
 #[derive(Clone, Debug)]
 pub struct ValidatedSemanticArtifact {
@@ -34,7 +35,6 @@ pub struct ValidatedSemanticArtifact {
 struct TestPlanCertification<'a> {
     evidence_ids: &'a [String],
     status: Option<TestPlanEvidenceStatus>,
-    require_declared_target: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,11 +108,7 @@ pub fn validate_semantic_artifact_with_trace(
         repository_root,
         origin_request_id,
         observation_trace,
-        TestPlanCertification {
-            evidence_ids: &[],
-            status: test_plan_evidence,
-            require_declared_target: true,
-        },
+        TestPlanCertification { evidence_ids: &[], status: test_plan_evidence },
     )
 }
 
@@ -137,7 +133,6 @@ pub fn validate_semantic_test_plan_with_evidence(
         TestPlanCertification {
             evidence_ids: std::slice::from_ref(&command_evidence.id),
             status: Some(TestPlanEvidenceStatus::Executed),
-            require_declared_target: false,
         },
     )
 }
@@ -157,11 +152,7 @@ pub fn validate_semantic_test_plan(
         repository_root,
         origin_request_id,
         observation_trace,
-        TestPlanCertification {
-            evidence_ids: &[],
-            status: Some(TestPlanEvidenceStatus::Located),
-            require_declared_target: false,
-        },
+        TestPlanCertification { evidence_ids: &[], status: Some(TestPlanEvidenceStatus::Located) },
     )
 }
 
@@ -220,12 +211,7 @@ fn validate_semantic_artifact_with_evidence(
     let Some(subject) = fragment.subject_definitions.first() else {
         return Err(SemanticValidationError::Insufficient(kind.0));
     };
-    let test_plan_proof = validate_test_plan_proof(
-        worker_artifact,
-        repository_root,
-        subject,
-        test_plan_certification.require_declared_target,
-    )?;
+    let test_plan_proof = validate_test_plan_proof(worker_artifact, repository_root, subject)?;
     validate_artifact_locations(worker_artifact, repository_root)?;
     let Some(derived) =
         derive_coverage(worker_artifact, subject, repository_root, test_plan_proof.as_ref())?
@@ -354,6 +340,17 @@ pub fn artifact_and_certificate_are_fresh(
     certificate: &ArtifactValidationCertificate,
     repository_root: &Path,
 ) -> bool {
+    let Ok(canonical_repository_root) = fs::canonicalize(repository_root) else {
+        return false;
+    };
+    artifact_and_certificate_are_fresh_from_root(artifact, certificate, &canonical_repository_root)
+}
+
+pub(crate) fn artifact_and_certificate_are_fresh_from_root(
+    artifact: &Artifact,
+    certificate: &ArtifactValidationCertificate,
+    canonical_repository_root: &Path,
+) -> bool {
     if artifact.contract.schema_id != needle_core::SEMANTIC_ARTIFACT_RESULT_SCHEMA_ID
         || artifact.contract.cache_scope != artifact.dependency_manifest.scope
         || (artifact.contract.cache_scope == CacheScope::WorktreeSemantic
@@ -388,20 +385,62 @@ pub fn artifact_and_certificate_are_fresh(
         .dependency_manifest
         .dependencies
         .iter()
-        .all(|dependency| dependency_is_fresh(repository_root, dependency))
+        .all(|dependency| dependency_is_fresh_from_root(canonical_repository_root, dependency))
 }
 
 pub(crate) fn dependency_is_fresh(repository_root: &Path, dependency: &Dependency) -> bool {
-    read_evidence(repository_root, &dependency.path).is_ok_and(|bytes| {
-        let range_is_valid = match (dependency.byte_start, dependency.byte_end) {
-            (None, None) => true,
-            (Some(start), Some(end)) => {
-                start < end && usize::try_from(end).is_ok_and(|end| end <= bytes.len())
+    fs::canonicalize(repository_root)
+        .ok()
+        .is_some_and(|root| dependency_is_fresh_from_root(&root, dependency))
+}
+
+fn dependency_is_fresh_from_root(
+    canonical_repository_root: &Path,
+    dependency: &Dependency,
+) -> bool {
+    let relative_path = Path::new(&dependency.path);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        })
+    {
+        return false;
+    }
+    let Ok(path) = fs::canonicalize(canonical_repository_root.join(relative_path)) else {
+        return false;
+    };
+    if !path.starts_with(canonical_repository_root) || !path.is_file() {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes_read = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let Ok(count_u64) = u64::try_from(count) else {
+                    return false;
+                };
+                let Some(next_bytes_read) = bytes_read.checked_add(count_u64) else {
+                    return false;
+                };
+                bytes_read = next_bytes_read;
+                hasher.update(&buffer[..count]);
             }
-            _ => false,
-        };
-        range_is_valid && Digest::blake3(bytes) == dependency.content_digest
-    })
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    let range_is_valid = match (dependency.byte_start, dependency.byte_end) {
+        (None, None) => true,
+        (Some(start), Some(end)) => start < end && end <= bytes_read,
+        _ => false,
+    };
+    range_is_valid && Digest(*hasher.finalize().as_bytes()) == dependency.content_digest
 }
 
 fn derive_coverage(
@@ -480,9 +519,7 @@ fn derive_coverage(
             identifiers,
             selection,
             evidence_paths,
-        } => Ok((runner == "cargo"
-            && argv.first().map(String::as_str) == Some("cargo")
-            && argv.get(1).map(String::as_str) == Some("test")
+        } => Ok((argv.first().map(String::as_str) == Some(runner.as_str())
             && is_safe_relative_path(cwd_relative)
             && !identifiers.is_empty()
             && !evidence_paths.is_empty()
@@ -846,6 +883,38 @@ mod tests {
         SubjectKind, TestPlan, need_fragment,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn dependency_freshness_streams_large_files_and_preserves_range_rules() {
+        let root = std::env::temp_dir().join(format!(
+            "needle-semantic-streaming-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let bytes = vec![0x5a; 160 * 1024];
+        fs::write(root.join("large.bin"), &bytes).unwrap();
+        let mut dependency = Dependency {
+            path: "large.bin".to_owned(),
+            content_digest: Digest::blake3(&bytes),
+            byte_start: None,
+            byte_end: None,
+            claims: vec!["large-file".to_owned()],
+        };
+        assert!(dependency_is_fresh(&root, &dependency));
+
+        dependency.byte_start = Some(64 * 1024);
+        dependency.byte_end = Some(128 * 1024);
+        assert!(dependency_is_fresh(&root, &dependency));
+        dependency.byte_end = Some((bytes.len() + 1).try_into().unwrap());
+        assert!(!dependency_is_fresh(&root, &dependency));
+
+        dependency.byte_start = None;
+        dependency.byte_end = None;
+        fs::write(root.join("large.bin"), &bytes[..bytes.len() - 1]).unwrap();
+        assert!(!dependency_is_fresh(&root, &dependency));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn coverage_is_derived_and_freshness_detects_mutation() {
@@ -1371,7 +1440,7 @@ mod tests {
         assert_eq!(untraced.certificate.test_plan_evidence, Some(TestPlanEvidenceStatus::Located));
         assert_eq!(untraced.claims.claims.len(), 1);
         assert_eq!(untraced.claims.claims[0].kind, ClaimKind::FocusedTest);
-        assert_eq!(untraced.claims.certificates[0].dependencies.len(), 3);
+        assert_eq!(untraced.claims.certificates[0].dependencies.len(), 2);
         assert_eq!(untraced.artifact.dependency_manifest.scope, CacheScope::WorktreeSemantic);
         assert!(untraced.artifact.dependency_manifest.gaps.is_empty());
         let discovered = validate_semantic_artifact_with_trace(
@@ -1423,7 +1492,7 @@ mod tests {
                 .iter()
                 .map(|dependency| dependency.path.as_str())
                 .collect::<Vec<_>>(),
-            ["Cargo.toml", "tests/feature.rs", "tests/misc.rs"]
+            ["Cargo.toml", "tests/feature.rs"]
         );
         assert!(
             discovered_with_unparseable_command_trace.artifact.dependency_manifest.gaps.is_empty()
@@ -1447,16 +1516,19 @@ mod tests {
         ));
         fs::write(
             root.join("tests/feature.rs"),
-            "// --glob-case-insensitive\n#[test]\nfn glob_always_case_insensitive() {}\n",
+            "// changed --glob-case-insensitive\n#[test]\nfn glob_always_case_insensitive() {}\n",
         )
         .unwrap();
-        fs::write(root.join("tests/misc.rs"), "mod changed;\n").unwrap();
         assert!(!artifact_and_certificate_are_fresh(
             &discovered_with_unparseable_command_trace.artifact,
             &discovered_with_unparseable_command_trace.certificate,
             &root
         ));
-        fs::write(root.join("tests/misc.rs"), "mod feature;\n").unwrap();
+        fs::write(
+            root.join("tests/feature.rs"),
+            "// --glob-case-insensitive\n#[test]\nfn glob_always_case_insensitive() {}\n",
+        )
+        .unwrap();
         let malicious = SemanticWorkerArtifact::TestPlan {
             runner: "cargo".to_owned(),
             argv: vec!["cargo".to_owned(), "test".to_owned(), "misc".to_owned(), ";".to_owned()],
@@ -1508,7 +1580,7 @@ mod tests {
                 }),
             ),
             Err(SemanticValidationError::Evidence(message))
-                if message.contains("argv_not_canonical")
+                if message.contains("argv_not_direct")
         ));
         let fabricated_identifier = SemanticWorkerArtifact::TestPlan {
             runner: "cargo".to_owned(),
@@ -1556,31 +1628,31 @@ mod tests {
                 "tests/feature.rs".to_owned(),
             ],
         };
-        assert!(matches!(
+        assert!(
             validate_semantic_artifact(
                 &fragment,
                 &fabricated_target,
                 &root,
-                Digest::blake3(b"fabricated-target-origin")
-            ),
-            Err(SemanticValidationError::Evidence(message))
-                if message.contains("cargo test target is absent")
-        ));
+                Digest::blake3(b"provider-owned-target-origin")
+            )
+            .is_ok(),
+            "the generic validator must not interpret a provider-owned target name"
+        );
         fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[[test]]\nname = \"integration\"\npath = \"../escape.rs\"\n",
         )
         .unwrap();
-        assert!(matches!(
+        assert!(
             validate_semantic_artifact(
                 &fragment,
                 &artifact,
                 &root,
-                Digest::blake3(b"escaping-target-origin")
-            ),
-            Err(SemanticValidationError::Evidence(message))
-                if message.contains("target escapes the repository")
-        ));
+                Digest::blake3(b"opaque-provider-target-origin")
+            )
+            .is_ok(),
+            "provider manifests are opaque to the generic semantic validator"
+        );
         fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[[test]]\nname = \"integration\"\npath = \"tests/misc.rs\"\n",

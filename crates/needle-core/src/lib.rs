@@ -5,30 +5,54 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{self, Write as _};
 use thiserror::Error;
 
+mod action;
 mod approval;
+mod architecture_brief;
 mod artifact;
+mod awcp;
 mod change;
+mod change_action;
+mod change_impact;
 pub mod claim;
+mod definition_generation;
+mod dependency_validity;
 mod domain;
+mod execution;
 mod lifecycle;
 mod multi_need;
+mod partition_manifest;
+mod refresh;
+mod repository_generation;
 mod role_profile;
 mod semantic;
+mod test_target_inventory;
 
+pub use action::*;
 pub use approval::*;
+pub use architecture_brief::*;
 pub use artifact::*;
+pub use awcp::*;
 pub use change::*;
+pub use change_action::*;
+pub use change_impact::*;
 pub use claim::{
     ClaimId, ClaimKind, ClaimOrigin, ClaimPayload, ClaimRelation, ClaimRelationKind,
     ClaimSetCertificate, ClaimSetCertificateId, ClaimValidationCertificate,
     ClaimValidationCertificateId, MAX_CLAIM_CANDIDATES, MAX_CLAIM_ORIGINS, MAX_CLAIMS_PER_ARTIFACT,
     MAX_SELECTED_CLAIMS, ProofComponent, runtime_flow_anchor,
 };
+pub use definition_generation::*;
+pub use dependency_validity::*;
 pub use domain::*;
+pub use execution::*;
 pub use lifecycle::*;
 pub use multi_need::*;
+pub use partition_manifest::*;
+pub use refresh::*;
+pub use repository_generation::*;
 pub use role_profile::*;
 pub use semantic::*;
+pub use test_target_inventory::*;
 
 pub const FORMAT_REVISION: u32 = 1;
 pub const MAX_REQUEST_BYTES: usize = 2_048;

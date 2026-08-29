@@ -223,6 +223,7 @@ struct Simulator {
     turn: u32,
     pending_approval: Option<PendingApproval>,
     pending_main_turn: Option<String>,
+    pending_action_test_plan: Option<TestPlan>,
     verifier_plans: Vec<SimulatorVerifierPlan>,
     verifier_next_plan: usize,
 }
@@ -559,12 +560,17 @@ impl Simulator {
                 }),
             );
         }
+        let output_schema =
+            message.pointer("/params/outputSchema").map(Value::to_string).unwrap_or_default();
         if matches!(
             self.scenario.as_str(),
-            "patch_worker" | "patch_repair_initial" | "patch_repair"
-        ) {
-            let output_schema =
-                message.pointer("/params/outputSchema").map(Value::to_string).unwrap_or_default();
+            "patch_worker"
+                | "patch_worker_paraphrased_criterion"
+                | "patch_repair_initial"
+                | "patch_repair"
+        ) || (self.scenario == "action_native_lifecycle"
+            && output_schema.contains("changed_files"))
+        {
             if !output_schema.contains("acceptance_coverage")
                 || !output_schema.contains("changed_files")
             {
@@ -593,6 +599,123 @@ impl Simulator {
                 file_change: true,
             });
             return Ok(());
+        }
+        if self.scenario == "action_native_lifecycle" {
+            if output_schema.contains("\"const\":\"code-location\"") {
+                return self.complete_turn(&turn_id, semantic_flag_location_artifact(), output);
+            }
+            if output_schema.contains("\"const\":\"test-plan\"") {
+                return self.complete_turn(
+                    &turn_id,
+                    action_lifecycle_test_plan_artifact(&self.checkout),
+                    output,
+                );
+            }
+            let prompt =
+                message.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+            let contents =
+                fs::read_to_string(self.checkout.join("fixture.txt")).map_err(|error| {
+                    format!("action lifecycle cannot inspect patched fixture: {error}")
+                })?;
+            if contents != "changed by isolated patcher\n" {
+                return Err("action lifecycle did not receive the materialized patch".to_owned());
+            }
+            if output_schema.contains("\"completed\"")
+                && prompt.contains("execute_certified_test_plan")
+            {
+                let prompt_value: Value = serde_json::from_str(prompt)
+                    .map_err(|error| format!("action lifecycle test prompt is invalid: {error}"))?;
+                let argv = prompt_value["argv"]
+                    .as_array()
+                    .ok_or_else(|| "action lifecycle test argv is missing".to_owned())?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| "action lifecycle test argv is invalid".to_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let runner = argv
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "action lifecycle test runner is missing".to_owned())?;
+                let plan = TestPlan {
+                    runner,
+                    argv: argv.clone(),
+                    cwd_relative: prompt_value["cwd_relative"]
+                        .as_str()
+                        .ok_or_else(|| "action lifecycle test cwd is missing".to_owned())?
+                        .to_owned(),
+                    test_identifier: prompt_value["test_identifier"]
+                        .as_str()
+                        .ok_or_else(|| "action lifecycle test identifier is missing".to_owned())?
+                        .to_owned(),
+                    requires_approval: true,
+                    execution_evidence_id: None,
+                };
+                plan.test_command()
+                    .map_err(|_| "action lifecycle TestPlan is not canonical".to_owned())?;
+                let command = argv.join(" ");
+                let request_id = json!(9301);
+                let item_id = "needle-sim-action-test-1".to_owned();
+                emit(
+                    output,
+                    json!({
+                        "id": request_id,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {
+                            "threadId": self.thread_id,
+                            "turnId": turn_id,
+                            "itemId": item_id,
+                            "command": command.clone(),
+                            "cwd": self.checkout,
+                            "commandActions": [{"type": "unknown", "command": command}],
+                            "additionalPermissions": {}
+                        }
+                    }),
+                )?;
+                self.pending_approval = Some(PendingApproval {
+                    request_id,
+                    turn_id,
+                    item_id,
+                    test_plan: true,
+                    file_change: false,
+                });
+                self.pending_action_test_plan = Some(plan);
+                return Ok(());
+            }
+            if output_schema.contains("\"severity\"") {
+                return self.complete_turn(
+                    &turn_id,
+                    json!({
+                        "verdict": "approved",
+                        "acceptance_coverage": [{
+                            "criterion": "The fixture changes.",
+                            "status": "addressed",
+                            "evidence": "fixture.txt contains the updated text"
+                        }],
+                        "findings": []
+                    }),
+                    output,
+                );
+            }
+            if output_schema.contains("\"repairable\"") {
+                return self.complete_turn(
+                    &turn_id,
+                    json!({
+                        "verdict": "verified",
+                        "acceptance_coverage": [{
+                            "criterion": "The fixture changes.",
+                            "status": "addressed",
+                            "evidence": "fixture.txt contains the updated text"
+                        }],
+                        "findings": []
+                    }),
+                    output,
+                );
+            }
+            return Err("action lifecycle received an unknown closed output schema".to_owned());
         }
         if matches!(self.scenario.as_str(), "verifier_worker" | "verifier_repair_flow") {
             let prompt =
@@ -638,8 +761,6 @@ impl Simulator {
                 output,
             );
         }
-        let output_schema =
-            message.pointer("/params/outputSchema").map(Value::to_string).unwrap_or_default();
         let test_plan_only = output_schema.contains("\"const\":\"test-plan\"")
             && !output_schema.contains("\"const\":\"code-location\"");
         if self.turn == 1 {
@@ -1013,14 +1134,17 @@ impl Simulator {
         let verifier_plan = (self.scenario == "verifier_worker" && pending.test_plan)
             .then(|| self.verifier_plans.get(self.verifier_next_plan))
             .flatten();
-        let expected_command =
-            verifier_plan.map(|entry| entry.plan.argv.join(" ")).unwrap_or_else(|| {
-                match self.scenario.as_str() {
-                    "worker_r44" => R44_TEST_COMMAND.to_owned(),
-                    "main_direct_read_only" => MAIN_DIRECT_READ_COMMAND.to_owned(),
-                    "main_direct_r84_pending_approval" => MAIN_DIRECT_R84_SCRIPT.to_owned(),
-                    _ => TEST_COMMAND.to_owned(),
-                }
+        let action_plan = (self.scenario == "action_native_lifecycle" && pending.test_plan)
+            .then(|| self.pending_action_test_plan.take())
+            .flatten();
+        let expected_command = verifier_plan
+            .map(|entry| entry.plan.argv.join(" "))
+            .or_else(|| action_plan.as_ref().map(|plan| plan.argv.join(" ")))
+            .unwrap_or_else(|| match self.scenario.as_str() {
+                "worker_r44" => R44_TEST_COMMAND.to_owned(),
+                "main_direct_read_only" => MAIN_DIRECT_READ_COMMAND.to_owned(),
+                "main_direct_r84_pending_approval" => MAIN_DIRECT_R84_SCRIPT.to_owned(),
+                _ => TEST_COMMAND.to_owned(),
             });
         let (command, action) = if self.scenario == "payload_mismatch" {
             (TEST_COMMAND.to_owned(), "cargo test other -- --exact".to_owned())
@@ -1035,13 +1159,21 @@ impl Simulator {
                     entry.plan.test_identifier
                 ),
             )
+        } else if let Some(plan) = action_plan.as_ref() {
+            (
+                0,
+                format!(
+                    "\nrunning 1 test\ntest {} ... ok\n\ntest result: ok. 1 passed; 0 failed\n",
+                    plan.test_identifier
+                ),
+            )
         } else {
             let (exit_code, test_output) = match self.scenario.as_str() {
-                "wrong_test_identifier" => (
+                "opaque_id_output" => (
                     0,
                     "\nrunning 1 test\ntest other ... ok\n\ntest result: ok. 1 passed; 0 failed\n",
                 ),
-                "no_test_executed" => {
+                "opaque_zero_output" => {
                     (0, "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed\n")
                 }
                 "test_exit_failure" => (
@@ -1118,6 +1250,8 @@ impl Simulator {
             &pending.turn_id,
             if self.scenario == "worker_r44" {
                 r44_location_artifact()
+            } else if self.scenario == "action_native_lifecycle" && pending.test_plan {
+                json!({"completed": true})
             } else if pending.test_plan {
                 test_plan_artifact()
             } else {
@@ -1186,6 +1320,11 @@ impl Simulator {
         };
         fs::write(self.checkout.join("fixture.txt"), contents)
             .map_err(|error| format!("cannot apply simulated patch: {error}"))?;
+        let acceptance_criterion = if self.scenario == "patch_worker_paraphrased_criterion" {
+            "The fixture text is different."
+        } else {
+            "The fixture changes."
+        };
         emit(
             output,
             json!({
@@ -1205,7 +1344,7 @@ impl Simulator {
                 "summary": "Updated the fixture in the disposable checkout.",
                 "changed_files": [{"path": "fixture.txt", "operation": "update"}],
                 "acceptance_coverage": [{
-                    "criterion": "The fixture changes.",
+                    "criterion": acceptance_criterion,
                     "status": "addressed",
                     "evidence": "fixture.txt contains the requested updated text"
                 }],
@@ -1368,6 +1507,36 @@ fn test_plan_artifact() -> Value {
             "evidence_paths": ["src/lib.rs"]
         }]
     })
+}
+
+fn action_lifecycle_test_plan_artifact(checkout: &Path) -> Value {
+    if checkout.join("tests/fixture.test.js").is_file() {
+        json!({
+            "schema": "needle.artifact-result/2",
+            "artifacts": [{
+                "kind": "test-plan",
+                "runner": "node",
+                "argv": ["node", "--test", "tests/fixture.test.js"],
+                "cwd_relative": ".",
+                "identifiers": ["tests/fixture.test.js"],
+                "selection": "representative",
+                "evidence_paths": ["tests/fixture.test.js"]
+            }]
+        })
+    } else {
+        json!({
+            "schema": "needle.artifact-result/2",
+            "artifacts": [{
+                "kind": "test-plan",
+                "runner": "cargo",
+                "argv": ["cargo", "test", "suite::focused", "--", "--exact"],
+                "cwd_relative": ".",
+                "identifiers": ["suite::focused"],
+                "selection": "representative",
+                "evidence_paths": ["tests/fixture.rs"]
+            }]
+        })
+    }
 }
 
 fn r44_location_artifact() -> Value {

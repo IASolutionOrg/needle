@@ -3,24 +3,32 @@
 mod artifact_cache_replay;
 mod calibration_replay;
 mod corpus;
+mod derived_action_gate;
 mod final_gate;
 mod minimal_pilot;
 mod power_plan;
 mod product;
+mod review_change_impact_gate;
 mod schedule;
 mod sealed_oracle;
 mod shadow_replay;
+mod test_target_refresh_gate;
+mod test_target_refresh_live;
 
 pub use artifact_cache_replay::*;
 pub use calibration_replay::*;
 pub use corpus::*;
+pub use derived_action_gate::*;
 pub use final_gate::*;
 pub use minimal_pilot::*;
 pub use power_plan::*;
 pub use product::*;
+pub use review_change_impact_gate::*;
 pub use schedule::*;
 pub use sealed_oracle::*;
 pub use shadow_replay::*;
+pub use test_target_refresh_gate::*;
+pub use test_target_refresh_live::*;
 
 use needle_core::{ContinuationEnvelope, Digest, NeedRequest};
 use serde::{Deserialize, Serialize};

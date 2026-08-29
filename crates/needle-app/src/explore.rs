@@ -1,7 +1,7 @@
 use super::{AppError, product_data_directory};
 use needle_core::{
-    Digest, NEED_IR_FORMAT_REVISION, NeedIr, NeedKey, NeedRequest, RoleProfileId,
-    SubjectExpression, SubjectKind,
+    Digest, NEED_IR_FORMAT_REVISION, NeedExecution, NeedExecutionEnvelopeV1, NeedIr, NeedKey,
+    NeedRequest, RoleProfileId, SubjectExpression, SubjectKind,
 };
 use needle_platform_codex::HookConfig;
 use needle_runtime::{ResolveRequest, RuntimeStore, capture_git_snapshot};
@@ -196,6 +196,12 @@ fn resolve(
     store.settings().map_err(|error| AppError::Runtime(error.to_string()))?;
     let prompt_profile_digest = HookConfig::default().profile()?.definition_digest;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let envelope = NeedExecutionEnvelopeV1::new(
+        Digest::blake3(format!("needle-explore-{}-{nonce}", std::process::id())),
+        need_ir,
+        NeedExecution::Resolve,
+    );
+    envelope.validate().map_err(|error| AppError::Runtime(error.to_string()))?;
     let session_id = format!("needle-explore-{}-{nonce}", std::process::id());
     let turn_id = "turn-1";
     let cwd = repository.to_string_lossy();
@@ -222,7 +228,7 @@ fn resolve(
         main_model: "unknown".to_owned(),
         cwd: repository,
         need,
-        need_ir: Some(need_ir),
+        need_ir: Some(envelope.need),
         declared_test_plan: None,
     };
     let worker_policy = if env::var("NEEDLE_RESOLVE_CACHE_ONLY").as_deref() == Ok("1") {

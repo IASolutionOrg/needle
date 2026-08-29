@@ -12,3 +12,6 @@ needle-runtime = { path = "../needle-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+needle-bench = { path = "../needle-bench" }

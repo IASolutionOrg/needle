@@ -4,6 +4,7 @@ use needle_core::{
     LifecyclePhase, LifecycleReason, PatchArtifact, PatchId, VerificationArtifact,
     VerificationStatus,
 };
+use rusqlite::Transaction;
 
 type PreparedChangeRow = (
     String,
@@ -74,6 +75,100 @@ fn require_change_role_profile_provenance(
     Ok(stored)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_change_request_in_transaction(
+    transaction: &Transaction<'_>,
+    change_id: &ChangeId,
+    repository_id: Digest,
+    source_snapshot: Digest,
+    request_digest: Digest,
+    request: &ChangeRequest,
+    role_profile_provenance: Option<&RoleProfileProvenance>,
+    now: u64,
+) -> Result<bool, StoreError> {
+    let request_json = serde_json::to_string(request)?;
+    let existing: Option<ExistingChangeRequestRow> = transaction
+        .query_row(
+            "SELECT request_digest, repository_id, source_snapshot_digest, request_json,
+                    role_profile_id, role_profile_revision,
+                    role_profile_definition_digest
+             FROM change_requests WHERE change_id=?1",
+            [change_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((
+        stored_request,
+        stored_repository,
+        stored_snapshot,
+        stored_json,
+        profile_id,
+        profile_revision,
+        profile_digest,
+    )) = existing
+    {
+        let stored_provenance =
+            parse_role_profile_provenance((profile_id, profile_revision, profile_digest))?;
+        if stored_request == request_digest.to_string()
+            && stored_repository == repository_id.to_string()
+            && stored_snapshot == source_snapshot.to_string()
+            && stored_json == request_json
+            && stored_provenance.as_ref() == role_profile_provenance
+        {
+            return Ok(false);
+        }
+        return Err(StoreError::ChangeConflict(change_id.to_string()));
+    }
+    transaction.execute(
+        "INSERT INTO change_requests(
+            change_id, request_digest, repository_id, source_snapshot_digest,
+            state, request_json, latest_patch_revision, repair_attempted,
+            created_unix_ms, updated_unix_ms, role_profile_id,
+            role_profile_revision, role_profile_definition_digest
+         ) VALUES(?1, ?2, ?3, ?4, 'requested', ?5, 0, 0, ?6, ?6, ?7, ?8, ?9)",
+        params![
+            change_id.to_string(),
+            request_digest.to_string(),
+            repository_id.to_string(),
+            source_snapshot.to_string(),
+            request_json,
+            now,
+            role_profile_provenance.map(|value| value.profile_id.as_str()),
+            role_profile_provenance.map(|value| value.revision),
+            role_profile_provenance.map(|value| value.definition_digest.to_string()),
+        ],
+    )?;
+    let event_json = serde_json::to_string(&with_role_profile_provenance(
+        &serde_json::json!({
+            "request_digest": request_digest,
+            "state": "requested"
+        }),
+        role_profile_provenance,
+    ))?;
+    transaction.execute(
+        "INSERT INTO change_events(
+            change_id, event_type, payload_digest, payload_json, created_unix_ms
+         ) VALUES(?1, 'requested', ?2, ?3, ?4)",
+        params![
+            change_id.to_string(),
+            Digest::blake3(event_json.as_bytes()).to_string(),
+            event_json,
+            now
+        ],
+    )?;
+    Ok(true)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatchFileBlob {
     pub path: String,
@@ -109,7 +204,7 @@ pub struct LifecycleChangeContext {
 #[serde(deny_unknown_fields)]
 pub struct ChangeAttemptRecord {
     pub role: String,
-    pub patch_id: PatchId,
+    pub patch_id: Option<PatchId>,
     pub attempt: serde_json::Value,
     pub usage: serde_json::Value,
     pub cost_microusd: Option<u64>,
@@ -186,90 +281,19 @@ impl RuntimeStore {
                 "{change_id}: unknown role-profile revision"
             )));
         }
-        let request_json = serde_json::to_string(request)?;
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let existing: Option<ExistingChangeRequestRow> = transaction
-            .query_row(
-                "SELECT request_digest, repository_id, source_snapshot_digest, request_json,
-                        role_profile_id, role_profile_revision,
-                        role_profile_definition_digest
-                 FROM change_requests WHERE change_id=?1",
-                [change_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((
-            stored_request,
-            stored_repository,
-            stored_snapshot,
-            stored_json,
-            profile_id,
-            profile_revision,
-            profile_digest,
-        )) = existing
-        {
-            let stored_provenance =
-                parse_role_profile_provenance((profile_id, profile_revision, profile_digest))?;
-            if stored_request == request_digest.to_string()
-                && stored_repository == repository_id.to_string()
-                && stored_snapshot == source_snapshot.to_string()
-                && stored_json == request_json
-                && stored_provenance.as_ref() == role_profile_provenance
-            {
-                transaction.commit()?;
-                return Ok(());
-            }
-            return Err(StoreError::ChangeConflict(change_id.to_string()));
-        }
-        transaction.execute(
-            "INSERT INTO change_requests(
-                change_id, request_digest, repository_id, source_snapshot_digest,
-                state, request_json, latest_patch_revision, repair_attempted,
-                created_unix_ms, updated_unix_ms, role_profile_id,
-                role_profile_revision, role_profile_definition_digest
-             ) VALUES(?1, ?2, ?3, ?4, 'requested', ?5, 0, 0, ?6, ?6, ?7, ?8, ?9)",
-            params![
-                change_id.to_string(),
-                request_digest.to_string(),
-                repository_id.to_string(),
-                source_snapshot.to_string(),
-                request_json,
-                now,
-                role_profile_provenance.map(|value| value.profile_id.as_str()),
-                role_profile_provenance.map(|value| value.revision),
-                role_profile_provenance.map(|value| value.definition_digest.to_string()),
-            ],
-        )?;
-        let event_json = serde_json::to_string(&with_role_profile_provenance(
-            &serde_json::json!({
-                "request_digest": request_digest,
-                "state": "requested"
-            }),
+        record_change_request_in_transaction(
+            &transaction,
+            change_id,
+            repository_id,
+            source_snapshot,
+            request_digest,
+            request,
             role_profile_provenance,
-        ))?;
-        transaction.execute(
-            "INSERT INTO change_events(
-                change_id, event_type, payload_digest, payload_json, created_unix_ms
-             ) VALUES(?1, 'requested', ?2, ?3, ?4)",
-            params![
-                change_id.to_string(),
-                Digest::blake3(event_json.as_bytes()).to_string(),
-                event_json,
-                now
-            ],
+            now,
         )?;
         transaction.commit()?;
         Ok(())
@@ -622,6 +646,18 @@ impl RuntimeStore {
         change_id: &ChangeId,
         patch_id: PatchId,
     ) -> Result<(), StoreError> {
+        self.begin_linked_change_repair(change_id, change_id, patch_id)
+    }
+
+    /// Atomically consumes a lifecycle repair reservation while advancing the
+    /// semantic action change that owns the prepared patch. Legacy lifecycles
+    /// use the same identifier for both sides.
+    pub fn begin_linked_change_repair(
+        &self,
+        lifecycle_change_id: &ChangeId,
+        action_change_id: &ChangeId,
+        patch_id: PatchId,
+    ) -> Result<(), StoreError> {
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction =
@@ -638,7 +674,7 @@ impl RuntimeStore {
                    AND c.latest_patch_revision=1 AND c.repair_attempted=0
                    AND p.patch_id=?2
                  ORDER BY v.created_unix_ms DESC, v.verification_id LIMIT 1",
-                params![change_id.to_string(), patch_id.to_string()],
+                params![action_change_id.to_string(), patch_id.to_string()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -646,26 +682,26 @@ impl RuntimeStore {
             .map(|json| serde_json::from_str::<VerificationArtifact>(&json))
             .transpose()?
             .filter(|artifact| {
-                artifact.change_id == *change_id
+                artifact.change_id == *action_change_id
                     && artifact.patch_id == patch_id
                     && artifact.verdict == VerificationStatus::Repairable
                     && artifact.is_canonical()
             })
-            .ok_or_else(|| StoreError::ChangeConflict(change_id.to_string()))?;
-        let provenance = change_role_profile_provenance(&transaction, change_id)?;
+            .ok_or_else(|| StoreError::ChangeConflict(action_change_id.to_string()))?;
+        let provenance = change_role_profile_provenance(&transaction, action_change_id)?;
         let changed = transaction.execute(
             "UPDATE change_requests
              SET state='repairing', repair_attempted=1, updated_unix_ms=?2
              WHERE change_id=?1 AND state='repairable'
                AND latest_patch_revision=1 AND repair_attempted=0",
-            params![change_id.to_string(), now],
+            params![action_change_id.to_string(), now],
         )?;
         if changed != 1 {
-            return Err(StoreError::ChangeConflict(change_id.to_string()));
+            return Err(StoreError::ChangeConflict(action_change_id.to_string()));
         }
         super::lifecycles::consume_lifecycle_repair(
             &transaction,
-            change_id,
+            lifecycle_change_id,
             patch_id,
             verification.id,
             now,
@@ -683,7 +719,7 @@ impl RuntimeStore {
                 change_id, event_type, payload_digest, payload_json, created_unix_ms
              ) VALUES(?1, 'repair_started', ?2, ?3, ?4)",
             params![
-                change_id.to_string(),
+                action_change_id.to_string(),
                 Digest::blake3(payload_json.as_bytes()).to_string(),
                 payload_json,
                 now
@@ -736,6 +772,23 @@ impl RuntimeStore {
                 "verification artifact is not canonical".to_owned(),
             ));
         }
+        let action_provenance = if artifact.action_request.is_some() {
+            let provenance = role_profile_provenance.ok_or_else(|| {
+                StoreError::ChangeConflict(format!(
+                    "{}: action-native verification requires phase provenance",
+                    artifact.change_id
+                ))
+            })?;
+            if !self.role_profile_provenance_is_historical(provenance)? {
+                return Err(StoreError::ChangeConflict(format!(
+                    "{}: action-native verifier provenance is not historical",
+                    artifact.change_id
+                )));
+            }
+            Some(provenance.clone())
+        } else {
+            None
+        };
         let artifact_json = serde_json::to_string(artifact)?;
         let attempt_json =
             serde_json::to_string(&with_role_profile_provenance(attempt, role_profile_provenance))?;
@@ -764,7 +817,9 @@ impl RuntimeStore {
             LifecyclePhase::Verify,
             role_profile_provenance,
         )?;
-        let event_provenance = if lifecycle_bound {
+        let event_provenance = if let Some(provenance) = action_provenance {
+            Some(provenance)
+        } else if lifecycle_bound {
             role_profile_provenance.cloned()
         } else {
             require_change_role_profile_provenance(
@@ -900,6 +955,41 @@ impl RuntimeStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_rejected_patch_attempt_with_provenance(
+        &self,
+        change_id: &ChangeId,
+        attempt: &serde_json::Value,
+        usage: &serde_json::Value,
+        cost_microusd: Option<u64>,
+        created_unix_ms: u64,
+        role_profile_provenance: Option<&RoleProfileProvenance>,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        require_change_role_profile_provenance(&connection, change_id, role_profile_provenance)?;
+        connection.execute(
+            "INSERT INTO change_attempts(
+                change_id, patch_id, role, attempt_json, usage_json, cost_microusd,
+                created_unix_ms, role_profile_id, role_profile_revision,
+                role_profile_definition_digest
+             ) VALUES(?1, NULL, 'patcher', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                change_id.to_string(),
+                serde_json::to_string(&with_role_profile_provenance(
+                    attempt,
+                    role_profile_provenance,
+                ))?,
+                serde_json::to_string(usage)?,
+                cost_microusd,
+                created_unix_ms,
+                role_profile_provenance.map(|value| value.profile_id.as_str()),
+                role_profile_provenance.map(|value| value.revision),
+                role_profile_provenance.map(|value| value.definition_digest.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn change_attempts(
         &self,
         change_id: &ChangeId,
@@ -913,7 +1003,7 @@ impl RuntimeStore {
         let rows = statement.query_map([change_id.to_string()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<u64>>(4)?,
@@ -937,9 +1027,11 @@ impl RuntimeStore {
             ) = row?;
             Ok(ChangeAttemptRecord {
                 role,
-                patch_id: PatchId(
-                    Digest::parse(&patch_id).map_err(|_| StoreError::Digest(patch_id))?,
-                ),
+                patch_id: patch_id
+                    .map(|value| {
+                        Digest::parse(&value).map(PatchId).map_err(|_| StoreError::Digest(value))
+                    })
+                    .transpose()?,
                 attempt: serde_json::from_str(&attempt)?,
                 usage: serde_json::from_str(&usage)?,
                 cost_microusd,
@@ -1123,8 +1215,8 @@ impl RuntimeStore {
             "INSERT INTO change_applies(
                 apply_id, change_id, patch_id, repository_root, pre_snapshot_digest,
                 post_snapshot_digest, status, journal_json, created_unix_ms,
-                completed_unix_ms
-             ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL)",
+                completed_unix_ms, operation_id
+             ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL, ?9)",
             params![
                 record.id.to_string(),
                 record.change_id.to_string(),
@@ -1133,7 +1225,8 @@ impl RuntimeStore {
                 record.pre_snapshot.to_string(),
                 status,
                 serde_json::to_string(journal)?,
-                record.created_unix_ms
+                record.created_unix_ms,
+                record.operation_id.map(|value| value.to_string())
             ],
         )?;
         transaction.execute(
@@ -1243,7 +1336,7 @@ impl RuntimeStore {
         let mut statement = connection.prepare(
             "SELECT apply_id, change_id, patch_id, repository_root,
                     pre_snapshot_digest, post_snapshot_digest, status,
-                    created_unix_ms, completed_unix_ms
+                    created_unix_ms, completed_unix_ms, operation_id
              FROM change_applies WHERE repository_root=?1 AND status='applying'
              ORDER BY created_unix_ms, apply_id",
         )?;
@@ -1260,9 +1353,28 @@ impl RuntimeStore {
             .query_row(
                 "SELECT apply_id, change_id, patch_id, repository_root,
                         pre_snapshot_digest, post_snapshot_digest, status,
-                        created_unix_ms, completed_unix_ms
+                        created_unix_ms, completed_unix_ms, operation_id
                  FROM change_applies WHERE apply_id=?1",
                 [apply_id.to_string()],
+                decode_apply_record,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn change_apply_for_operation(
+        &self,
+        operation_id: Digest,
+    ) -> Result<Option<ChangeApplyRecord>, StoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT apply_id, change_id, patch_id, repository_root,
+                        pre_snapshot_digest, post_snapshot_digest, status,
+                        created_unix_ms, completed_unix_ms, operation_id
+                 FROM change_applies WHERE operation_id=?1
+                 ORDER BY created_unix_ms DESC, apply_id DESC LIMIT 1",
+                [operation_id.to_string()],
                 decode_apply_record,
             )
             .optional()
@@ -1278,7 +1390,7 @@ impl RuntimeStore {
             .query_row(
                 "SELECT apply_id, change_id, patch_id, repository_root,
                         pre_snapshot_digest, post_snapshot_digest, status,
-                        created_unix_ms, completed_unix_ms
+                        created_unix_ms, completed_unix_ms, operation_id
                  FROM change_applies WHERE change_id=?1
                  ORDER BY created_unix_ms DESC, apply_id DESC LIMIT 1",
                 [change_id.to_string()],
@@ -1296,7 +1408,7 @@ impl RuntimeStore {
         let mut statement = connection.prepare(
             "SELECT apply_id, change_id, patch_id, repository_root,
                     pre_snapshot_digest, post_snapshot_digest, status,
-                    created_unix_ms, completed_unix_ms
+                    created_unix_ms, completed_unix_ms, operation_id
              FROM change_applies WHERE change_id=?1 ORDER BY created_unix_ms, apply_id",
         )?;
         statement
@@ -1377,6 +1489,7 @@ fn decode_apply_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeApplyR
     let post_snapshot = row.get::<_, Option<String>>(5)?.map(digest).transpose()?;
     Ok(ChangeApplyRecord {
         id: apply_id,
+        operation_id: row.get::<_, Option<String>>(9)?.map(digest).transpose()?,
         change_id,
         patch_id,
         repository_root: row.get(3)?,
@@ -1529,8 +1642,35 @@ mod tests {
                 Some(&provenance),
             )
             .unwrap();
+        let operation_id = Digest::blake3(b"rejected-patch-operation");
+        store
+            .record_rejected_patch_attempt_with_provenance(
+                &change_id,
+                &serde_json::json!({
+                    "operation_id": operation_id,
+                    "outcome": "rejected",
+                    "failure_code": "declared_output_rejected"
+                }),
+                &serde_json::json!({
+                    "input_tokens": 120,
+                    "cached_input_tokens": 80,
+                    "output_tokens": 40,
+                    "duration_ms": 25
+                }),
+                None,
+                1,
+                Some(&provenance),
+            )
+            .unwrap();
         let sensitive_reason = "worker failed at C:\\private\\repo with raw prompt text";
         store.record_change_failure(&change_id, sensitive_reason).unwrap();
+
+        let attempts = store.change_attempts(&change_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].patch_id, None);
+        assert_eq!(attempts[0].attempt["operation_id"], serde_json::json!(operation_id));
+        assert_eq!(attempts[0].usage["output_tokens"], 40);
+        assert_eq!(attempts[0].role_profile_provenance, Some(provenance.clone()));
 
         let connection = rusqlite::Connection::open(&path).unwrap();
         let (state, revision): (String, u32) = connection
@@ -1657,6 +1797,9 @@ mod tests {
             ),
             change_id: change_id.clone(),
             patch_id,
+            action_request: None,
+            requirements_digest: None,
+            input_test_evidence_artifacts: Vec::new(),
             verdict: VerificationStatus::Repairable,
             acceptance_coverage: coverage,
             findings,

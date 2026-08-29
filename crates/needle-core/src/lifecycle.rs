@@ -1,12 +1,16 @@
 use crate::{
-    ChangeApplyId, ChangeApplyStatus, ChangeId, Digest, PatchId, VerificationArtifactId,
-    VerificationStatus,
+    ArtifactId, ChangeApplyId, ChangeApplyStatus, ChangeId, Digest, PatchId,
+    VerificationArtifactId, VerificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
+mod action_phase_plan;
+mod action_plan;
 mod model;
+pub use action_phase_plan::*;
+pub use action_plan::*;
 pub use model::*;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -23,9 +27,15 @@ pub struct DevelopmentLifecycle {
     pub generation: u64,
     pub usage: LifecycleUsage,
     pub exploration_artifacts: Vec<LifecycleArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explore_reuse: Option<LifecycleExploreReuseCompletion>,
     pub patch: Option<LifecyclePatchRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_test_plans: Vec<LifecycleResolvedTestPlan>,
     pub test_results: Vec<LifecycleTestResult>,
     pub review: Option<ReviewArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_report_artifacts: Vec<ArtifactId>,
     pub verification: Option<LifecycleVerificationRef>,
     pub repair_reserved: bool,
     pub repair_consumed: bool,
@@ -55,9 +65,12 @@ impl DevelopmentLifecycle {
             generation: 0,
             usage: LifecycleUsage::default(),
             exploration_artifacts: Vec::new(),
+            explore_reuse: None,
             patch: None,
+            resolved_test_plans: Vec::new(),
             test_results: Vec::new(),
             review: None,
+            review_report_artifacts: Vec::new(),
             verification: None,
             repair_reserved: false,
             repair_consumed: false,
@@ -94,6 +107,19 @@ impl DevelopmentLifecycle {
         }
         if self.repair_reserved && self.repair_consumed {
             return Err(LifecycleError::InvalidState);
+        }
+        if self.review_report_artifacts.len() > 2
+            || self.review_report_artifacts.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(LifecycleError::InvalidReview);
+        }
+        if self
+            .spec
+            .explore_action_plan
+            .as_ref()
+            .is_some_and(|plan| plan.source_snapshot() != Some(self.source_snapshot))
+        {
+            return Err(LifecycleError::InvalidExploreActionPlan);
         }
         self.validate_artifact_chain()?;
         self.validate_status_shape()?;
@@ -176,17 +202,30 @@ impl DevelopmentLifecycle {
             LifecycleTransition::CompleteExplore { worker, artifacts } => {
                 self.require_active_phase(LifecyclePhase::Explore)?;
                 self.accept_worker(LifecyclePhase::Explore, worker)?;
-                if artifacts.is_empty() || artifacts.len() > MAX_LIFECYCLE_ARTIFACT_REFS {
-                    return Err(LifecycleError::MissingArtifact);
-                }
-                let mut ids = BTreeSet::new();
-                for artifact in artifacts {
-                    if artifact.source_snapshot != self.source_snapshot || !ids.insert(artifact.id)
-                    {
-                        return Err(LifecycleError::InvalidArtifact);
-                    }
+                self.validate_explore_artifacts(artifacts)?;
+                self.exploration_artifacts = artifacts.clone();
+                self.explore_reuse = None;
+                self.phase = LifecyclePhase::Implement;
+            }
+            LifecycleTransition::CompleteExploreFromReuse { reuse, artifacts } => {
+                self.require_active_phase(LifecyclePhase::Explore)?;
+                reuse.validate()?;
+                self.validate_explore_artifacts(artifacts)?;
+                let Some(plan) = self.spec.explore_action_plan.as_ref() else {
+                    return Err(LifecycleError::InvalidExploreReuse);
+                };
+                if artifacts.len() != 1
+                    || artifacts[0].id != reuse.artifact.digest()
+                    || reuse.source_snapshot != self.source_snapshot
+                    || reuse.repository_id != plan.repository_id()
+                    || plan.source_snapshot() != Some(reuse.source_snapshot)
+                    || plan.actions.len() != 1
+                    || plan.actions[0].semantic_id() != reuse.action_request
+                {
+                    return Err(LifecycleError::InvalidExploreReuse);
                 }
                 self.exploration_artifacts = artifacts.clone();
+                self.explore_reuse = Some(reuse.clone());
                 self.phase = LifecyclePhase::Implement;
             }
             LifecycleTransition::CompleteImplement { worker, patch } => {
@@ -204,13 +243,37 @@ impl DevelopmentLifecycle {
                 self.apply_id = None;
                 self.phase = LifecyclePhase::Test;
             }
+            LifecycleTransition::BindTestPlans { worker, plans } => {
+                self.require_active_phase(LifecyclePhase::Test)?;
+                if !self.spec.test_plans.is_empty()
+                    || !self.resolved_test_plans.is_empty()
+                    || plans.is_empty()
+                    || plans.len() > MAX_LIFECYCLE_TEST_PLANS
+                {
+                    return Err(LifecycleError::InvalidTestPlan);
+                }
+                if let Some(worker) = worker {
+                    self.accept_worker(LifecyclePhase::Test, worker)?;
+                }
+                let mut prior = None;
+                for plan in plans {
+                    plan.validate()?;
+                    let key = (plan.binding.plan_digest(), plan.artifact);
+                    if prior.is_some_and(|value| value >= key) {
+                        return Err(LifecycleError::InvalidTestPlan);
+                    }
+                    prior = Some(key);
+                }
+                self.resolved_test_plans = plans.clone();
+            }
             LifecycleTransition::CompleteTest { worker, results } => {
                 self.require_active_phase(LifecyclePhase::Test)?;
                 self.accept_worker(LifecyclePhase::Test, worker)?;
-                if results.len() != self.spec.test_plans.len() {
+                let test_plans = self.active_test_plans()?;
+                if results.len() != test_plans.len() {
                     return Err(LifecycleError::MissingTestEvidence);
                 }
-                for (result, binding) in results.iter().zip(&self.spec.test_plans) {
+                for (result, binding) in results.iter().zip(test_plans) {
                     result.validate()?;
                     if result.plan_digest != binding.plan_digest()
                         || result.certificate_digest != binding.certificate_digest
@@ -238,7 +301,7 @@ impl DevelopmentLifecycle {
                     self.phase = LifecyclePhase::Review;
                 }
             }
-            LifecycleTransition::CompleteReview { worker, review } => {
+            LifecycleTransition::CompleteReview { worker, review, report_artifact } => {
                 self.require_active_phase(LifecyclePhase::Review)?;
                 self.accept_worker(LifecyclePhase::Review, worker)?;
                 let patch = self.patch.as_ref().ok_or(LifecycleError::MissingArtifact)?;
@@ -250,6 +313,14 @@ impl DevelopmentLifecycle {
                     return Err(LifecycleError::InvalidReview);
                 }
                 self.review = Some(review.clone());
+                if let Some(artifact) = report_artifact {
+                    self.review_report_artifacts.push(*artifact);
+                    self.review_report_artifacts.sort_unstable();
+                    self.review_report_artifacts.dedup();
+                    if self.review_report_artifacts.len() > 2 {
+                        return Err(LifecycleError::InvalidReview);
+                    }
+                }
                 match review.verdict {
                     LifecycleReviewVerdict::Approved => self.phase = LifecyclePhase::Verify,
                     LifecycleReviewVerdict::Rejected => self.finish_terminal(
@@ -404,6 +475,25 @@ impl DevelopmentLifecycle {
         Ok(())
     }
 
+    fn validate_explore_artifacts(
+        &self,
+        artifacts: &[LifecycleArtifactRef],
+    ) -> Result<(), LifecycleError> {
+        if artifacts.is_empty() || artifacts.len() > MAX_LIFECYCLE_ARTIFACT_REFS {
+            return Err(LifecycleError::MissingArtifact);
+        }
+        let mut ids = BTreeSet::new();
+        for artifact in artifacts {
+            if artifact.kind != LifecycleArtifactKind::Exploration
+                || artifact.source_snapshot != self.source_snapshot
+                || !ids.insert(artifact.id)
+            {
+                return Err(LifecycleError::InvalidArtifact);
+            }
+        }
+        Ok(())
+    }
+
     fn require_active_phase(&self, expected: LifecyclePhase) -> Result<(), LifecycleError> {
         if self.phase != expected || self.status != LifecycleStatus::Active {
             return Err(LifecycleError::InvalidTransition);
@@ -445,6 +535,19 @@ impl DevelopmentLifecycle {
         self.terminal_reason = reason;
     }
 
+    pub fn active_test_plans(&self) -> Result<Vec<&LifecycleTestPlanBinding>, LifecycleError> {
+        if !self.spec.test_plans.is_empty() {
+            if !self.resolved_test_plans.is_empty() {
+                return Err(LifecycleError::InvalidTestPlan);
+            }
+            return Ok(self.spec.test_plans.iter().collect());
+        }
+        if self.resolved_test_plans.is_empty() {
+            return Err(LifecycleError::InvalidTestPlan);
+        }
+        Ok(self.resolved_test_plans.iter().map(|plan| &plan.binding).collect())
+    }
+
     fn validate_artifact_chain(&self) -> Result<(), LifecycleError> {
         if self.exploration_artifacts.len() > MAX_LIFECYCLE_ARTIFACT_REFS
             || self.exploration_artifacts.iter().any(|artifact| {
@@ -454,6 +557,25 @@ impl DevelopmentLifecycle {
             || self.exploration_artifacts.windows(2).any(|pair| pair[0].id >= pair[1].id)
         {
             return Err(LifecycleError::InvalidArtifact);
+        }
+        if let Some(reuse) = &self.explore_reuse {
+            reuse.validate()?;
+            let Some(plan) = self.spec.explore_action_plan.as_ref() else {
+                return Err(LifecycleError::InvalidExploreReuse);
+            };
+            if self.exploration_artifacts.len() != 1
+                || self.exploration_artifacts[0].id != reuse.artifact.digest()
+                || reuse.source_snapshot != self.source_snapshot
+                || reuse.repository_id != plan.repository_id()
+                || plan.source_snapshot() != Some(reuse.source_snapshot)
+                || plan.actions.len() != 1
+                || plan.actions[0].semantic_id() != reuse.action_request
+            {
+                return Err(LifecycleError::InvalidExploreReuse);
+            }
+        }
+        if self.phase == LifecyclePhase::Explore && self.explore_reuse.is_some() {
+            return Err(LifecycleError::InvalidExploreReuse);
         }
         if let Some(patch) = &self.patch {
             let expected_revision = if self.repair_consumed { 2 } else { 1 };
@@ -468,11 +590,28 @@ impl DevelopmentLifecycle {
         {
             return Err(LifecycleError::InvalidState);
         }
+        if !self.resolved_test_plans.is_empty() {
+            if !self.spec.test_plans.is_empty()
+                || self.resolved_test_plans.len() > MAX_LIFECYCLE_TEST_PLANS
+            {
+                return Err(LifecycleError::InvalidTestPlan);
+            }
+            let mut prior = None;
+            for plan in &self.resolved_test_plans {
+                plan.validate()?;
+                let key = (plan.binding.plan_digest(), plan.artifact);
+                if prior.is_some_and(|value| value >= key) {
+                    return Err(LifecycleError::InvalidTestPlan);
+                }
+                prior = Some(key);
+            }
+        }
         if !self.test_results.is_empty() {
-            if self.test_results.len() != self.spec.test_plans.len() {
+            let plans = self.active_test_plans()?;
+            if self.test_results.len() != plans.len() {
                 return Err(LifecycleError::MissingTestEvidence);
             }
-            for (result, binding) in self.test_results.iter().zip(&self.spec.test_plans) {
+            for (result, binding) in self.test_results.iter().zip(plans) {
                 result.validate()?;
                 if result.plan_digest != binding.plan_digest()
                     || result.certificate_digest != binding.certificate_digest
@@ -483,8 +622,9 @@ impl DevelopmentLifecycle {
         }
         if let Some(review) = &self.review {
             let patch = self.patch.as_ref().ok_or(LifecycleError::MissingArtifact)?;
+            let plan_count = self.active_test_plans()?.len();
             if self.test_results.iter().any(|result| !result.passed)
-                || self.test_results.len() != self.spec.test_plans.len()
+                || self.test_results.len() != plan_count
                 || !review.is_canonical()
                 || review.change_id != self.change_id
                 || review.patch_id != patch.patch_id
@@ -568,7 +708,7 @@ impl DevelopmentLifecycle {
                     && self.verification.is_none()
             }
             (LifecyclePhase::Review, LifecycleStatus::Active) => {
-                self.test_results.len() == self.spec.test_plans.len()
+                self.active_test_plans().is_ok_and(|plans| self.test_results.len() == plans.len())
                     && self.test_results.iter().all(|result| result.passed)
                     && self.review.is_none()
                     && self.verification.is_none()
@@ -747,6 +887,12 @@ pub enum LifecycleError {
     InvalidArtifact,
     #[error("lifecycle test plan is invalid")]
     InvalidTestPlan,
+    #[error("lifecycle explore action plan is invalid")]
+    InvalidExploreActionPlan,
+    #[error("lifecycle action phase plan is invalid")]
+    InvalidActionPhasePlan,
+    #[error("lifecycle Explore reuse completion is invalid")]
+    InvalidExploreReuse,
     #[error("lifecycle test evidence is missing")]
     MissingTestEvidence,
     #[error("lifecycle test evidence is invalid")]

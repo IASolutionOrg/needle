@@ -10,6 +10,7 @@ pub(crate) const MAX_MCP_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_SUBJECT_BYTES: usize = 512;
 const MAX_TASK_BYTES: usize = 8 * 1024;
 const MAX_CAPABILITIES: usize = 3;
+const MAX_ACTION_RESOLUTIONS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -355,6 +356,7 @@ pub(crate) struct McpNeedContextResponse {
     pub satisfied: Vec<String>,
     pub missing: Vec<String>,
     pub resolution: McpResolution,
+    pub action_resolutions: Vec<McpActionResolution>,
     pub reuse_unit: String,
     pub claim_ids: Vec<String>,
     pub cache_hit: bool,
@@ -362,6 +364,37 @@ pub(crate) struct McpNeedContextResponse {
     pub calibration: bool,
     pub result_digest: String,
     pub context: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum McpActionResolutionAuthority {
+    Shadow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum McpActionResolutionKind {
+    Exact,
+    Coverage,
+    Composite,
+    Partial,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct McpActionResolution {
+    pub authority: McpActionResolutionAuthority,
+    pub request_id: String,
+    pub action_contract: String,
+    pub predicate: String,
+    pub kind: McpActionResolutionKind,
+    pub artifact_ids: Vec<String>,
+    pub validation_certificate_ids: Vec<String>,
+    pub selected_plan_id: String,
+    pub sufficiency_certificate_id: Option<String>,
+    pub covered_mask: u16,
+    pub missing_mask: u16,
+    pub definition_digest: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -532,6 +565,12 @@ pub(crate) fn output_schema() -> Value {
             "satisfied": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
             "missing": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
             "resolution": resolution_schema(),
+            "action_resolutions": {
+                "type": "array",
+                "maxItems": MAX_ACTION_RESOLUTIONS,
+                "uniqueItems": true,
+                "items": action_resolution_schema()
+            },
             "reuse_unit": {"type": "string", "enum": ["artifact", "claim", "mixed", "none"]},
             "claim_ids": {
                 "type": "array",
@@ -546,8 +585,53 @@ pub(crate) fn output_schema() -> Value {
         },
         "required": [
             "status", "route", "subject", "need_id", "step", "satisfied", "missing",
-            "resolution", "reuse_unit", "claim_ids", "cache_hit", "worker_spawned",
-            "calibration", "result_digest", "context"
+            "resolution", "action_resolutions", "reuse_unit", "claim_ids", "cache_hit",
+            "worker_spawned", "calibration", "result_digest", "context"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn action_resolution_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "authority": {"const": "shadow"},
+            "request_id": {"type": "string", "pattern": "^b3:[0-9a-f]{64}$"},
+            "action_contract": {"type": "string", "minLength": 1, "maxLength": 64},
+            "predicate": {"type": "string", "enum": [
+                "implementation-location", "runtime-flow", "focused-tests"
+            ]},
+            "kind": {"type": "string", "enum": [
+                "exact", "coverage", "composite", "partial"
+            ]},
+            "artifact_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^b3:[0-9a-f]{64}$"},
+                "minItems": 1,
+                "maxItems": 8,
+                "uniqueItems": true
+            },
+            "validation_certificate_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^b3:[0-9a-f]{64}$"},
+                "minItems": 1,
+                "maxItems": 8,
+                "uniqueItems": true
+            },
+            "selected_plan_id": {"type": "string", "pattern": "^b3:[0-9a-f]{64}$"},
+            "sufficiency_certificate_id": {
+                "type": ["string", "null"],
+                "pattern": "^b3:[0-9a-f]{64}$"
+            },
+            "covered_mask": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "missing_mask": {"type": "integer", "minimum": 0, "maximum": 65535},
+            "definition_digest": {"type": "string", "pattern": "^b3:[0-9a-f]{64}$"}
+        },
+        "required": [
+            "authority", "request_id", "action_contract", "predicate", "kind",
+            "artifact_ids", "validation_certificate_ids", "selected_plan_id",
+            "sufficiency_certificate_id", "covered_mask", "missing_mask", "definition_digest"
         ],
         "additionalProperties": false
     })
@@ -691,7 +775,19 @@ mod tests {
         assert_eq!(input["additionalProperties"], false);
         assert_eq!(input["properties"]["subject"]["additionalProperties"], false);
         assert_eq!(output["properties"]["reuse_unit"]["enum"][1], "claim");
+        assert_eq!(output["properties"]["action_resolutions"]["maxItems"], 3);
+        assert_eq!(
+            output["properties"]["action_resolutions"]["items"]["additionalProperties"],
+            false
+        );
         assert!(output["required"].as_array().unwrap().iter().any(|field| field == "claim_ids"));
+        assert!(
+            output["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "action_resolutions")
+        );
         assert!(output["properties"]["resolution"]["oneOf"].as_array().unwrap().iter().any(
             |variant| {
                 variant["properties"]["kind"]["const"] == "claim_hit"

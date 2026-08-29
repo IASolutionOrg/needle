@@ -1,14 +1,15 @@
 use crate::{ProofCandidate, built_in_presets, built_in_routes};
 use needle_core::{
-    ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, Artifact, ArtifactRequest,
-    ArtifactValidationCertificate, CacheLookup, CacheResolution, CapabilityClass, CapabilityMode,
-    CommandClassification, CommandExecutionEvidence, Digest, EvidenceFailurePolicy,
-    MainTurnOutcome, ModelPolicy, MultiNeedPolicy, Need, NeedCacheEntry, NeedCacheIdentity,
-    NeedFragment, NeedIr, NeedStep, NeedStepRelation, NeedStepState, Preset,
-    ReuseSufficiencyCertificate, RoleProfileId, RoleProfileProvenance, RoleProfileRevision, Route,
-    SelectedPlan, SemanticInterrupt, TestPlan, WorkerConfig, WorkerFailure, WorkerOutcome,
-    WorkerProfile, built_in_capability_classes, built_in_claim_capability_classes,
-    built_in_predicate_contracts, built_in_route_contracts, built_in_route_plans,
+    ActionRequest, ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, Artifact,
+    ArtifactRequest, ArtifactRequestId, ArtifactValidationCertificate, CacheLookup,
+    CacheResolution, CapabilityClass, CapabilityMode, CommandClassification,
+    CommandExecutionEvidence, Digest, EvidenceFailurePolicy, MainTurnOutcome, ModelPolicy,
+    MultiNeedPolicy, Need, NeedCacheEntry, NeedCacheIdentity, NeedFragment, NeedIr, NeedStep,
+    NeedStepRelation, NeedStepState, Preset, ReuseDescriptor, ReuseSufficiencyCertificate,
+    RoleProfileId, RoleProfileProvenance, RoleProfileRevision, Route, SelectedPlan,
+    SemanticInterrupt, TestPlan, WorkerConfig, WorkerFailure, WorkerOutcome, WorkerProfile,
+    built_in_capability_classes, built_in_claim_capability_classes, built_in_predicate_contracts,
+    built_in_route_contracts, built_in_route_plans,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -21,22 +22,86 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+#[path = "store/action_assurance.rs"]
+mod action_assurance;
+#[path = "store/action_execution_operations.rs"]
+mod action_execution_operations;
+#[path = "store/action_safety.rs"]
+mod action_safety;
 #[path = "store/activation.rs"]
 mod activation;
 #[path = "store/changes.rs"]
 mod changes;
 #[path = "store/claims.rs"]
 mod claims;
+#[path = "store/definition_generations.rs"]
+mod definition_generations;
+#[path = "store/generations.rs"]
+mod generations;
+#[path = "store/lifecycle_action_observations.rs"]
+mod lifecycle_action_observations;
+#[path = "store/lifecycle_adapter_invocations.rs"]
+mod lifecycle_adapter_invocations;
+#[path = "store/lifecycle_execution_operations.rs"]
+mod lifecycle_execution_operations;
 #[path = "store/lifecycles.rs"]
 mod lifecycles;
+#[path = "store/opaque_action_artifacts.rs"]
+mod opaque_action_artifacts;
+#[path = "store/partition_manifests.rs"]
+mod partition_manifest_store;
+#[path = "store/partitioned_artifacts.rs"]
+mod partitioned_artifacts;
+#[path = "store/partitioned_heads.rs"]
+mod partitioned_heads;
+#[path = "store/refresh_economics.rs"]
+mod refresh_economics;
+#[path = "store/refreshes.rs"]
+mod refreshes;
 #[path = "store/role_profiles.rs"]
 mod role_profiles;
+#[path = "store/validity.rs"]
+mod validity;
 
+pub use action_assurance::{
+    ActionAssuranceEvidenceRecord, ActionAssurancePreflight, ActionCapabilityDecisionRecord,
+    ProviderBackedActionAssuranceInput,
+};
+pub(crate) use action_execution_operations::ActionExecutionOperationClaim;
+pub use action_safety::ActionSafetyMetrics;
 pub use activation::{ActivationRecord, ActivationScope, ActivationStatus};
 pub use changes::{
     ChangeAttemptRecord, LifecycleChangeContext, PatchFileBlob, PreparedChangeRecord,
 };
-pub use lifecycles::{LifecycleProjection, LifecycleSummaryRecord, MAX_LIFECYCLE_LIST_LIMIT};
+pub use lifecycle_action_observations::{
+    LifecycleExploreShadowObservationRecord, MAX_LIFECYCLE_EXPLORE_OBSERVATION_LIST_LIMIT,
+};
+pub use lifecycle_adapter_invocations::{
+    LifecycleAdapterInvocationClaim, LifecycleAdapterInvocationRecord,
+    LifecycleAdapterInvocationState, LifecycleAdapterRecoveryRecord,
+    LifecycleAdapterRecoveryResult, LifecycleAdapterRecoverySource,
+};
+pub(crate) use lifecycles::LifecycleExploreReuseCommit;
+pub use lifecycles::{
+    LifecycleProjection, LifecycleStartCreation, LifecycleStartTestPlanCandidate,
+    LifecycleSummaryRecord, MAX_LIFECYCLE_LIST_LIMIT, MAX_LIFECYCLE_START_TEST_PLAN_CANDIDATES,
+};
+pub use partition_manifest_store::{
+    MAX_PARTITION_MANIFEST_LIST_LIMIT, PartitionManifestSummaryRecord,
+};
+pub use partitioned_artifacts::{
+    ShadowEconomicallyAssessedPartitionedActionArtifactPublication,
+    ShadowEconomicallySelectedRefreshedActionArtifactPublication,
+    ShadowRefreshedActionArtifactPublication,
+};
+pub use partitioned_heads::{
+    MAX_PARTITION_SOURCE_VALIDATION_WIRE_BYTES, PARTITIONED_ACTION_HEAD_FORMAT_REVISION,
+    PartitionedActionHeadKey, PartitionedActionHeadRecord, ShadowPartitionedActionHeadAdvance,
+    ShadowPartitionedActionHeadBase,
+};
+pub use refresh_economics::{
+    MAX_REFRESH_ECONOMIC_ASSESSMENT_LIST_LIMIT, RefreshEconomicAssessmentRecord,
+};
 pub use role_profiles::{
     RoleProfileAuditOperation, RoleProfileAuditRecord, RoleProfileStateRecord,
 };
@@ -51,6 +116,29 @@ pub struct NeedShadowWrite<'a> {
     pub need: &'a Need,
     pub fragments: &'a [NeedFragment],
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ActionRequestMatch {
+    pub matched_request: ArtifactRequestId,
+    pub origin_request: ArtifactRequestId,
+}
+
+struct SemanticRequestStorage<'a> {
+    artifact_request: &'a ArtifactRequest,
+    action_request: Option<&'a ActionRequest>,
+    request_id: Digest,
+    logical_id: Digest,
+    request_json: String,
+    format_revision: u16,
+    demand_id: String,
+    semantic_policy_digest: Option<Digest>,
+    dependency_context_digest: Option<Digest>,
+    origin_need_id: String,
+}
+
+const ACTION_REQUEST_STORAGE_FORMAT_REVISION: u16 = 3;
+const MAX_ACTION_ORIGIN_ROWS: usize = 64;
+const MAX_STORED_ACTION_REQUEST_JSON_BYTES: usize = 64 * 1024;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1019,6 +1107,972 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V18: &str = r#"
+CREATE TABLE action_request_observations (
+    action_request_id TEXT NOT NULL REFERENCES artifact_requests(request_id),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    source_digest TEXT NOT NULL CHECK(length(source_digest) = 67),
+    route_key TEXT NOT NULL,
+    need_id TEXT NOT NULL,
+    observed_unix_ms INTEGER NOT NULL CHECK(observed_unix_ms >= 0),
+    PRIMARY KEY(action_request_id, artifact_id, source_digest, route_key)
+);
+CREATE INDEX action_request_observations_source
+    ON action_request_observations(artifact_id, source_digest);
+CREATE TABLE action_request_identity_mappings (
+    action_request_id TEXT NOT NULL REFERENCES artifact_requests(request_id),
+    legacy_request_id TEXT NOT NULL REFERENCES artifact_requests(request_id),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    validation_certificate_id TEXT NOT NULL
+        REFERENCES artifact_validation_certificates(certificate_id),
+    action_semantic_definition_digest TEXT NOT NULL
+        CHECK(length(action_semantic_definition_digest) = 67),
+    mapped_unix_ms INTEGER NOT NULL CHECK(mapped_unix_ms >= 0),
+    PRIMARY KEY(action_request_id, artifact_id)
+);
+CREATE INDEX action_request_identity_legacy
+    ON action_request_identity_mappings(legacy_request_id, artifact_id);
+"#;
+
+const MIGRATION_V19: &str = r#"
+CREATE TABLE repository_generations (
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    source_context_digest TEXT NOT NULL CHECK(length(source_context_digest) = 67),
+    source_version_digest TEXT CHECK(
+        source_version_digest IS NULL OR length(source_version_digest) = 67
+    ),
+    reconciled INTEGER NOT NULL CHECK(reconciled IN (0, 1)),
+    generation_digest TEXT NOT NULL CHECK(length(generation_digest) = 67),
+    generation_json TEXT NOT NULL CHECK(length(generation_json) <= 16384),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    PRIMARY KEY(repository_lineage, repository_context_id, generation),
+    UNIQUE(repository_lineage, repository_context_id, generation_digest)
+);
+CREATE TABLE repository_generation_heads (
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    updated_unix_ms INTEGER NOT NULL CHECK(updated_unix_ms >= 0),
+    PRIMARY KEY(repository_lineage, repository_context_id),
+    FOREIGN KEY(repository_lineage, repository_context_id, generation)
+        REFERENCES repository_generations(repository_lineage, repository_context_id, generation)
+);
+CREATE TABLE repository_state_deltas (
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    from_generation INTEGER NOT NULL CHECK(from_generation >= 0),
+    to_generation INTEGER NOT NULL CHECK(to_generation = from_generation + 1),
+    complete INTEGER NOT NULL CHECK(complete IN (0, 1)),
+    delta_digest TEXT NOT NULL CHECK(length(delta_digest) = 67),
+    delta_json TEXT NOT NULL CHECK(length(delta_json) <= 2097152),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    PRIMARY KEY(repository_lineage, repository_context_id, to_generation),
+    UNIQUE(repository_lineage, repository_context_id, delta_digest),
+    FOREIGN KEY(repository_lineage, repository_context_id, from_generation)
+        REFERENCES repository_generations(repository_lineage, repository_context_id, generation),
+    FOREIGN KEY(repository_lineage, repository_context_id, to_generation)
+        REFERENCES repository_generations(repository_lineage, repository_context_id, generation)
+);
+CREATE INDEX repository_state_deltas_from_generation
+    ON repository_state_deltas(repository_lineage, repository_context_id, from_generation);
+CREATE TRIGGER repository_generations_no_update
+BEFORE UPDATE ON repository_generations
+BEGIN
+    SELECT RAISE(ABORT, 'repository generations are immutable');
+END;
+CREATE TRIGGER repository_generations_no_delete
+BEFORE DELETE ON repository_generations
+BEGIN
+    SELECT RAISE(ABORT, 'repository generations are immutable');
+END;
+CREATE TRIGGER repository_state_deltas_no_update
+BEFORE UPDATE ON repository_state_deltas
+BEGIN
+    SELECT RAISE(ABORT, 'repository state deltas are immutable');
+END;
+CREATE TRIGGER repository_state_deltas_no_delete
+BEFORE DELETE ON repository_state_deltas
+BEGIN
+    SELECT RAISE(ABORT, 'repository state deltas are immutable');
+END;
+CREATE TRIGGER repository_generation_heads_adjacent_update
+BEFORE UPDATE ON repository_generation_heads
+WHEN NEW.repository_lineage != OLD.repository_lineage
+    OR NEW.repository_context_id != OLD.repository_context_id
+    OR NEW.generation != OLD.generation + 1
+BEGIN
+    SELECT RAISE(ABORT, 'repository generation heads advance by one');
+END;
+CREATE TRIGGER repository_generation_heads_no_delete
+BEFORE DELETE ON repository_generation_heads
+BEGIN
+    SELECT RAISE(ABORT, 'repository generation heads are durable');
+END;
+"#;
+
+const MIGRATION_V20: &str = r#"
+CREATE TABLE repository_observations (
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    format_revision INTEGER NOT NULL CHECK(format_revision > 0),
+    source_context_digest TEXT NOT NULL CHECK(length(source_context_digest) = 67),
+    observer_definition_digest TEXT NOT NULL CHECK(length(observer_definition_digest) = 67),
+    source_version TEXT NOT NULL CHECK(
+        length(source_version) > 0 AND length(source_version) <= 256
+    ),
+    locators_complete INTEGER NOT NULL CHECK(locators_complete IN (0, 1)),
+    observation_digest TEXT NOT NULL CHECK(length(observation_digest) = 67),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    PRIMARY KEY(repository_lineage, repository_context_id, generation),
+    UNIQUE(repository_lineage, repository_context_id, observation_digest),
+    FOREIGN KEY(repository_lineage, repository_context_id, generation)
+        REFERENCES repository_generations(repository_lineage, repository_context_id, generation)
+);
+CREATE TABLE repository_observation_locators (
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    locator_kind INTEGER NOT NULL CHECK(locator_kind IN (0, 1)),
+    scheme_definition_digest TEXT NOT NULL CHECK(length(scheme_definition_digest) = 67),
+    locator_digest TEXT NOT NULL CHECK(length(locator_digest) = 67),
+    PRIMARY KEY(
+        repository_lineage, repository_context_id, generation,
+        locator_kind, scheme_definition_digest, locator_digest
+    ),
+    FOREIGN KEY(repository_lineage, repository_context_id, generation)
+        REFERENCES repository_observations(repository_lineage, repository_context_id, generation)
+);
+CREATE TRIGGER repository_observations_no_update
+BEFORE UPDATE ON repository_observations
+BEGIN
+    SELECT RAISE(ABORT, 'repository observations are immutable');
+END;
+CREATE TRIGGER repository_observations_no_delete
+BEFORE DELETE ON repository_observations
+BEGIN
+    SELECT RAISE(ABORT, 'repository observations are immutable');
+END;
+CREATE TRIGGER repository_observation_locators_no_update
+BEFORE UPDATE ON repository_observation_locators
+BEGIN
+    SELECT RAISE(ABORT, 'repository observation locators are immutable');
+END;
+CREATE TRIGGER repository_observation_locators_no_delete
+BEFORE DELETE ON repository_observation_locators
+BEGIN
+    SELECT RAISE(ABORT, 'repository observation locators are immutable');
+END;
+"#;
+
+const MIGRATION_V21: &str = r#"
+CREATE TABLE definition_set_generations (
+    generation INTEGER NOT NULL PRIMARY KEY CHECK(generation >= 0),
+    semantic_set_digest TEXT NOT NULL CHECK(length(semantic_set_digest) = 67),
+    validation_set_digest TEXT NOT NULL CHECK(length(validation_set_digest) = 67),
+    operational_set_digest TEXT NOT NULL CHECK(length(operational_set_digest) = 67),
+    audit_digest TEXT NOT NULL CHECK(length(audit_digest) = 67),
+    generation_digest TEXT NOT NULL CHECK(length(generation_digest) = 67),
+    generation_json TEXT NOT NULL CHECK(length(generation_json) <= 163840),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    UNIQUE(generation_digest)
+);
+CREATE INDEX definition_set_generations_audit
+    ON definition_set_generations(audit_digest);
+CREATE TABLE definition_set_head (
+    singleton INTEGER NOT NULL PRIMARY KEY CHECK(singleton = 1),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    updated_unix_ms INTEGER NOT NULL CHECK(updated_unix_ms >= 0),
+    FOREIGN KEY(generation) REFERENCES definition_set_generations(generation)
+);
+CREATE TRIGGER definition_set_generations_no_update
+BEFORE UPDATE ON definition_set_generations
+BEGIN
+    SELECT RAISE(ABORT, 'definition-set generations are immutable');
+END;
+CREATE TRIGGER definition_set_generations_no_delete
+BEFORE DELETE ON definition_set_generations
+BEGIN
+    SELECT RAISE(ABORT, 'definition-set generations are immutable');
+END;
+CREATE TRIGGER definition_set_head_adjacent_update
+BEFORE UPDATE ON definition_set_head
+WHEN NEW.singleton != OLD.singleton OR NEW.generation != OLD.generation + 1
+BEGIN
+    SELECT RAISE(ABORT, 'definition-set head advances by one');
+END;
+CREATE TRIGGER definition_set_head_no_delete
+BEFORE DELETE ON definition_set_head
+BEGIN
+    SELECT RAISE(ABORT, 'definition-set head is durable');
+END;
+"#;
+
+const MIGRATION_V22: &str = r#"
+CREATE TABLE artifact_dependency_stamps (
+    stamp_id TEXT NOT NULL PRIMARY KEY CHECK(length(stamp_id) = 67),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    certificate_id TEXT NOT NULL REFERENCES artifact_validation_certificates(certificate_id),
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
+    repository_generation_digest TEXT NOT NULL CHECK(length(repository_generation_digest) = 67),
+    dependency_manifest_digest TEXT NOT NULL
+        REFERENCES dependency_manifests(manifest_digest),
+    dependency_locator_set_digest TEXT NOT NULL CHECK(length(dependency_locator_set_digest) = 67),
+    intersection_definition_digest TEXT NOT NULL CHECK(length(intersection_definition_digest) = 67),
+    definition_generation INTEGER NOT NULL CHECK(definition_generation >= 0)
+        REFERENCES definition_set_generations(generation),
+    definition_generation_digest TEXT NOT NULL CHECK(length(definition_generation_digest) = 67),
+    semantic_definition_set_digest TEXT NOT NULL CHECK(length(semantic_definition_set_digest) = 67),
+    validation_definition_set_digest TEXT NOT NULL CHECK(length(validation_definition_set_digest) = 67),
+    operational_definition_set_digest TEXT NOT NULL CHECK(length(operational_definition_set_digest) = 67),
+    semantic_world_digest TEXT NOT NULL REFERENCES semantic_worlds(world_digest),
+    stamp_json TEXT NOT NULL CHECK(length(stamp_json) <= 16384),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    UNIQUE(certificate_id, repository_context_id),
+    FOREIGN KEY(repository_lineage, repository_context_id, repository_generation)
+        REFERENCES repository_generations(repository_lineage, repository_context_id, generation)
+);
+CREATE INDEX artifact_dependency_stamps_artifact
+    ON artifact_dependency_stamps(artifact_id, repository_context_id);
+CREATE TABLE operational_validity_memos (
+    memo_id TEXT NOT NULL PRIMARY KEY CHECK(length(memo_id) = 67),
+    dependency_stamp_id TEXT NOT NULL REFERENCES artifact_dependency_stamps(stamp_id),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    certificate_id TEXT NOT NULL REFERENCES artifact_validation_certificates(certificate_id),
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
+    validated_through_generation INTEGER NOT NULL CHECK(validated_through_generation >= source_generation),
+    validated_through_generation_digest TEXT NOT NULL
+        CHECK(length(validated_through_generation_digest) = 67),
+    definition_generation INTEGER NOT NULL CHECK(definition_generation >= 0)
+        REFERENCES definition_set_generations(generation),
+    definition_generation_digest TEXT NOT NULL CHECK(length(definition_generation_digest) = 67),
+    semantic_definition_set_digest TEXT NOT NULL CHECK(length(semantic_definition_set_digest) = 67),
+    validation_definition_set_digest TEXT NOT NULL CHECK(length(validation_definition_set_digest) = 67),
+    operational_definition_set_digest TEXT NOT NULL CHECK(length(operational_definition_set_digest) = 67),
+    input_artifact_state_digest TEXT NOT NULL CHECK(length(input_artifact_state_digest) = 67),
+    external_version_state_digest TEXT NOT NULL CHECK(length(external_version_state_digest) = 67),
+    delta_chain_digest TEXT NOT NULL CHECK(length(delta_chain_digest) = 67),
+    intersection_definition_digest TEXT NOT NULL CHECK(length(intersection_definition_digest) = 67),
+    outcome TEXT NOT NULL CHECK(outcome IN ('current', 'unaffected_by_delta')),
+    memo_json TEXT NOT NULL CHECK(length(memo_json) <= 24576),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    UNIQUE(
+        dependency_stamp_id,
+        validated_through_generation_digest,
+        definition_generation_digest,
+        input_artifact_state_digest,
+        external_version_state_digest,
+        intersection_definition_digest
+    ),
+    FOREIGN KEY(repository_lineage, repository_context_id, validated_through_generation)
+        REFERENCES repository_generations(repository_lineage, repository_context_id, generation)
+);
+CREATE INDEX operational_validity_memos_lookup
+    ON operational_validity_memos(
+        dependency_stamp_id,
+        validated_through_generation_digest,
+        definition_generation_digest
+    );
+CREATE TRIGGER artifact_dependency_stamps_no_update
+BEFORE UPDATE ON artifact_dependency_stamps
+BEGIN
+    SELECT RAISE(ABORT, 'artifact dependency stamps are immutable');
+END;
+CREATE TRIGGER artifact_dependency_stamps_no_delete
+BEFORE DELETE ON artifact_dependency_stamps
+BEGIN
+    SELECT RAISE(ABORT, 'artifact dependency stamps are immutable');
+END;
+CREATE TRIGGER operational_validity_memos_no_update
+BEFORE UPDATE ON operational_validity_memos
+BEGIN
+    SELECT RAISE(ABORT, 'operational validity memos are immutable');
+END;
+CREATE TRIGGER operational_validity_memos_no_delete
+BEFORE DELETE ON operational_validity_memos
+BEGIN
+    SELECT RAISE(ABORT, 'operational validity memos are immutable');
+END;
+"#;
+
+const MIGRATION_V23: &str = r#"
+CREATE TABLE partition_manifests (
+    manifest_id TEXT NOT NULL PRIMARY KEY CHECK(length(manifest_id) = 67),
+    scheme_id TEXT NOT NULL CHECK(length(scheme_id) BETWEEN 1 AND 128),
+    action_request_id TEXT NOT NULL CHECK(length(action_request_id) = 67),
+    action_contract_id TEXT NOT NULL CHECK(length(action_contract_id) BETWEEN 1 AND 128),
+    output_contract_id TEXT NOT NULL CHECK(length(output_contract_id) BETWEEN 1 AND 128),
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    semantic_world_digest TEXT NOT NULL CHECK(length(semantic_world_digest) = 67),
+    definition_set_digest TEXT NOT NULL CHECK(length(definition_set_digest) = 67),
+    closure TEXT NOT NULL CHECK(closure IN ('open', 'closed')),
+    entry_count INTEGER NOT NULL CHECK(entry_count >= 0 AND entry_count <= 4096),
+    definition_digest TEXT NOT NULL CHECK(length(definition_digest) = 67),
+    manifest_json TEXT NOT NULL CHECK(length(CAST(manifest_json AS BLOB)) <= 4194304),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0)
+);
+CREATE INDEX partition_manifests_request ON partition_manifests(action_request_id, scheme_id);
+CREATE INDEX partition_manifests_action ON partition_manifests(action_contract_id, created_unix_ms);
+CREATE INDEX partition_manifests_repository
+    ON partition_manifests(repository_lineage, created_unix_ms);
+
+CREATE TABLE partition_manifest_entries (
+    manifest_id TEXT NOT NULL REFERENCES partition_manifests(manifest_id),
+    key_digest TEXT NOT NULL CHECK(length(key_digest) = 67),
+    role TEXT NOT NULL CHECK(role IN ('component', 'aggregate')),
+    payload_digest TEXT NOT NULL CHECK(length(payload_digest) = 67),
+    dependency_digest TEXT NOT NULL CHECK(length(dependency_digest) = 67),
+    PRIMARY KEY(manifest_id, key_digest)
+);
+
+CREATE TABLE partition_manifest_certificates (
+    certificate_id TEXT NOT NULL PRIMARY KEY CHECK(length(certificate_id) = 67),
+    manifest_id TEXT NOT NULL UNIQUE REFERENCES partition_manifests(manifest_id),
+    policy_id TEXT NOT NULL CHECK(length(policy_id) BETWEEN 1 AND 128),
+    scheme_definition_digest TEXT NOT NULL CHECK(length(scheme_definition_digest) = 67),
+    policy_definition_digest TEXT NOT NULL CHECK(length(policy_definition_digest) = 67),
+    declared_policy_authority_digest TEXT NOT NULL
+        CHECK(length(declared_policy_authority_digest) = 67),
+    validator_id TEXT NOT NULL CHECK(length(validator_id) BETWEEN 1 AND 128),
+    validator_definition_digest TEXT NOT NULL CHECK(length(validator_definition_digest) = 67),
+    adapter_definition_digest TEXT NOT NULL CHECK(length(adapter_definition_digest) = 67),
+    source_payload_digest TEXT NOT NULL CHECK(length(source_payload_digest) = 67),
+    source_validation_certificate_digest TEXT NOT NULL
+        CHECK(length(source_validation_certificate_digest) = 67),
+    definition_digest TEXT NOT NULL CHECK(length(definition_digest) = 67),
+    issued_mode TEXT NOT NULL CHECK(issued_mode = 'shadow'),
+    certificate_json TEXT NOT NULL
+        CHECK(length(CAST(certificate_json AS BLOB)) <= 32768),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0)
+);
+
+CREATE TABLE manifest_transitions (
+    transition_id TEXT NOT NULL PRIMARY KEY CHECK(length(transition_id) = 67),
+    prior_manifest_id TEXT NOT NULL REFERENCES partition_manifests(manifest_id),
+    current_manifest_id TEXT NOT NULL REFERENCES partition_manifests(manifest_id),
+    state_delta TEXT NOT NULL CHECK(length(state_delta) = 67),
+    validator_id TEXT NOT NULL CHECK(length(validator_id) BETWEEN 1 AND 128),
+    definition_digest TEXT NOT NULL CHECK(length(definition_digest) = 67),
+    transition_json TEXT NOT NULL CHECK(length(CAST(transition_json AS BLOB)) <= 4194304),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    CHECK(prior_manifest_id <> current_manifest_id)
+);
+CREATE INDEX manifest_transitions_pair
+    ON manifest_transitions(prior_manifest_id, current_manifest_id);
+
+CREATE TABLE manifest_transition_mappings (
+    transition_id TEXT NOT NULL REFERENCES manifest_transitions(transition_id),
+    prior_manifest_id TEXT NOT NULL,
+    prior_key_digest TEXT NOT NULL CHECK(length(prior_key_digest) = 67),
+    current_manifest_id TEXT NOT NULL,
+    current_key_digest TEXT NOT NULL CHECK(length(current_key_digest) = 67),
+    PRIMARY KEY(transition_id, prior_manifest_id, prior_key_digest),
+    UNIQUE(transition_id, current_manifest_id, current_key_digest),
+    FOREIGN KEY(prior_manifest_id, prior_key_digest)
+        REFERENCES partition_manifest_entries(manifest_id, key_digest),
+    FOREIGN KEY(current_manifest_id, current_key_digest)
+        REFERENCES partition_manifest_entries(manifest_id, key_digest)
+);
+
+CREATE TRIGGER partition_manifests_no_update BEFORE UPDATE ON partition_manifests
+BEGIN SELECT RAISE(ABORT, 'partition manifests are immutable'); END;
+CREATE TRIGGER partition_manifests_no_delete BEFORE DELETE ON partition_manifests
+BEGIN SELECT RAISE(ABORT, 'partition manifests are immutable'); END;
+CREATE TRIGGER partition_manifest_entries_no_update BEFORE UPDATE ON partition_manifest_entries
+BEGIN SELECT RAISE(ABORT, 'partition manifest entries are immutable'); END;
+CREATE TRIGGER partition_manifest_entries_no_delete BEFORE DELETE ON partition_manifest_entries
+BEGIN SELECT RAISE(ABORT, 'partition manifest entries are immutable'); END;
+CREATE TRIGGER partition_manifest_certificates_no_update
+BEFORE UPDATE ON partition_manifest_certificates
+BEGIN SELECT RAISE(ABORT, 'partition manifest certificates are immutable'); END;
+CREATE TRIGGER partition_manifest_certificates_no_delete
+BEFORE DELETE ON partition_manifest_certificates
+BEGIN SELECT RAISE(ABORT, 'partition manifest certificates are immutable'); END;
+CREATE TRIGGER manifest_transitions_no_update BEFORE UPDATE ON manifest_transitions
+BEGIN SELECT RAISE(ABORT, 'manifest transitions are immutable'); END;
+CREATE TRIGGER manifest_transitions_no_delete BEFORE DELETE ON manifest_transitions
+BEGIN SELECT RAISE(ABORT, 'manifest transitions are immutable'); END;
+CREATE TRIGGER manifest_transition_mappings_no_update
+BEFORE UPDATE ON manifest_transition_mappings
+BEGIN SELECT RAISE(ABORT, 'manifest transition mappings are immutable'); END;
+CREATE TRIGGER manifest_transition_mappings_no_delete
+BEFORE DELETE ON manifest_transition_mappings
+BEGIN SELECT RAISE(ABORT, 'manifest transition mappings are immutable'); END;
+"#;
+
+const MIGRATION_V24: &str = r#"
+CREATE TABLE refresh_attempts (
+    attempt_id TEXT NOT NULL PRIMARY KEY CHECK(length(attempt_id) = 67),
+    request_id TEXT NOT NULL CHECK(length(request_id) = 67),
+    action_contract_id TEXT NOT NULL CHECK(length(action_contract_id) BETWEEN 1 AND 128),
+    prior_artifact_id TEXT NOT NULL CHECK(length(prior_artifact_id) = 67),
+    state_delta TEXT NOT NULL CHECK(length(state_delta) = 67),
+    prior_manifest_id TEXT NOT NULL REFERENCES partition_manifests(manifest_id),
+    current_manifest_id TEXT NOT NULL REFERENCES partition_manifests(manifest_id),
+    transition_id TEXT NOT NULL REFERENCES manifest_transitions(transition_id),
+    refresh_policy_definition_digest TEXT NOT NULL
+        CHECK(length(refresh_policy_definition_digest) = 67),
+    operator_definition_digest TEXT NOT NULL CHECK(length(operator_definition_digest) = 67),
+    execution_scope_digest TEXT NOT NULL CHECK(length(execution_scope_digest) = 67),
+    retained_partition_count INTEGER NOT NULL CHECK(retained_partition_count BETWEEN 1 AND 4096),
+    refreshed_partition_count INTEGER NOT NULL CHECK(refreshed_partition_count BETWEEN 0 AND 4096),
+    added_partition_count INTEGER NOT NULL CHECK(added_partition_count BETWEEN 0 AND 4096),
+    removed_partition_count INTEGER NOT NULL CHECK(removed_partition_count BETWEEN 0 AND 4096),
+    execution_attempt_count INTEGER NOT NULL CHECK(execution_attempt_count BETWEEN 0 AND 16),
+    outcome TEXT NOT NULL CHECK(outcome IN ('succeeded', 'failed')),
+    failure_class TEXT CHECK(failure_class IS NULL OR failure_class IN (
+        'acquisition', 'operator', 'reconstruction', 'validation', 'timeout',
+        'budget_exceeded', 'runtime_unavailable', 'storage'
+    )),
+    started_unix_ms INTEGER NOT NULL CHECK(started_unix_ms >= 0),
+    completed_unix_ms INTEGER NOT NULL CHECK(completed_unix_ms >= started_unix_ms),
+    cost_microusd INTEGER CHECK(cost_microusd IS NULL OR cost_microusd >= 0),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    attempt_json TEXT NOT NULL CHECK(length(CAST(attempt_json AS BLOB)) <= 4194304),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    CHECK(prior_manifest_id <> current_manifest_id),
+    CHECK(
+        (outcome = 'succeeded' AND failure_class IS NULL)
+        OR (outcome = 'failed' AND failure_class IS NOT NULL)
+    )
+);
+CREATE INDEX refresh_attempts_request
+    ON refresh_attempts(request_id, action_contract_id, created_unix_ms DESC);
+CREATE INDEX refresh_attempts_refresh_key
+    ON refresh_attempts(
+        prior_artifact_id, current_manifest_id, transition_id, state_delta,
+        refresh_policy_definition_digest, created_unix_ms DESC
+    );
+
+CREATE TABLE failed_refresh_memos (
+    memo_id TEXT NOT NULL PRIMARY KEY CHECK(length(memo_id) = 67),
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES refresh_attempts(attempt_id),
+    request_id TEXT NOT NULL CHECK(length(request_id) = 67),
+    action_contract_id TEXT NOT NULL CHECK(length(action_contract_id) BETWEEN 1 AND 128),
+    prior_artifact_id TEXT NOT NULL CHECK(length(prior_artifact_id) = 67),
+    state_delta TEXT NOT NULL CHECK(length(state_delta) = 67),
+    refresh_policy_definition_digest TEXT NOT NULL
+        CHECK(length(refresh_policy_definition_digest) = 67),
+    operator_definition_digest TEXT NOT NULL CHECK(length(operator_definition_digest) = 67),
+    execution_scope_digest TEXT NOT NULL CHECK(length(execution_scope_digest) = 67),
+    failure_class TEXT NOT NULL CHECK(failure_class IN (
+        'acquisition', 'operator', 'reconstruction', 'validation', 'timeout',
+        'budget_exceeded', 'runtime_unavailable', 'storage'
+    )),
+    failure_evidence_digest TEXT NOT NULL CHECK(length(failure_evidence_digest) = 67),
+    expires_unix_ms INTEGER CHECK(expires_unix_ms IS NULL OR expires_unix_ms >= 0),
+    memo_json TEXT NOT NULL CHECK(length(CAST(memo_json AS BLOB)) <= 16384),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0)
+);
+CREATE INDEX failed_refresh_memos_lookup
+    ON failed_refresh_memos(
+        request_id, action_contract_id, prior_artifact_id, state_delta,
+        refresh_policy_definition_digest, operator_definition_digest,
+        execution_scope_digest, expires_unix_ms
+    );
+
+CREATE TRIGGER refresh_attempts_no_update BEFORE UPDATE ON refresh_attempts
+BEGIN SELECT RAISE(ABORT, 'refresh attempts are immutable'); END;
+CREATE TRIGGER refresh_attempts_no_delete BEFORE DELETE ON refresh_attempts
+BEGIN SELECT RAISE(ABORT, 'refresh attempts are immutable'); END;
+CREATE TRIGGER failed_refresh_memos_no_update BEFORE UPDATE ON failed_refresh_memos
+BEGIN SELECT RAISE(ABORT, 'failed refresh memos are immutable'); END;
+CREATE TRIGGER failed_refresh_memos_no_delete BEFORE DELETE ON failed_refresh_memos
+BEGIN SELECT RAISE(ABORT, 'failed refresh memos are immutable'); END;
+"#;
+
+const MIGRATION_V25: &str = r#"
+CREATE TABLE action_artifact_validation_certificates (
+    certificate_id TEXT NOT NULL PRIMARY KEY CHECK(length(certificate_id) = 67),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    action_contract_id TEXT NOT NULL CHECK(length(action_contract_id) BETWEEN 1 AND 128),
+    action_semantic_definition_digest TEXT NOT NULL CHECK(length(action_semantic_definition_digest) = 67),
+    action_validation_definition_digest TEXT NOT NULL CHECK(length(action_validation_definition_digest) = 67),
+    output_contract_definition_digest TEXT NOT NULL CHECK(length(output_contract_definition_digest) = 67),
+    partition_manifest_id TEXT NOT NULL REFERENCES partition_manifests(manifest_id),
+    source_payload_digest TEXT NOT NULL CHECK(length(source_payload_digest) = 67),
+    source_validation_certificate_digest TEXT NOT NULL CHECK(length(source_validation_certificate_digest) = 67),
+    dependency_manifest_digest TEXT NOT NULL REFERENCES dependency_manifests(manifest_digest),
+    semantic_world_digest TEXT NOT NULL REFERENCES semantic_worlds(world_digest),
+    validator_definition_digest TEXT NOT NULL CHECK(length(validator_definition_digest) = 67),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    certificate_json TEXT NOT NULL CHECK(length(CAST(certificate_json AS BLOB)) <= 65536),
+    issued_unix_ms INTEGER NOT NULL CHECK(issued_unix_ms >= 0)
+);
+CREATE INDEX action_artifact_validation_artifact
+    ON action_artifact_validation_certificates(artifact_id, issued_unix_ms DESC);
+
+CREATE TABLE reuse_descriptors (
+    descriptor_digest TEXT NOT NULL PRIMARY KEY CHECK(length(descriptor_digest) = 67),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    exact_request_id TEXT NOT NULL REFERENCES artifact_requests(request_id),
+    origin_request_id TEXT NOT NULL REFERENCES artifact_requests(request_id),
+    action_contract_id TEXT NOT NULL CHECK(length(action_contract_id) BETWEEN 1 AND 128),
+    validation_certificate_id TEXT NOT NULL CHECK(length(validation_certificate_id) = 67),
+    semantic_certificate_id TEXT REFERENCES artifact_validation_certificates(certificate_id),
+    action_certificate_id TEXT REFERENCES action_artifact_validation_certificates(certificate_id),
+    partition_manifest_id TEXT REFERENCES partition_manifests(manifest_id),
+    dependency_manifest_digest TEXT NOT NULL REFERENCES dependency_manifests(manifest_digest),
+    semantic_world_digest TEXT NOT NULL REFERENCES semantic_worlds(world_digest),
+    descriptor_json TEXT NOT NULL CHECK(length(CAST(descriptor_json AS BLOB)) <= 4194304),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0),
+    CHECK(
+        (semantic_certificate_id = validation_certificate_id
+            AND action_certificate_id IS NULL AND partition_manifest_id IS NULL)
+        OR
+        (action_certificate_id = validation_certificate_id
+            AND semantic_certificate_id IS NULL AND partition_manifest_id IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX reuse_descriptors_exact
+    ON reuse_descriptors(exact_request_id, artifact_id);
+CREATE INDEX reuse_descriptors_action
+    ON reuse_descriptors(action_contract_id, semantic_world_digest, artifact_id);
+CREATE INDEX reuse_descriptors_origin
+    ON reuse_descriptors(origin_request_id, artifact_id);
+
+CREATE TRIGGER action_artifact_validation_certificates_no_update
+BEFORE UPDATE ON action_artifact_validation_certificates
+BEGIN SELECT RAISE(ABORT, 'action artifact validation certificates are immutable'); END;
+CREATE TRIGGER action_artifact_validation_certificates_no_delete
+BEFORE DELETE ON action_artifact_validation_certificates
+BEGIN SELECT RAISE(ABORT, 'action artifact validation certificates are immutable'); END;
+CREATE TRIGGER reuse_descriptors_no_update BEFORE UPDATE ON reuse_descriptors
+BEGIN SELECT RAISE(ABORT, 'reuse descriptors are immutable'); END;
+CREATE TRIGGER reuse_descriptors_no_delete BEFORE DELETE ON reuse_descriptors
+BEGIN SELECT RAISE(ABORT, 'reuse descriptors are immutable'); END;
+"#;
+
+const MIGRATION_V26: &str = r#"
+CREATE TABLE refresh_economic_assessments (
+    assessment_digest TEXT NOT NULL PRIMARY KEY CHECK(length(assessment_digest) = 67),
+    request_id TEXT NOT NULL CHECK(length(request_id) = 67),
+    action_contract_id TEXT NOT NULL CHECK(length(action_contract_id) BETWEEN 1 AND 128),
+    candidate_definition_digest TEXT NOT NULL CHECK(length(candidate_definition_digest) = 67),
+    operator_definition_digest TEXT NOT NULL CHECK(length(operator_definition_digest) = 67),
+    execution_scope_digest TEXT NOT NULL CHECK(length(execution_scope_digest) = 67),
+    policy_definition_digest TEXT NOT NULL CHECK(length(policy_definition_digest) = 67),
+    evidence_definition_digest TEXT CHECK(
+        evidence_definition_digest IS NULL OR length(evidence_definition_digest) = 67
+    ),
+    expected_net_microusd INTEGER,
+    decision TEXT NOT NULL CHECK(decision IN ('refresh', 'full_compute')),
+    fallback_reason TEXT CHECK(fallback_reason IS NULL OR fallback_reason IN (
+        'missing_cost_evidence', 'below_minimum_net_value',
+        'missing_latency_evidence', 'refresh_latency_budget_exceeded'
+    )),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    assessment_json TEXT NOT NULL
+        CHECK(length(CAST(assessment_json AS BLOB)) <= 16384),
+    recorded_unix_ms INTEGER NOT NULL CHECK(recorded_unix_ms >= 0),
+    CHECK(
+        (decision = 'refresh' AND fallback_reason IS NULL)
+        OR (decision = 'full_compute' AND fallback_reason IS NOT NULL)
+    )
+);
+CREATE INDEX refresh_economic_assessments_request
+    ON refresh_economic_assessments(
+        request_id, action_contract_id, recorded_unix_ms DESC, assessment_digest
+    );
+CREATE INDEX refresh_economic_assessments_candidate
+    ON refresh_economic_assessments(
+        candidate_definition_digest, operator_definition_digest,
+        execution_scope_digest, recorded_unix_ms DESC
+    );
+
+CREATE TRIGGER refresh_economic_assessments_no_update
+BEFORE UPDATE ON refresh_economic_assessments
+BEGIN SELECT RAISE(ABORT, 'refresh economic assessments are immutable'); END;
+CREATE TRIGGER refresh_economic_assessments_no_delete
+BEFORE DELETE ON refresh_economic_assessments
+BEGIN SELECT RAISE(ABORT, 'refresh economic assessments are immutable'); END;
+"#;
+
+const MIGRATION_V27: &str = r#"
+CREATE TABLE refresh_economic_selections (
+    assessment_digest TEXT NOT NULL PRIMARY KEY
+        REFERENCES refresh_economic_assessments(assessment_digest),
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES refresh_attempts(attempt_id),
+    candidate_definition_digest TEXT NOT NULL
+        CHECK(length(candidate_definition_digest) = 67),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    recorded_unix_ms INTEGER NOT NULL CHECK(recorded_unix_ms >= 0)
+);
+CREATE INDEX refresh_economic_selections_attempt
+    ON refresh_economic_selections(attempt_id, assessment_digest);
+
+CREATE TRIGGER refresh_economic_selections_no_update
+BEFORE UPDATE ON refresh_economic_selections
+BEGIN SELECT RAISE(ABORT, 'refresh economic selections are immutable'); END;
+CREATE TRIGGER refresh_economic_selections_no_delete
+BEFORE DELETE ON refresh_economic_selections
+BEGIN SELECT RAISE(ABORT, 'refresh economic selections are immutable'); END;
+"#;
+
+const MIGRATION_V28: &str = r#"
+CREATE TABLE partitioned_action_source_validations (
+    validation_digest TEXT PRIMARY KEY CHECK(length(validation_digest) = 67),
+    action_contract_id TEXT NOT NULL,
+    source_payload_digest TEXT NOT NULL CHECK(length(source_payload_digest) = 67),
+    validator_definition_digest TEXT NOT NULL CHECK(length(validator_definition_digest) = 67),
+    validation_json TEXT NOT NULL CHECK(length(validation_json) <= 65536),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0)
+);
+
+CREATE TABLE partitioned_action_head_history (
+    head_key TEXT NOT NULL CHECK(length(head_key) = 67),
+    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
+    action_contract_id TEXT NOT NULL,
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    source_selector TEXT NOT NULL CHECK(length(source_selector) > 0),
+    provider_context_digest TEXT NOT NULL CHECK(length(provider_context_digest) = 67),
+    scope_digest TEXT NOT NULL CHECK(length(scope_digest) = 67),
+    request_id TEXT NOT NULL REFERENCES artifact_requests(request_id),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    validation_certificate_id TEXT NOT NULL
+        REFERENCES action_artifact_validation_certificates(certificate_id),
+    descriptor_digest TEXT NOT NULL REFERENCES reuse_descriptors(descriptor_digest),
+    partition_manifest_id TEXT NOT NULL REFERENCES partition_manifests(manifest_id),
+    source_validation_digest TEXT NOT NULL
+        REFERENCES partitioned_action_source_validations(validation_digest),
+    content_digest TEXT NOT NULL CHECK(length(content_digest) = 67),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    recorded_unix_ms INTEGER NOT NULL CHECK(recorded_unix_ms >= 0),
+    PRIMARY KEY(head_key, repository_generation)
+);
+CREATE INDEX partitioned_action_head_history_artifact
+    ON partitioned_action_head_history(artifact_id, head_key, repository_generation DESC);
+
+CREATE TABLE partitioned_action_heads (
+    head_key TEXT PRIMARY KEY CHECK(length(head_key) = 67),
+    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
+    action_contract_id TEXT NOT NULL,
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    repository_context_id TEXT NOT NULL CHECK(length(repository_context_id) = 67),
+    source_selector TEXT NOT NULL CHECK(length(source_selector) > 0),
+    provider_context_digest TEXT NOT NULL CHECK(length(provider_context_digest) = 67),
+    scope_digest TEXT NOT NULL CHECK(length(scope_digest) = 67),
+    request_id TEXT NOT NULL REFERENCES artifact_requests(request_id),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    validation_certificate_id TEXT NOT NULL
+        REFERENCES action_artifact_validation_certificates(certificate_id),
+    descriptor_digest TEXT NOT NULL REFERENCES reuse_descriptors(descriptor_digest),
+    partition_manifest_id TEXT NOT NULL REFERENCES partition_manifests(manifest_id),
+    source_validation_digest TEXT NOT NULL
+        REFERENCES partitioned_action_source_validations(validation_digest),
+    content_digest TEXT NOT NULL CHECK(length(content_digest) = 67),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    recorded_unix_ms INTEGER NOT NULL CHECK(recorded_unix_ms >= 0),
+    FOREIGN KEY(head_key, repository_generation)
+        REFERENCES partitioned_action_head_history(head_key, repository_generation)
+);
+CREATE INDEX partitioned_action_heads_contract_repository
+    ON partitioned_action_heads(action_contract_id, repository_lineage, repository_context_id);
+
+CREATE TRIGGER partitioned_action_source_validations_no_update
+BEFORE UPDATE ON partitioned_action_source_validations
+BEGIN SELECT RAISE(ABORT, 'partitioned action source validations are immutable'); END;
+CREATE TRIGGER partitioned_action_source_validations_no_delete
+BEFORE DELETE ON partitioned_action_source_validations
+BEGIN SELECT RAISE(ABORT, 'partitioned action source validations are immutable'); END;
+CREATE TRIGGER partitioned_action_head_history_no_update
+BEFORE UPDATE ON partitioned_action_head_history
+BEGIN SELECT RAISE(ABORT, 'partitioned action head history is immutable'); END;
+CREATE TRIGGER partitioned_action_head_history_no_delete
+BEFORE DELETE ON partitioned_action_head_history
+BEGIN SELECT RAISE(ABORT, 'partitioned action head history is immutable'); END;
+"#;
+
+const MIGRATION_V29: &str = r#"
+CREATE TABLE lifecycle_explore_action_observations (
+    observation_digest TEXT PRIMARY KEY CHECK(length(observation_digest) = 67),
+    lifecycle_id TEXT NOT NULL REFERENCES change_lifecycles(lifecycle_id),
+    expected_state_digest TEXT NOT NULL CHECK(length(expected_state_digest) = 67),
+    plan_definition_digest TEXT NOT NULL CHECK(length(plan_definition_digest) = 67),
+    resolution TEXT NOT NULL CHECK(
+        resolution IN ('unavailable', 'miss', 'partial', 'resolved', 'invalid')
+    ),
+    planned_action_count INTEGER NOT NULL CHECK(
+        planned_action_count BETWEEN 1 AND 8
+    ),
+    observation_json TEXT NOT NULL CHECK(length(observation_json) <= 65536),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    adapter_invocation_required INTEGER NOT NULL CHECK(adapter_invocation_required = 1),
+    recorded_unix_ms INTEGER NOT NULL CHECK(recorded_unix_ms >= 0),
+    UNIQUE(lifecycle_id, expected_state_digest)
+);
+CREATE INDEX lifecycle_explore_action_observations_lifecycle
+    ON lifecycle_explore_action_observations(
+        lifecycle_id, recorded_unix_ms, observation_digest
+    );
+
+CREATE TRIGGER lifecycle_explore_action_observations_no_update
+BEFORE UPDATE ON lifecycle_explore_action_observations
+BEGIN SELECT RAISE(ABORT, 'lifecycle Explore action observations are immutable'); END;
+CREATE TRIGGER lifecycle_explore_action_observations_no_delete
+BEFORE DELETE ON lifecycle_explore_action_observations
+BEGIN SELECT RAISE(ABORT, 'lifecycle Explore action observations are immutable'); END;
+"#;
+
+const MIGRATION_V30: &str = r#"
+CREATE TABLE lifecycle_adapter_invocations (
+    invocation_id TEXT PRIMARY KEY CHECK(length(invocation_id) = 67),
+    lifecycle_id TEXT NOT NULL REFERENCES change_lifecycles(lifecycle_id),
+    expected_state_digest TEXT NOT NULL CHECK(length(expected_state_digest) = 67),
+    phase TEXT NOT NULL CHECK(phase IN ('explore', 'implement', 'test', 'review', 'verify')),
+    request_digest TEXT NOT NULL CHECK(length(request_digest) = 67),
+    adapter_definition_digest TEXT NOT NULL CHECK(length(adapter_definition_digest) = 67),
+    request_json TEXT NOT NULL CHECK(length(CAST(request_json AS BLOB)) <= 131072),
+    started_unix_ms INTEGER NOT NULL CHECK(started_unix_ms >= 0),
+    UNIQUE(lifecycle_id, expected_state_digest, phase)
+);
+CREATE TABLE lifecycle_adapter_outcomes (
+    invocation_id TEXT PRIMARY KEY REFERENCES lifecycle_adapter_invocations(invocation_id),
+    outcome_digest TEXT NOT NULL UNIQUE CHECK(length(outcome_digest) = 67),
+    outcome_json TEXT NOT NULL CHECK(length(CAST(outcome_json AS BLOB)) <= 131072),
+    completed_unix_ms INTEGER NOT NULL CHECK(completed_unix_ms >= 0)
+);
+CREATE INDEX lifecycle_adapter_invocations_lifecycle
+    ON lifecycle_adapter_invocations(lifecycle_id, started_unix_ms, invocation_id);
+
+CREATE TRIGGER lifecycle_adapter_invocations_no_update
+BEFORE UPDATE ON lifecycle_adapter_invocations
+BEGIN SELECT RAISE(ABORT, 'lifecycle adapter invocations are immutable'); END;
+CREATE TRIGGER lifecycle_adapter_invocations_no_delete
+BEFORE DELETE ON lifecycle_adapter_invocations
+BEGIN SELECT RAISE(ABORT, 'lifecycle adapter invocations are immutable'); END;
+CREATE TRIGGER lifecycle_adapter_outcomes_no_update
+BEFORE UPDATE ON lifecycle_adapter_outcomes
+BEGIN SELECT RAISE(ABORT, 'lifecycle adapter outcomes are immutable'); END;
+CREATE TRIGGER lifecycle_adapter_outcomes_no_delete
+BEFORE DELETE ON lifecycle_adapter_outcomes
+BEGIN SELECT RAISE(ABORT, 'lifecycle adapter outcomes are immutable'); END;
+"#;
+
+const MIGRATION_V31: &str = r#"
+CREATE TABLE lifecycle_adapter_recoveries (
+    recovery_digest TEXT PRIMARY KEY CHECK(length(recovery_digest) = 67),
+    invocation_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_adapter_invocations(invocation_id),
+    lifecycle_id TEXT NOT NULL REFERENCES change_lifecycles(lifecycle_id),
+    expected_state_digest TEXT NOT NULL CHECK(length(expected_state_digest) = 67),
+    request_digest TEXT NOT NULL CHECK(length(request_digest) = 67),
+    adapter_definition_digest TEXT NOT NULL CHECK(length(adapter_definition_digest) = 67),
+    source TEXT NOT NULL CHECK(source = 'web_user'),
+    recovered_unix_ms INTEGER NOT NULL CHECK(recovered_unix_ms >= 0)
+);
+CREATE INDEX lifecycle_adapter_recoveries_lifecycle
+    ON lifecycle_adapter_recoveries(lifecycle_id, recovered_unix_ms, recovery_digest);
+
+CREATE TRIGGER lifecycle_adapter_recoveries_no_update
+BEFORE UPDATE ON lifecycle_adapter_recoveries
+BEGIN SELECT RAISE(ABORT, 'lifecycle adapter recoveries are immutable'); END;
+CREATE TRIGGER lifecycle_adapter_recoveries_no_delete
+BEFORE DELETE ON lifecycle_adapter_recoveries
+BEGIN SELECT RAISE(ABORT, 'lifecycle adapter recoveries are immutable'); END;
+CREATE TRIGGER lifecycle_adapter_recoveries_no_completed_insert
+BEFORE INSERT ON lifecycle_adapter_recoveries
+WHEN EXISTS(
+    SELECT 1 FROM lifecycle_adapter_outcomes
+    WHERE invocation_id=NEW.invocation_id
+)
+BEGIN SELECT RAISE(ABORT, 'completed lifecycle adapter invocation cannot be recovered'); END;
+CREATE TRIGGER lifecycle_adapter_outcomes_no_recovered_insert
+BEFORE INSERT ON lifecycle_adapter_outcomes
+WHEN EXISTS(
+    SELECT 1 FROM lifecycle_adapter_recoveries
+    WHERE invocation_id=NEW.invocation_id
+)
+BEGIN SELECT RAISE(ABORT, 'recovered lifecycle adapter invocation cannot be completed'); END;
+"#;
+
+const MIGRATION_V32: &str = r#"
+CREATE TABLE action_assurance_records (
+    evidence_id TEXT PRIMARY KEY CHECK(length(evidence_id) = 67),
+    capability_class_id TEXT NOT NULL CHECK(length(capability_class_id) = 67),
+    capability_definition_digest TEXT NOT NULL CHECK(length(capability_definition_digest) = 67),
+    evidence_definition_digest TEXT NOT NULL CHECK(length(evidence_definition_digest) = 67),
+    action_request_id TEXT NOT NULL CHECK(length(action_request_id) = 67),
+    artifact_id TEXT NOT NULL CHECK(length(artifact_id) = 67),
+    validation_certificate_id TEXT NOT NULL CHECK(length(validation_certificate_id) = 67),
+    repository_lineage TEXT NOT NULL CHECK(length(repository_lineage) = 67),
+    source_snapshot TEXT NOT NULL CHECK(length(source_snapshot) = 67),
+    lifecycle_id TEXT NOT NULL CHECK(length(lifecycle_id) = 67),
+    adapter_invocation_id TEXT NOT NULL UNIQUE CHECK(length(adapter_invocation_id) = 67),
+    evidence_kind TEXT NOT NULL CHECK(evidence_kind = 'provider_backed_fresh'),
+    execution_evidence_digest TEXT NOT NULL CHECK(length(execution_evidence_digest) = 67),
+    observed_unix_ms INTEGER NOT NULL CHECK(observed_unix_ms > 0),
+    evidence_json TEXT NOT NULL CHECK(length(CAST(evidence_json AS BLOB)) <= 65536),
+    recorded_unix_ms INTEGER NOT NULL CHECK(recorded_unix_ms >= 0)
+);
+CREATE INDEX action_assurance_records_capability
+    ON action_assurance_records(capability_class_id, observed_unix_ms, evidence_id);
+
+CREATE TABLE action_capability_decisions (
+    decision_id TEXT PRIMARY KEY CHECK(length(decision_id) = 67),
+    capability_class_id TEXT NOT NULL CHECK(length(capability_class_id) = 67),
+    capability_definition_digest TEXT NOT NULL CHECK(length(capability_definition_digest) = 67),
+    evidence_id TEXT NOT NULL REFERENCES action_assurance_records(evidence_id),
+    evidence_definition_digest TEXT NOT NULL CHECK(length(evidence_definition_digest) = 67),
+    previous_decision_id TEXT REFERENCES action_capability_decisions(decision_id),
+    selected_mode TEXT NOT NULL CHECK(
+        selected_mode IN ('disabled', 'shadow', 'advisory', 'authoritative')
+    ),
+    automatic_resolver_consumption_approved INTEGER NOT NULL CHECK(
+        automatic_resolver_consumption_approved IN (0, 1)
+    ),
+    automatic_lifecycle_consumption_approved INTEGER NOT NULL CHECK(
+        automatic_lifecycle_consumption_approved IN (0, 1)
+    ),
+    decision_json TEXT NOT NULL CHECK(length(CAST(decision_json AS BLOB)) <= 65536),
+    decided_unix_ms INTEGER NOT NULL CHECK(decided_unix_ms > 0),
+    recorded_unix_ms INTEGER NOT NULL CHECK(recorded_unix_ms >= 0)
+);
+CREATE UNIQUE INDEX action_capability_decisions_root
+    ON action_capability_decisions(capability_class_id)
+    WHERE previous_decision_id IS NULL;
+CREATE UNIQUE INDEX action_capability_decisions_parent
+    ON action_capability_decisions(capability_class_id, previous_decision_id)
+    WHERE previous_decision_id IS NOT NULL;
+CREATE INDEX action_capability_decisions_effective
+    ON action_capability_decisions(
+        capability_class_id, decided_unix_ms DESC, decision_id DESC
+    );
+
+CREATE TRIGGER action_assurance_records_no_update
+BEFORE UPDATE ON action_assurance_records
+BEGIN SELECT RAISE(ABORT, 'action assurance records are immutable'); END;
+CREATE TRIGGER action_assurance_records_no_delete
+BEFORE DELETE ON action_assurance_records
+BEGIN SELECT RAISE(ABORT, 'action assurance records are immutable'); END;
+CREATE TRIGGER action_capability_decisions_no_update
+BEFORE UPDATE ON action_capability_decisions
+BEGIN SELECT RAISE(ABORT, 'action capability decisions are immutable'); END;
+CREATE TRIGGER action_capability_decisions_no_delete
+BEFORE DELETE ON action_capability_decisions
+BEGIN SELECT RAISE(ABORT, 'action capability decisions are immutable'); END;
+CREATE TRIGGER action_capability_decisions_evidence_binding
+BEFORE INSERT ON action_capability_decisions
+WHEN NOT EXISTS(
+    SELECT 1 FROM action_assurance_records evidence
+    WHERE evidence.evidence_id=NEW.evidence_id
+      AND evidence.capability_class_id=NEW.capability_class_id
+      AND evidence.capability_definition_digest=NEW.capability_definition_digest
+      AND evidence.evidence_definition_digest=NEW.evidence_definition_digest
+)
+BEGIN SELECT RAISE(ABORT, 'action capability decision evidence binding is invalid'); END;
+CREATE TRIGGER action_capability_decisions_chain_binding
+BEFORE INSERT ON action_capability_decisions
+WHEN NEW.previous_decision_id IS NOT NULL AND NOT EXISTS(
+    SELECT 1 FROM action_capability_decisions previous
+    WHERE previous.decision_id=NEW.previous_decision_id
+      AND previous.capability_class_id=NEW.capability_class_id
+      AND previous.decided_unix_ms < NEW.decided_unix_ms
+)
+BEGIN SELECT RAISE(ABORT, 'action capability decision chain binding is invalid'); END;
+"#;
+
+const MIGRATION_V33: &str = r#"
+CREATE TABLE opaque_action_validation_certificates (
+    certificate_id TEXT NOT NULL PRIMARY KEY CHECK(length(certificate_id) = 67),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    action_contract_id TEXT NOT NULL CHECK(length(action_contract_id) BETWEEN 1 AND 128),
+    action_semantic_definition_digest TEXT NOT NULL CHECK(length(action_semantic_definition_digest) = 67),
+    action_validation_definition_digest TEXT NOT NULL CHECK(length(action_validation_definition_digest) = 67),
+    output_contract_definition_digest TEXT NOT NULL CHECK(length(output_contract_definition_digest) = 67),
+    source_payload_digest TEXT NOT NULL CHECK(length(source_payload_digest) = 67),
+    dependency_manifest_digest TEXT NOT NULL REFERENCES dependency_manifests(manifest_digest),
+    semantic_world_digest TEXT NOT NULL REFERENCES semantic_worlds(world_digest),
+    validator_definition_digest TEXT NOT NULL CHECK(length(validator_definition_digest) = 67),
+    authority TEXT NOT NULL CHECK(authority = 'shadow'),
+    certificate_json TEXT NOT NULL CHECK(length(CAST(certificate_json AS BLOB)) <= 65536),
+    issued_unix_ms INTEGER NOT NULL CHECK(issued_unix_ms >= 0)
+);
+CREATE INDEX opaque_action_validation_artifact
+    ON opaque_action_validation_certificates(artifact_id, issued_unix_ms DESC);
+
+CREATE TRIGGER opaque_action_validation_certificates_no_update
+BEFORE UPDATE ON opaque_action_validation_certificates
+BEGIN SELECT RAISE(ABORT, 'opaque action validation certificates are immutable'); END;
+CREATE TRIGGER opaque_action_validation_certificates_no_delete
+BEFORE DELETE ON opaque_action_validation_certificates
+BEGIN SELECT RAISE(ABORT, 'opaque action validation certificates are immutable'); END;
+"#;
+
+const MIGRATION_V34: &str = r#"
+CREATE TABLE action_execution_operations (
+    operation_id TEXT NOT NULL PRIMARY KEY CHECK(length(operation_id) = 67),
+    action_request_id TEXT NOT NULL CHECK(length(action_request_id) = 67),
+    state TEXT NOT NULL CHECK(state IN ('running', 'completed')),
+    artifact_id TEXT REFERENCES artifacts(artifact_id),
+    validation_certificate_id TEXT CHECK(
+        validation_certificate_id IS NULL OR length(validation_certificate_id) = 67
+    ),
+    partition_manifest_id TEXT REFERENCES partition_manifests(manifest_id),
+    started_unix_ms INTEGER NOT NULL CHECK(started_unix_ms >= 0),
+    completed_unix_ms INTEGER,
+    CHECK(
+        (state='running' AND artifact_id IS NULL AND validation_certificate_id IS NULL
+            AND partition_manifest_id IS NULL AND completed_unix_ms IS NULL)
+        OR
+        (state='completed' AND artifact_id IS NOT NULL AND validation_certificate_id IS NOT NULL
+            AND completed_unix_ms IS NOT NULL)
+    )
+);
+CREATE INDEX action_execution_operations_request
+    ON action_execution_operations(action_request_id, completed_unix_ms DESC);
+
+CREATE TRIGGER action_execution_operations_no_delete
+BEFORE DELETE ON action_execution_operations
+BEGIN SELECT RAISE(ABORT, 'action execution operations are durable'); END;
+CREATE TRIGGER action_execution_operations_completed_immutable
+BEFORE UPDATE ON action_execution_operations
+WHEN OLD.state='completed'
+BEGIN SELECT RAISE(ABORT, 'completed action execution operations are immutable'); END;
+CREATE TRIGGER action_execution_operations_single_transition
+BEFORE UPDATE ON action_execution_operations
+WHEN OLD.state!='running' OR NEW.state!='completed'
+BEGIN SELECT RAISE(ABORT, 'invalid action execution operation transition'); END;
+"#;
+
+const MIGRATION_V35: &str = r#"
+ALTER TABLE change_applies ADD COLUMN operation_id TEXT
+    CHECK(operation_id IS NULL OR length(operation_id) = 67);
+CREATE UNIQUE INDEX change_applies_active_operation
+    ON change_applies(operation_id)
+    WHERE operation_id IS NOT NULL AND status IN ('applying', 'applied');
+"#;
+
+const MIGRATION_V36: &str = r#"
+ALTER TABLE action_execution_operations ADD COLUMN usage_json TEXT
+    CHECK(usage_json IS NULL OR length(CAST(usage_json AS BLOB)) <= 4096);
+"#;
+
+const MIGRATION_V37: &str = r#"
+CREATE TABLE lifecycle_execution_operations (
+    operation_id TEXT NOT NULL PRIMARY KEY CHECK(length(operation_id) = 67),
+    request_digest TEXT NOT NULL CHECK(length(request_digest) = 67),
+    change_id TEXT NOT NULL REFERENCES change_lifecycles(change_id),
+    created_unix_ms INTEGER NOT NULL CHECK(created_unix_ms >= 0)
+);
+CREATE INDEX lifecycle_execution_operations_change
+    ON lifecycle_execution_operations(change_id, created_unix_ms DESC);
+
+CREATE TRIGGER lifecycle_execution_operations_no_update
+BEFORE UPDATE ON lifecycle_execution_operations
+BEGIN SELECT RAISE(ABORT, 'lifecycle execution operations are immutable'); END;
+CREATE TRIGGER lifecycle_execution_operations_no_delete
+BEFORE DELETE ON lifecycle_execution_operations
+BEGIN SELECT RAISE(ABORT, 'lifecycle execution operations are durable'); END;
+"#;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("database operation failed: {0}")]
@@ -1043,6 +2097,8 @@ pub enum StoreError {
     DefinitionDigest(String),
     #[error("artifact identity mismatch: {0}")]
     ArtifactIdentity(String),
+    #[error("action execution operation conflict: {0}")]
+    ActionExecutionConflict(String),
     #[error("approval `{0}` is already resolved or its payload changed")]
     ApprovalConflict(String),
     #[error("approval `{0}` has expired")]
@@ -1073,12 +2129,86 @@ pub enum StoreError {
     LifecycleNotFound(String),
     #[error("stored lifecycle is corrupt: {0}")]
     LifecycleCorruption(String),
+    #[error("lifecycle Explore action observation is invalid: {0}")]
+    LifecycleExploreObservationValidation(String),
+    #[error("lifecycle Explore action observation conflicts with immutable state: {0}")]
+    LifecycleExploreObservationConflict(String),
+    #[error("stored lifecycle Explore action observation is corrupt: {0}")]
+    LifecycleExploreObservationCorruption(String),
+    #[error("lifecycle Explore action observation query is invalid: {0}")]
+    LifecycleExploreObservationQuery(String),
+    #[error("action assurance record is invalid: {0}")]
+    ActionAssuranceValidation(String),
+    #[error("action assurance operation conflicts with immutable state: {0}")]
+    ActionAssuranceConflict(String),
+    #[error("stored action assurance state is corrupt: {0}")]
+    ActionAssuranceCorruption(String),
+    #[error("lifecycle adapter invocation is invalid: {0}")]
+    LifecycleAdapterInvocationValidation(String),
+    #[error("lifecycle adapter invocation conflicts with durable state: {0}")]
+    LifecycleAdapterInvocationConflict(String),
+    #[error("stored lifecycle adapter invocation is corrupt: {0}")]
+    LifecycleAdapterInvocationCorruption(String),
     #[error("product activation is invalid: {0}")]
     ActivationValidation(String),
     #[error("product activation operation conflicts: {0}")]
     ActivationConflict(String),
     #[error("stored product activation is corrupt: {0}")]
     ActivationCorruption(String),
+    #[error("repository generation validation failed: {0}")]
+    RepositoryGenerationValidation(#[from] needle_core::RepositoryGenerationError),
+    #[error("repository generation operation conflicts: {0}")]
+    RepositoryGenerationConflict(String),
+    #[error("stored repository generation is corrupt: {0}")]
+    RepositoryGenerationCorruption(String),
+    #[error("definition-set generation validation failed: {0}")]
+    DefinitionGenerationValidation(#[from] needle_core::DefinitionGenerationError),
+    #[error("definition-set generation operation conflicts: {0}")]
+    DefinitionGenerationConflict(String),
+    #[error("stored definition-set generation is corrupt: {0}")]
+    DefinitionGenerationCorruption(String),
+    #[error("dependency validity validation failed: {0}")]
+    DependencyValidityValidation(#[from] needle_core::DependencyValidityRecordError),
+    #[error("dependency validity operation conflicts: {0}")]
+    DependencyValidityConflict(String),
+    #[error("stored dependency validity state is corrupt: {0}")]
+    DependencyValidityCorruption(String),
+    #[error("partition manifest validation failed: {0}")]
+    PartitionManifestValidation(#[from] needle_core::PartitionManifestError),
+    #[error("partition manifest publication is invalid: {0}")]
+    PartitionManifestPublication(String),
+    #[error("partition manifest operation conflicts: {0}")]
+    PartitionManifestConflict(String),
+    #[error("stored partition manifest state is corrupt: {0}")]
+    PartitionManifestCorruption(String),
+    #[error("partition manifest query is invalid: {0}")]
+    PartitionManifestQuery(String),
+    #[error("refresh record validation failed: {0}")]
+    RefreshRecordValidation(#[from] needle_core::RefreshRecordError),
+    #[error("refresh persistence binding is invalid: {0}")]
+    RefreshPersistenceBinding(String),
+    #[error("refresh persistence conflicts with immutable state: {0}")]
+    RefreshPersistenceConflict(String),
+    #[error("stored refresh persistence state is corrupt: {0}")]
+    RefreshPersistenceCorruption(String),
+    #[error("refresh economic assessment validation failed: {0}")]
+    RefreshEconomicValidation(#[from] needle_core::RefreshEconomicError),
+    #[error("refresh economic assessment operation conflicts: {0}")]
+    RefreshEconomicConflict(String),
+    #[error("stored refresh economic assessment is corrupt: {0}")]
+    RefreshEconomicCorruption(String),
+    #[error("refresh economic assessment query is invalid: {0}")]
+    RefreshEconomicQuery(String),
+    #[error("partitioned action publication binding is invalid: {0}")]
+    PartitionedActionPublicationBinding(String),
+    #[error("partitioned action publication conflicts with immutable state: {0}")]
+    PartitionedActionPublicationConflict(String),
+    #[error("stored partitioned action publication is corrupt: {0}")]
+    PartitionedActionPublicationCorruption(String),
+    #[error("partitioned action head operation conflicts: {0}")]
+    PartitionedActionHeadConflict(String),
+    #[error("stored partitioned action head is corrupt: {0}")]
+    PartitionedActionHeadCorruption(String),
     #[error("database connection lock was poisoned")]
     ConnectionLock,
 }
@@ -1404,6 +2534,26 @@ impl RuntimeStore {
         apply_migration(&mut connection, 15, MIGRATION_V15)?;
         apply_migration(&mut connection, 16, MIGRATION_V16)?;
         apply_migration(&mut connection, 17, MIGRATION_V17)?;
+        apply_migration(&mut connection, 18, MIGRATION_V18)?;
+        apply_migration(&mut connection, 19, MIGRATION_V19)?;
+        apply_migration(&mut connection, 20, MIGRATION_V20)?;
+        apply_migration(&mut connection, 21, MIGRATION_V21)?;
+        apply_migration(&mut connection, 22, MIGRATION_V22)?;
+        apply_migration(&mut connection, 23, MIGRATION_V23)?;
+        apply_migration(&mut connection, 24, MIGRATION_V24)?;
+        apply_migration(&mut connection, 25, MIGRATION_V25)?;
+        apply_migration(&mut connection, 26, MIGRATION_V26)?;
+        apply_migration(&mut connection, 27, MIGRATION_V27)?;
+        apply_migration(&mut connection, 28, MIGRATION_V28)?;
+        apply_migration(&mut connection, 29, MIGRATION_V29)?;
+        apply_migration(&mut connection, 30, MIGRATION_V30)?;
+        apply_migration(&mut connection, 31, MIGRATION_V31)?;
+        apply_migration(&mut connection, 32, MIGRATION_V32)?;
+        apply_migration(&mut connection, 33, MIGRATION_V33)?;
+        apply_migration(&mut connection, 34, MIGRATION_V34)?;
+        apply_migration(&mut connection, 35, MIGRATION_V35)?;
+        apply_migration(&mut connection, 36, MIGRATION_V36)?;
+        apply_migration(&mut connection, 37, MIGRATION_V37)?;
         connection.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('utility_gate_passed', '0')",
             [],
@@ -1420,6 +2570,8 @@ impl RuntimeStore {
             "INSERT OR IGNORE INTO settings(key, value) VALUES('multi_need_policy', ?1)",
             [serde_json::to_string(&MultiNeedPolicy::default())?],
         )?;
+        drop(connection);
+        self.reconcile_active_definition_set()?;
         Ok(())
     }
 
@@ -1695,6 +2847,67 @@ impl RuntimeStore {
             });
         }
         Ok(records)
+    }
+
+    /// Load the latest persisted semantic input for one exact Need identity.
+    ///
+    /// This is deliberately read-only: lifecycle start preflight must not
+    /// initialize or otherwise mutate the store while inspecting candidates.
+    pub fn need_shadow(
+        &self,
+        id: &needle_core::NeedId,
+    ) -> Result<Option<NeedShadowRecord>, StoreError> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT r.ir_json, n.need_json, r.parser_definition_digest,
+                        r.prompt_profile_digest, r.created_unix_ms
+                 FROM need_ir_records r
+                 JOIN needs n ON n.need_id=r.need_id
+                 WHERE r.need_id=?1
+                 ORDER BY r.created_unix_ms DESC, r.record_id DESC
+                 LIMIT 1",
+                [id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((ir_json, need_json, parser, profile, created_unix_ms)) = row else {
+            return Ok(None);
+        };
+        let need: Need = serde_json::from_str(&need_json)?;
+        if need.id != *id {
+            return Err(StoreError::LifecycleCorruption(
+                "stored Need identity differs from its lookup key".to_owned(),
+            ));
+        }
+        let mut statement = connection.prepare_cached(
+            "SELECT fragment_json FROM need_fragments
+             WHERE need_id=?1 ORDER BY fragment_id",
+        )?;
+        let fragments = statement
+            .query_map([id.to_string()], |row| row.get::<_, String>(0))?
+            .map(|value| {
+                value
+                    .map_err(StoreError::from)
+                    .and_then(|json| serde_json::from_str(&json).map_err(StoreError::from))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(NeedShadowRecord {
+            need_ir: serde_json::from_str(&ir_json)?,
+            need,
+            fragments,
+            parser_definition_digest: parse_digest(&parser)?,
+            prompt_profile_digest: parse_digest(&profile)?,
+            created_unix_ms,
+        }))
     }
 
     pub fn needs(&self, limit: u32) -> Result<Vec<Need>, StoreError> {
@@ -2633,6 +3846,31 @@ impl RuntimeStore {
         self.resolve_session_worker_config(session_id, executable)
     }
 
+    /// Resolve the exact immutable role-profile revision frozen directly on a
+    /// parent-owned lifecycle phase. Current activation pointers are not
+    /// consulted and therefore cannot change an in-flight execution.
+    pub fn worker_config_for_provenance(
+        &self,
+        provenance: &RoleProfileProvenance,
+        executable: impl Into<String>,
+    ) -> Result<WorkerConfig, StoreError> {
+        provenance
+            .validate()
+            .map_err(|error| StoreError::RoleProfileCorruption(error.to_string()))?;
+        let revision =
+            self.read_role_profile_revision(&provenance.profile_id, provenance.revision)?;
+        let actual = RoleProfileProvenance::from_revision(&revision)
+            .map_err(|error| StoreError::RoleProfileCorruption(error.to_string()))?;
+        if actual != *provenance {
+            return Err(StoreError::RoleProfileCorruption(
+                "lifecycle role-profile provenance does not match historical revision".to_owned(),
+            ));
+        }
+        revision
+            .to_worker_config(executable)
+            .map_err(|error| StoreError::RoleProfileCorruption(error.to_string()))
+    }
+
     /// Checks a bounded provenance value against immutable historical storage.
     /// Current activation state is irrelevant; the exact revision and digest
     /// must still exist and validate.
@@ -3273,7 +4511,87 @@ impl RuntimeStore {
         artifact: &Artifact,
         certificate: &ArtifactValidationCertificate,
     ) -> Result<(), StoreError> {
+        self.publish_semantic_artifact_record(
+            SemanticRequestStorage {
+                artifact_request: request,
+                action_request: None,
+                request_id: request.semantic_id().digest(),
+                logical_id: request.semantic_logical_id().digest(),
+                request_json: serde_json::to_string(request)?,
+                format_revision: 2,
+                demand_id: need.id.to_string(),
+                semantic_policy_digest: None,
+                dependency_context_digest: None,
+                origin_need_id: need.id.to_string(),
+            },
+            artifact,
+            certificate,
+        )
+    }
+
+    pub fn publish_action_artifact(
+        &self,
+        request: &ActionRequest,
+        artifact: &Artifact,
+        certificate: &ArtifactValidationCertificate,
+    ) -> Result<(), StoreError> {
+        let action =
+            crate::built_in_action_for_artifact_kind(&artifact.contract.kind).ok_or_else(|| {
+                StoreError::ArtifactIdentity("unknown action artifact kind".to_owned())
+            })?;
+        request
+            .validate(&action.contract)
+            .map_err(|error| StoreError::ArtifactIdentity(error.to_string()))?;
+        if request.artifact_request.contract_id != action.output_contract_id
+            || request.artifact_request.contract_revision != action.output_contract_revision
+        {
+            return Err(StoreError::ArtifactIdentity(
+                "action request output contract does not match its definition".to_owned(),
+            ));
+        }
+        crate::reuse_descriptor::derive_shadow_reuse_descriptor_from_validated_pair(
+            artifact,
+            certificate,
+        )
+        .map_err(|error| StoreError::ArtifactIdentity(error.to_string()))?;
+        if certificate.coverage.world.repository_lineage != request.artifact_request.repository_id {
+            return Err(StoreError::ArtifactIdentity(
+                "action request repository does not match its validation world".to_owned(),
+            ));
+        }
         let request_id = request.semantic_id().digest();
+        self.publish_semantic_artifact_record(
+            SemanticRequestStorage {
+                artifact_request: &request.artifact_request,
+                action_request: Some(request),
+                request_id,
+                logical_id: request_id,
+                request_json: serde_json::to_string(request)?,
+                format_revision: ACTION_REQUEST_STORAGE_FORMAT_REVISION,
+                demand_id: request
+                    .artifact_request
+                    .semantic_fragment_id
+                    .expect("revision 2 action requests require a fragment")
+                    .to_string(),
+                semantic_policy_digest: request.contract_semantic_definition_digest,
+                dependency_context_digest: Some(action_input_context_digest(
+                    &request.artifact_request.input_artifact_ids,
+                )),
+                origin_need_id: request.root_need.to_string(),
+            },
+            artifact,
+            certificate,
+        )
+    }
+
+    fn publish_semantic_artifact_record(
+        &self,
+        storage: SemanticRequestStorage<'_>,
+        artifact: &Artifact,
+        certificate: &ArtifactValidationCertificate,
+    ) -> Result<(), StoreError> {
+        let request = storage.artifact_request;
+        let request_id = storage.request_id;
         if request.input_artifact_ids.len() > needle_core::MAX_NEED_INPUTS {
             return Err(StoreError::ArtifactIdentity(
                 "semantic artifact request exceeds the input bound".to_owned(),
@@ -3317,7 +4635,7 @@ impl RuntimeStore {
             let certified: u64 = transaction.query_row(
                 "SELECT COUNT(*) FROM artifacts a
                  JOIN artifact_validation_certificates c ON c.artifact_id=a.artifact_id
-                 WHERE a.artifact_id=?1 AND a.format_revision=2",
+                 WHERE a.artifact_id=?1 AND a.format_revision IN (2, 3)",
                 [input.to_string()],
                 |row| row.get(0),
             )?;
@@ -3342,30 +4660,38 @@ impl RuntimeStore {
         transaction.execute(
             "INSERT OR IGNORE INTO artifact_requests(
                 request_id, logical_id, source_digest, contract_id, route_key, request_json,
-                created_unix_ms, format_revision, demand_id
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 2, ?8)",
+                created_unix_ms, format_revision, demand_id, semantic_policy_digest,
+                dependency_context_digest
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 request_id.to_string(),
-                request.semantic_logical_id().to_string(),
+                storage.logical_id.to_string(),
                 request.source_snapshot_digest.to_string(),
                 request.contract_id,
                 request.route_key.as_str(),
-                serde_json::to_string(request)?,
+                storage.request_json,
                 artifact.created_unix_ms,
-                need.id.to_string(),
+                storage.format_revision,
+                storage.demand_id,
+                storage.semantic_policy_digest.map(|digest| digest.to_string()),
+                storage.dependency_context_digest.map(|digest| digest.to_string()),
             ],
         )?;
+        if let Some(action_request) = storage.action_request {
+            insert_action_request_row(&transaction, action_request, artifact.created_unix_ms)?;
+        }
         transaction.execute(
             "INSERT OR IGNORE INTO artifacts(
                 artifact_id, request_id, contract_id, artifact_json, created_unix_ms,
                 format_revision
-             ) VALUES(?1, ?2, ?3, ?4, ?5, 2)",
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 artifact.id.to_string(),
                 request_id.to_string(),
                 artifact.contract.id,
                 serde_json::to_string(artifact)?,
                 artifact.created_unix_ms,
+                storage.format_revision,
             ],
         )?;
         transaction.execute(
@@ -3376,10 +4702,26 @@ impl RuntimeStore {
                 artifact.id.to_string(),
                 request_id.to_string(),
                 request.route_key.as_str(),
-                need.id.to_string(),
+                storage.origin_need_id,
                 artifact.created_unix_ms,
             ],
         )?;
+        if let Some(action_request) = storage.action_request {
+            transaction.execute(
+                "INSERT OR IGNORE INTO action_request_observations(
+                    action_request_id, artifact_id, source_digest, route_key, need_id,
+                    observed_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    request_id.to_string(),
+                    artifact.id.to_string(),
+                    action_request.artifact_request.source_snapshot_digest.to_string(),
+                    action_request.route.as_str(),
+                    action_request.root_need.to_string(),
+                    artifact.created_unix_ms,
+                ],
+            )?;
+        }
         let world_digest = certificate.coverage.world.id();
         transaction.execute(
             "INSERT OR IGNORE INTO semantic_worlds(world_digest, world_json, created_unix_ms)
@@ -3452,6 +4794,209 @@ impl RuntimeStore {
         Ok(())
     }
 
+    /// Matches a current action request against a structurally validated,
+    /// freshness-checked artifact pair. The caller must complete filesystem and
+    /// recursive input freshness checks before invoking this method.
+    pub(crate) fn match_or_map_validated_action_request(
+        &self,
+        request: &ActionRequest,
+        artifact: &Artifact,
+        certificate: &ArtifactValidationCertificate,
+        descriptor: &ReuseDescriptor,
+    ) -> Result<Option<ActionRequestMatch>, StoreError> {
+        let Some(action) = crate::built_in_action_for_artifact_kind(&artifact.contract.kind) else {
+            return Ok(None);
+        };
+        request
+            .validate(&action.contract)
+            .map_err(|error| StoreError::ArtifactIdentity(error.to_string()))?;
+        descriptor.validate().map_err(|error| StoreError::ArtifactIdentity(error.to_string()))?;
+        if request.contract != descriptor.action_contract
+            || request.contract_semantic_definition_digest
+                != Some(descriptor.action_semantic_definition_digest)
+            || descriptor.action_validation_definition_digest
+                != action.contract.validation_definition_digest
+            || descriptor.output_contract_definition_digest
+                != action.output_contract_definition_digest
+            || descriptor.validator_definition_digest
+                != crate::validator_definition(action.artifact_kind())
+            || descriptor.artifact.digest() != artifact.id
+            || descriptor.validation_certificate != certificate.id
+            || descriptor.semantic_world_digest != certificate.coverage.world.id()
+            || request.artifact_request.repository_id
+                != certificate.coverage.world.repository_lineage
+            || request.artifact_request.contract_id != action.output_contract_id
+            || request.artifact_request.contract_revision != action.output_contract_revision
+        {
+            return Ok(None);
+        }
+        let mut certificate_inputs =
+            certificate.input_artifacts.iter().map(|input| input.digest()).collect::<Vec<_>>();
+        certificate_inputs.sort_unstable();
+        if certificate_inputs != request.artifact_request.input_artifact_ids {
+            return Ok(None);
+        }
+
+        let matched_request = request.semantic_id();
+        let matched = matched_request.to_string();
+        let artifact_id = artifact.id.to_string();
+        let mut connection = self.connection()?;
+        if connection
+            .query_row(
+                "SELECT 1 FROM artifact_origins
+                 WHERE artifact_id=?1 AND request_id=?2 LIMIT 1",
+                params![artifact_id, matched],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            insert_action_request_observation(&connection, request, artifact.id, now_ms())?;
+            return Ok(Some(ActionRequestMatch {
+                matched_request,
+                origin_request: matched_request,
+            }));
+        }
+
+        let existing: Option<(String, String)> = connection
+            .query_row(
+                "SELECT legacy_request_id, action_semantic_definition_digest
+                 FROM action_request_identity_mappings
+                 WHERE action_request_id=?1 AND artifact_id=?2",
+                params![matched, artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((origin, semantic_definition)) = existing {
+            if semantic_definition
+                != request
+                    .contract_semantic_definition_digest
+                    .expect("validated revision 2 request has a semantic definition")
+                    .to_string()
+            {
+                return Err(StoreError::ArtifactIdentity(
+                    "stored action request mapping changed semantic definition".to_owned(),
+                ));
+            }
+            insert_action_request_observation(&connection, request, artifact.id, now_ms())?;
+            return Ok(Some(ActionRequestMatch {
+                matched_request,
+                origin_request: parse_artifact_request_id(&origin)?,
+            }));
+        }
+
+        let compatible_origin = {
+            let mut statement = connection.prepare_cached(
+                "SELECT origins.request_id, requests.request_json
+                 FROM artifact_origins origins
+                 JOIN artifact_requests requests ON requests.request_id=origins.request_id
+                 WHERE origins.artifact_id=?1
+                   AND requests.format_revision=2
+                   AND length(requests.request_json)<=?2
+                 ORDER BY origins.request_id
+                 LIMIT 64",
+            )?;
+            let rows = statement
+                .query_map(params![artifact_id, MAX_STORED_ACTION_REQUEST_JSON_BYTES], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+            let mut compatible = None;
+            for row in rows.take(MAX_ACTION_ORIGIN_ROWS) {
+                let (origin_id, request_json) = row?;
+                let stored: ArtifactRequest = serde_json::from_str(&request_json)?;
+                if stored.semantic_id().digest().to_string() != origin_id
+                    || stored.contract_id != request.artifact_request.contract_id
+                    || stored.contract_revision != request.artifact_request.contract_revision
+                    || stored.repository_id != request.artifact_request.repository_id
+                    || stored.semantic_fragment_id != request.artifact_request.semantic_fragment_id
+                {
+                    continue;
+                }
+                let mut stored_inputs = stored.input_artifact_ids;
+                stored_inputs.sort_unstable();
+                if stored_inputs == request.artifact_request.input_artifact_ids {
+                    compatible = Some(parse_artifact_request_id(&origin_id)?);
+                    break;
+                }
+            }
+            compatible
+        };
+        let Some(origin_request) = compatible_origin else {
+            return Ok(None);
+        };
+
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        insert_action_request_row(&transaction, request, now_ms())?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO action_request_identity_mappings(
+                action_request_id, legacy_request_id, artifact_id,
+                validation_certificate_id, action_semantic_definition_digest, mapped_unix_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                matched,
+                origin_request.to_string(),
+                artifact_id,
+                certificate.id.to_string(),
+                request
+                    .contract_semantic_definition_digest
+                    .expect("validated revision 2 request has a semantic definition")
+                    .to_string(),
+                now_ms(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO action_request_observations(
+                action_request_id, artifact_id, source_digest, route_key, need_id,
+                observed_unix_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                matched,
+                artifact_id,
+                request.artifact_request.source_snapshot_digest.to_string(),
+                request.route.as_str(),
+                request.root_need.to_string(),
+                now_ms(),
+            ],
+        )?;
+        let stored: (String, String) = transaction.query_row(
+            "SELECT legacy_request_id, action_semantic_definition_digest
+             FROM action_request_identity_mappings
+             WHERE action_request_id=?1 AND artifact_id=?2",
+            params![matched, artifact_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if stored.1
+            != request
+                .contract_semantic_definition_digest
+                .expect("validated revision 2 request has a semantic definition")
+                .to_string()
+        {
+            return Err(StoreError::ArtifactIdentity(
+                "stored action request mapping conflicts with its semantic definition".to_owned(),
+            ));
+        }
+        let origin_request = parse_artifact_request_id(&stored.0)?;
+        transaction.commit()?;
+        Ok(Some(ActionRequestMatch { matched_request, origin_request }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn action_request_identity_mapping_count(&self) -> Result<u64, StoreError> {
+        self.connection()?
+            .query_row("SELECT COUNT(*) FROM action_request_identity_mappings", [], |row| {
+                row.get(0)
+            })
+            .map_err(StoreError::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn action_request_observation_count(&self) -> Result<u64, StoreError> {
+        self.connection()?
+            .query_row("SELECT COUNT(*) FROM action_request_observations", [], |row| row.get(0))
+            .map_err(StoreError::from)
+    }
+
     pub fn semantic_candidates(
         &self,
         need: &Need,
@@ -3501,10 +5046,14 @@ impl RuntimeStore {
              WHERE artifact_id=?1 AND request_id=?2 LIMIT 1",
         )?;
         let mut source_lookup = connection.prepare_cached(
-            "SELECT 1
-             FROM artifact_origins origins
-             JOIN artifact_requests requests ON requests.request_id=origins.request_id
-             WHERE origins.artifact_id=?1 AND requests.source_digest=?2
+            "SELECT 1 FROM (
+                 SELECT origins.artifact_id AS artifact_id, requests.source_digest AS source_digest
+                 FROM artifact_origins origins
+                 JOIN artifact_requests requests ON requests.request_id=origins.request_id
+                 UNION ALL
+                 SELECT artifact_id, source_digest FROM action_request_observations
+             ) observations
+             WHERE observations.artifact_id=?1 AND observations.source_digest=?2
              LIMIT 1",
         )?;
         let mut evidence_lookup = connection
@@ -3612,10 +5161,15 @@ impl RuntimeStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT 1
-                 FROM artifact_origins origins
-                 JOIN artifact_requests requests ON requests.request_id=origins.request_id
-                 WHERE origins.artifact_id=?1 AND requests.source_digest=?2
+                "SELECT 1 FROM (
+                     SELECT origins.artifact_id AS artifact_id,
+                            requests.source_digest AS source_digest
+                     FROM artifact_origins origins
+                     JOIN artifact_requests requests ON requests.request_id=origins.request_id
+                     UNION ALL
+                     SELECT artifact_id, source_digest FROM action_request_observations
+                 ) observations
+                 WHERE observations.artifact_id=?1 AND observations.source_digest=?2
                  LIMIT 1",
                 params![artifact_id, source_snapshot_digest.to_string()],
                 |_| Ok(()),
@@ -4601,6 +6155,84 @@ impl RuntimeStore {
             .map_err(StoreError::from)
     }
 
+    /// Return the immutable worker-run row cursor used to correlate one
+    /// subsequently completed provider call without scanning unrelated history.
+    pub fn worker_run_cursor(&self) -> Result<u64, StoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM worker_runs", [], |row| row.get(0))
+            .map_err(StoreError::from)
+    }
+
+    /// Resolve exactly one new worker run by its frozen profile.
+    /// The query is bounded to two rows so concurrent or duplicate production
+    /// is rejected instead of being attributed to the lifecycle implicitly.
+    pub fn worker_run_for_profile_after(
+        &self,
+        cursor: u64,
+        profile: &RoleProfileProvenance,
+    ) -> Result<Option<WorkerRunRecord>, StoreError> {
+        let cursor = i64::try_from(cursor).map_err(|_| {
+            StoreError::ArtifactIdentity("worker-run cursor exceeds SQLite range".to_owned())
+        })?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT input_tokens, cached_input_tokens, output_tokens, result_digest,
+                    failure_code, failure_diagnostic, discarded_facts, logical_worker_spawns,
+                    worker_turns, repair_performed, worker_session_id, session_cleanup_success,
+                    role_profile_id, role_profile_revision, role_profile_definition_digest
+             FROM worker_runs
+             WHERE id>?1
+               AND role_profile_id=?2 AND role_profile_revision=?3
+               AND role_profile_definition_digest=?4
+             ORDER BY id ASC LIMIT 2",
+        )?;
+        let rows = statement.query_map(
+            params![
+                cursor,
+                profile.profile_id.as_str(),
+                profile.revision,
+                profile.definition_digest.to_string(),
+            ],
+            |row| {
+                Ok(WorkerRunRecord {
+                    input_tokens: row.get(0)?,
+                    cached_input_tokens: row.get(1)?,
+                    output_tokens: row.get(2)?,
+                    result_digest: row
+                        .get::<_, Option<String>>(3)?
+                        .as_deref()
+                        .map(parse_digest)
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                    failure_code: row.get(4)?,
+                    failure_diagnostic: row.get(5)?,
+                    discarded_facts: row.get(6)?,
+                    logical_worker_spawns: row.get(7)?,
+                    worker_turns: row.get(8)?,
+                    repair_performed: row.get(9)?,
+                    worker_session_id: row.get(10)?,
+                    session_cleanup_success: row.get(11)?,
+                    role_profile_provenance: Some(profile.clone()),
+                })
+            },
+        )?;
+        let mut records = rows.collect::<Result<Vec<_>, _>>()?;
+        match records.len() {
+            0 => Ok(None),
+            1 => Ok(records.pop()),
+            _ => Err(StoreError::ArtifactIdentity(
+                "multiple worker runs matched one lifecycle TestPlan discovery".to_owned(),
+            )),
+        }
+    }
+
     pub fn latest_worker_run(&self) -> Result<Option<WorkerRunRecord>, StoreError> {
         let connection = self.connection()?;
         let value = connection
@@ -4940,6 +6572,100 @@ fn parse_role_profile_provenance(
             "role-profile provenance columns are partially populated".to_owned(),
         )),
     }
+}
+
+fn insert_action_request_row(
+    transaction: &Connection,
+    request: &ActionRequest,
+    created_unix_ms: u64,
+) -> Result<(), StoreError> {
+    let request_id = request.semantic_id().to_string();
+    let fragment = request
+        .artifact_request
+        .semantic_fragment_id
+        .expect("validated revision 2 action requests require a fragment")
+        .to_string();
+    let semantic_policy = request
+        .contract_semantic_definition_digest
+        .expect("validated revision 2 action requests require a semantic definition")
+        .to_string();
+    let dependency_context =
+        action_input_context_digest(&request.artifact_request.input_artifact_ids).to_string();
+    transaction.execute(
+        "INSERT OR IGNORE INTO artifact_requests(
+            request_id, logical_id, source_digest, contract_id, route_key, request_json,
+            created_unix_ms, format_revision, demand_id, semantic_policy_digest,
+            dependency_context_digest
+         ) VALUES(?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            request_id,
+            request.artifact_request.source_snapshot_digest.to_string(),
+            request.artifact_request.contract_id,
+            request.route.as_str(),
+            serde_json::to_string(request)?,
+            created_unix_ms,
+            ACTION_REQUEST_STORAGE_FORMAT_REVISION,
+            fragment,
+            semantic_policy,
+            dependency_context,
+        ],
+    )?;
+    let stored: (u16, String, String, Option<String>, Option<String>) = transaction.query_row(
+        "SELECT format_revision, logical_id, demand_id, semantic_policy_digest,
+                dependency_context_digest
+         FROM artifact_requests WHERE request_id=?1",
+        [request_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    )?;
+    if stored.0 != ACTION_REQUEST_STORAGE_FORMAT_REVISION
+        || stored.1 != request.semantic_id().to_string()
+        || stored.2 != fragment
+        || stored.3.as_deref() != Some(semantic_policy.as_str())
+        || stored.4.as_deref() != Some(dependency_context.as_str())
+    {
+        return Err(StoreError::ArtifactIdentity(
+            "stored action request conflicts with its canonical identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn action_input_context_digest(inputs: &[Digest]) -> Digest {
+    let mut hasher = needle_core::CanonicalHasher::new(b"action-request-input-context-v1");
+    hasher.field_u16(inputs.len() as u16);
+    for input in inputs {
+        hasher.field_digest(*input);
+    }
+    hasher.finish()
+}
+
+fn insert_action_request_observation(
+    connection: &Connection,
+    request: &ActionRequest,
+    artifact_id: Digest,
+    observed_unix_ms: u64,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT OR IGNORE INTO action_request_observations(
+            action_request_id, artifact_id, source_digest, route_key, need_id,
+            observed_unix_ms
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            request.semantic_id().to_string(),
+            artifact_id.to_string(),
+            request.artifact_request.source_snapshot_digest.to_string(),
+            request.route.as_str(),
+            request.root_need.to_string(),
+            observed_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn parse_artifact_request_id(value: &str) -> Result<ArtifactRequestId, StoreError> {
+    Digest::parse(value)
+        .map(ArtifactRequestId::new)
+        .map_err(|_| StoreError::Digest(value.to_owned()))
 }
 
 fn apply_migration(
@@ -5330,7 +7056,18 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(versions, (1..=37).collect::<Vec<_>>());
+        let definition_generation_tables: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name IN (
+                    'definition_set_generations', 'definition_set_head'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(definition_generation_tables, 2);
         let columns = connection
             .prepare("PRAGMA table_info(worker_runs)")
             .unwrap()
