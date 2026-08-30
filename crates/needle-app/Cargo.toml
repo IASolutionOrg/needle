@@ -19,6 +19,7 @@ getrandom = "0.3"
 mime_guess = "2"
 needle-bench = { path = "../needle-bench" }
 needle-core = { path = "../needle-core" }
+needle-platform-antigravity = { path = "../needle-platform-antigravity" }
 needle-platform-codex = { path = "../needle-platform-codex" }
 needle-runtime = { path = "../needle-runtime" }
 serde.workspace = true

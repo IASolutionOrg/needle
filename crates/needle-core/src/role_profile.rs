@@ -129,17 +129,32 @@ impl CodexRole {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CodexHost {
+pub enum AgentHost {
+    #[default]
     Codex,
+    Antigravity,
 }
 
-impl CodexHost {
+impl AgentHost {
     pub const fn as_str(self) -> &'static str {
-        "codex"
+        match self {
+            Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Codex => 0,
+            Self::Antigravity => 1,
+        }
     }
 }
+
+/// Compatibility spelling retained for existing Codex-first callers.
+pub type CodexHost = AgentHost;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,7 +212,7 @@ impl ServiceTier {
 }
 
 pub type RoleProfileServiceTier = ServiceTier;
-pub type RoleProfileHost = CodexHost;
+pub type RoleProfileHost = AgentHost;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -258,6 +273,82 @@ pub enum NetworkPolicy {
 impl NetworkPolicy {
     const fn tag(self) -> u8 {
         0
+    }
+}
+
+pub const EFFECTIVE_WORKER_ALLOWANCES_SCHEMA_V1: &str = "needle.worker-allowances/1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemWriteAllowance {
+    Denied,
+    DisposableCheckout,
+}
+
+impl FilesystemWriteAllowance {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Denied => 0,
+            Self::DisposableCheckout => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveWorkerAllowancesV1 {
+    pub schema: String,
+    pub host: AgentHost,
+    pub filesystem_read_checkout: bool,
+    pub filesystem_write: FilesystemWriteAllowance,
+    pub command_policy: CommandPolicy,
+    pub network: bool,
+    pub mcp: bool,
+    pub subagents: bool,
+    pub external_effects: bool,
+    pub human_approval_required: bool,
+    pub role_profile_definition_digest: Digest,
+    pub allowance_digest: Digest,
+}
+
+impl EffectiveWorkerAllowancesV1 {
+    fn compute_digest(&self) -> Digest {
+        let mut hasher = CanonicalHasher::new(b"needle-effective-worker-allowances-v1");
+        hasher.field_str(self.schema.as_str());
+        hasher.field_str(self.host.as_str());
+        hasher.field_u8(u8::from(self.filesystem_read_checkout));
+        hasher.field_u8(self.filesystem_write.tag());
+        hasher.field_u8(self.command_policy.tag());
+        hasher.field_u8(u8::from(self.network));
+        hasher.field_u8(u8::from(self.mcp));
+        hasher.field_u8(u8::from(self.subagents));
+        hasher.field_u8(u8::from(self.external_effects));
+        hasher.field_u8(u8::from(self.human_approval_required));
+        hasher.field_digest(self.role_profile_definition_digest);
+        hasher.finish()
+    }
+
+    pub fn validate(&self) -> Result<(), RoleProfileValidationError> {
+        if self.schema != EFFECTIVE_WORKER_ALLOWANCES_SCHEMA_V1
+            || !self.filesystem_read_checkout
+            || self.network
+            || self.mcp
+            || self.subagents
+            || self.external_effects
+            || !self.human_approval_required
+        {
+            return Err(RoleProfileValidationError::Policy(
+                "effective allowances exceed Needle's worker boundary",
+            ));
+        }
+        let expected = self.compute_digest();
+        if expected != self.allowance_digest {
+            return Err(RoleProfileValidationError::DigestMismatch {
+                expected,
+                actual: self.allowance_digest,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -489,11 +580,34 @@ impl RoleProfileDefinition {
         &self.profile_id
     }
 
+    pub fn effective_allowances(
+        &self,
+    ) -> Result<EffectiveWorkerAllowancesV1, RoleProfileValidationError> {
+        self.validate()?;
+        let filesystem_write = match self.filesystem_policy {
+            FilesystemPolicy::ReadOnlyCheckout => FilesystemWriteAllowance::Denied,
+            FilesystemPolicy::DisposableCheckout => FilesystemWriteAllowance::DisposableCheckout,
+        };
+        let mut allowances = EffectiveWorkerAllowancesV1 {
+            schema: EFFECTIVE_WORKER_ALLOWANCES_SCHEMA_V1.to_owned(),
+            host: self.host,
+            filesystem_read_checkout: true,
+            filesystem_write,
+            command_policy: self.command_policy,
+            network: false,
+            mcp: false,
+            subagents: false,
+            external_effects: false,
+            human_approval_required: true,
+            role_profile_definition_digest: self.definition_digest,
+            allowance_digest: Digest([0; 32]),
+        };
+        allowances.allowance_digest = allowances.compute_digest();
+        Ok(allowances)
+    }
+
     fn validate_without_digest(&self) -> Result<(), RoleProfileValidationError> {
         validate_model(&self.model)?;
-        if self.host != CodexHost::Codex {
-            return Err(RoleProfileValidationError::Host);
-        }
         if self.timeout_seconds == 0 || self.timeout_seconds > ROLE_PROFILE_MAX_TIMEOUT_SECONDS {
             return Err(RoleProfileValidationError::Timeout);
         }
@@ -566,10 +680,15 @@ impl RoleProfileDefinition {
     }
 
     fn compute_digest(&self) -> Digest {
-        let mut hasher = CanonicalHasher::new(b"needle-codex-role-profile-definition-v1");
+        let identity_domain = match self.host {
+            // Preserve every existing Codex role-profile digest byte-for-byte.
+            AgentHost::Codex => b"needle-codex-role-profile-definition-v1".as_slice(),
+            AgentHost::Antigravity => b"needle-agent-role-profile-definition-v2".as_slice(),
+        };
+        let mut hasher = CanonicalHasher::new(identity_domain);
         hasher.field_str(self.profile_id.as_str());
         hasher.field_u8(self.role.tag());
-        hasher.field_u8(0);
+        hasher.field_u8(self.host.tag());
         hasher.field_str(self.model.as_str());
         hasher.field_u8(self.reasoning.tag());
         hasher.field_u8(self.service_tier.tag());

@@ -1,11 +1,12 @@
 use super::{AppError, option_value, product_data_directory};
 use crate::product_resolver::{ProductResolver, WorkerPolicy};
 use needle_core::{
-    ChangeActionInput, ChangeId, CodexRole, Digest, LifecycleBudget, LifecyclePhase, LifecycleSpec,
-    LifecycleStatus, LifecycleWorkerProfiles, NeedExecution, NeedExecutionEnvelopeV1, NeedRequest,
-    RoleProfileProvenance, RoleProfileRevision, built_in_route_contracts, compile_need,
-    need_fragment, need_grammar_definition_digest,
+    AgentHost, ChangeActionInput, ChangeId, CodexRole, Digest, LifecycleBudget, LifecyclePhase,
+    LifecycleSpec, LifecycleStatus, LifecycleWorkerProfiles, NeedExecution,
+    NeedExecutionEnvelopeV1, NeedRequest, RoleProfileProvenance, RoleProfileRevision,
+    built_in_route_contracts, compile_need, need_fragment, need_grammar_definition_digest,
 };
+use needle_platform_antigravity::{AntigravityChangeActionProvider, inspect_installation};
 use needle_platform_codex::{
     CodexChangeActionProvider, CodexLifecycleActionAdapter, CodexWorker, HookConfig,
 };
@@ -146,16 +147,49 @@ fn run_action(
 ) -> Result<Value, AppError> {
     let role = action_role(&input);
     let profile = unique_active_profile(store, role)?;
+    validate_action_host_contract(profile.definition.host, &input)?;
     let provenance = RoleProfileProvenance::from_revision(&profile)
         .map_err(|error| AppError::Runtime(error.to_string()))?;
-    let settings = store.settings().map_err(|error| AppError::Runtime(error.to_string()))?;
-    let config = store
-        .worker_config_for_provenance(&provenance, settings.codex_executable)
-        .map_err(|error| AppError::Runtime(error.to_string()))?;
-    let provider = CodexChangeActionProvider::new(data_directory, repository_root, config);
-    let result = ActionExecutionService::new(store.clone(), provider)
-        .execute_action(envelope, repository_id, source_snapshot)
-        .map_err(|error| AppError::Runtime(error.to_string()))?;
+    let result = match profile.definition.host {
+        AgentHost::Codex => {
+            let settings =
+                store.settings().map_err(|error| AppError::Runtime(error.to_string()))?;
+            let config = store
+                .worker_config_for_provenance(&provenance, settings.codex_executable)
+                .map_err(|error| AppError::Runtime(error.to_string()))?;
+            let provider = CodexChangeActionProvider::new(data_directory, repository_root, config);
+            ActionExecutionService::new(store.clone(), provider)
+                .execute_action(envelope, repository_id, source_snapshot)
+                .map_err(|error| AppError::Runtime(error.to_string()))?
+        }
+        AgentHost::Antigravity => {
+            let installation = inspect_installation();
+            let executable = installation.cli_executable.ok_or_else(|| {
+                AppError::Runtime("Antigravity CLI `agy` was not discovered".to_owned())
+            })?;
+            let preflight = installation.cli_preflight.ok_or_else(|| {
+                AppError::Runtime(installation.cli_error.unwrap_or_else(|| {
+                    "Antigravity CLI preflight did not produce a compatibility report".to_owned()
+                }))
+            })?;
+            if !preflight.verified() {
+                return Err(AppError::Runtime(preflight.incompatibility_reason.unwrap_or_else(
+                    || "Antigravity CLI does not satisfy the required host contract".to_owned(),
+                )));
+            }
+            let config = store
+                .worker_config_for_provenance(
+                    &provenance,
+                    executable.to_string_lossy().into_owned(),
+                )
+                .map_err(|error| AppError::Runtime(error.to_string()))?;
+            let provider =
+                AntigravityChangeActionProvider::new(data_directory, repository_root, config);
+            ActionExecutionService::new(store.clone(), provider)
+                .execute_action(envelope, repository_id, source_snapshot)
+                .map_err(|error| AppError::Runtime(error.to_string()))?
+        }
+    };
     Ok(json!({
         "schema": needle_core::NEED_EXECUTION_OUTCOME_SCHEMA_V1,
         "operation_id": result.operation_id,
@@ -166,12 +200,26 @@ fn run_action(
             "validation_certificate_id": result.validation_certificate,
             "partition_manifest_id": result.partition_manifest,
             "usage": result.usage,
+            "host_usage": result.host_usage,
             "authority": result.authority,
             "completion_reused": result.completion_reused,
             "idempotent_replay": result.idempotent_replay,
             "output": result.output.to_value()?,
         }
     }))
+}
+
+fn validate_action_host_contract(
+    host: AgentHost,
+    input: &ChangeActionInput,
+) -> Result<(), AppError> {
+    if host == AgentHost::Antigravity && !matches!(input, ChangeActionInput::ReviewDiff { .. }) {
+        return Err(AppError::Runtime(format!(
+            "Antigravity action `{}` is unavailable before Gate A8; only `needle.review.diff` is implemented",
+            input.contract_id()
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -608,5 +656,38 @@ mod tests {
             &LifecycleBudget { max_worker_turns: 11, ..configured.clone() },
             &configured,
         ));
+    }
+
+    #[test]
+    fn antigravity_action_surface_is_review_only_before_gate_a8() {
+        let change = needle_core::ChangeRequest {
+            task: "Update the fixture.".to_owned(),
+            acceptance_criteria: vec!["The fixture changes.".to_owned()],
+            allowed_paths: vec![needle_core::AllowedPath {
+                path: "fixture.txt".to_owned(),
+                scope: needle_core::AllowedPathScope::Exact,
+            }],
+            artifact_ids: Vec::new(),
+            claim_ids: Vec::new(),
+            constraints: Vec::new(),
+        };
+        let patch = ChangeActionInput::PatchPropose {
+            change,
+            prior_patch: None,
+            repair_verification: None,
+        };
+        assert!(validate_action_host_contract(AgentHost::Codex, &patch).is_ok());
+        assert!(validate_action_host_contract(AgentHost::Antigravity, &patch).is_err());
+
+        let review = ChangeActionInput::ReviewDiff {
+            change_id: ChangeId::from_digest(Digest::blake3(b"change")),
+            requirements_digest: Digest::blake3(b"requirements"),
+            patch: needle_core::PatchActionInputRef {
+                artifact: needle_core::ArtifactId::new(Digest::blake3(b"patch-artifact")),
+                patch: needle_core::PatchId(Digest::blake3(b"patch")),
+            },
+            prior_review_artifacts: Vec::new(),
+        };
+        assert!(validate_action_host_contract(AgentHost::Antigravity, &review).is_ok());
     }
 }

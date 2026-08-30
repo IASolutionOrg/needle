@@ -2,10 +2,13 @@ import { useEffect, useMemo, useState, type ReactNode } from "react"
 import { AlertTriangle, Check, Clock3, Copy, ShieldCheck, X } from "lucide-react"
 
 import {
+  type ApprovalAutomationPolicy,
   type ApprovalDecision,
   type ApprovalRequest,
+  useApprovalAutomationUpdate,
   useApprovalDecision,
   useApprovals,
+  useControlPlane,
 } from "@/api"
 import {
   AlertDialog,
@@ -45,17 +48,29 @@ function compactDigest(value: string) {
 export default function ApprovalInboxPage() {
   const approvals = useApprovals()
   const decision = useApprovalDecision()
+  const control = useControlPlane()
+  const automationUpdate = useApprovalAutomationUpdate()
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [confirmation, setConfirmation] = useState<{
     request: ApprovalRequest
     decision: ApprovalDecision
   } | null>(null)
   const [now, setNow] = useState(0)
+  const [automationDraft, setAutomationDraft] = useState<ApprovalAutomationPolicy | null>(null)
+  const [automationNotice, setAutomationNotice] = useState<string | null>(null)
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [])
+
+  useEffect(() => {
+    if (control.data?.approval_automation) {
+      // The server owns the canonical policy; refresh the local editor after each CAS update.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setAutomationDraft({ ...control.data.approval_automation })
+    }
+  }, [control.data?.approval_automation])
 
   const pending = useMemo(() => approvals.data ?? [], [approvals.data])
   const selected = useMemo(
@@ -67,6 +82,20 @@ export default function ApprovalInboxPage() {
     if (!confirmation) return
     await decision.mutateAsync(confirmation)
     setConfirmation(null)
+  }
+
+  const saveAutomation = async () => {
+    if (!automationDraft || !control.data?.approval_automation_digest) return
+    setAutomationNotice(null)
+    try {
+      await automationUpdate.mutateAsync({
+        policy: automationDraft,
+        digest: control.data.approval_automation_digest,
+      })
+      setAutomationNotice("Approval automation policy saved.")
+    } catch (error) {
+      setAutomationNotice(error instanceof Error ? error.message : "Policy update failed.")
+    }
   }
 
   return (
@@ -88,6 +117,25 @@ export default function ApprovalInboxPage() {
             </TabsList>
           </Tabs>
         </div>
+        {automationDraft ? (
+          <div className="grid gap-3 border-t px-5 py-4 text-xs md:px-6">
+            <div>
+              <h2 className="text-sm font-semibold">AI approval reviewer</h2>
+              <p className="mt-1 text-muted-foreground">
+                Only requests already marked AI-eligible by the hard policy are evaluated. Errors always return to a human.
+              </p>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="grid gap-1">Mode<select className="h-8 border bg-background px-2" value={automationDraft.mode} onChange={(event) => setAutomationDraft({ ...automationDraft, mode: event.target.value as ApprovalAutomationPolicy["mode"] })}><option value="disabled">disabled</option><option value="advisory">advisory</option><option value="decide">decide</option></select></label>
+              <label className="grid gap-1">Evaluator host<input className="h-8 border bg-muted px-2 font-mono" value={automationDraft.evaluator_host} readOnly disabled /></label>
+              <label className="grid gap-1">Model<input className="h-8 border bg-background px-2 font-mono" value={automationDraft.model} onChange={(event) => setAutomationDraft({ ...automationDraft, model: event.target.value })} /></label>
+              <label className="grid gap-1">Reasoning<select className="h-8 border bg-background px-2" value={automationDraft.reasoning} onChange={(event) => setAutomationDraft({ ...automationDraft, reasoning: event.target.value as ApprovalAutomationPolicy["reasoning"] })}>{["none", "low", "medium", "high", "xhigh", "max"].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+              <label className="grid gap-1">Timeout seconds<input className="h-8 border bg-background px-2" type="number" min={5} max={120} value={automationDraft.timeout_seconds} onChange={(event) => setAutomationDraft({ ...automationDraft, timeout_seconds: Number(event.target.value) })} /></label>
+              <div className="flex items-end"><Button size="sm" className="w-full" disabled={automationUpdate.isPending || !control.data?.approval_automation_digest} onClick={() => void saveAutomation()}>Save AI policy</Button></div>
+            </div>
+            {automationNotice ? <div className="text-muted-foreground">{automationNotice}</div> : null}
+          </div>
+        ) : null}
         <Separator />
         {pending.length === 0 ? (
           <Empty className="min-h-96 rounded-none border-0">
@@ -95,7 +143,7 @@ export default function ApprovalInboxPage() {
               <ShieldCheck />
               <EmptyTitle>No pending approvals</EmptyTitle>
               <EmptyDescription>
-                Unknown commands appear here until accepted once, declined, or timed out.
+                Worker operations appear here until accepted once, declined, or timed out.
               </EmptyDescription>
             </EmptyHeader>
           </Empty>
@@ -105,7 +153,7 @@ export default function ApprovalInboxPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Status</TableHead>
-                  <TableHead>Command</TableHead>
+                  <TableHead>Operation</TableHead>
                   <TableHead>Route</TableHead>
                   <TableHead>Repository</TableHead>
                   <TableHead>Expires</TableHead>
@@ -126,7 +174,7 @@ export default function ApprovalInboxPage() {
                       </span>
                     </TableCell>
                     <TableCell className="max-w-64 truncate font-mono">
-                      {request.command_display ?? request.argv.join(" ")}
+                      {request.command_display ?? request.operation}
                     </TableCell>
                     <TableCell className="font-mono text-link">{request.route}</TableCell>
                     <TableCell className="font-mono">
@@ -162,14 +210,14 @@ export default function ApprovalInboxPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>
               {confirmation?.decision === "accept"
-                ? "Accept this exact command once?"
+                ? "Accept this exact operation once?"
                 : confirmation?.decision === "cancel"
                   ? "Cancel the worker turn?"
-                  : "Decline this command?"}
+                  : "Decline this operation?"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               The decision is bound to the displayed approval ID and payload digest. It
-              cannot be replayed if argv, cwd, or permissions change.
+              cannot be replayed if its host, profile, allowances, operation, payload, or permissions change.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -214,24 +262,31 @@ function ApprovalDetail({
         <div className="flex flex-col gap-5 p-5 text-[13px] md:p-6">
           <Definition label="Approval ID" value={request.id} copy />
           <Definition label="Payload digest" value={request.payload_digest} copy />
+          <Definition label="Host / operation" value={`${request.host} / ${request.operation}`} />
+          <Definition
+            label="Worker role / profile"
+            value={`${request.worker_role ?? "unbound"} / ${request.role_profile ? `${request.role_profile.profile_id}@${request.role_profile.revision}` : "unbound"}`}
+          />
           <Definition
             label="Thread / Turn / Item"
             value={`${request.thread_id} / ${request.turn_id} / ${request.item_id}`}
           />
           <Definition label="Classification">
             <Badge variant="outline" className="border-pending text-pending">
-              Pending user
+              {request.classification === "pending_ai_eligible" ? "Pending · AI eligible" : "Pending user"}
             </Badge>
           </Definition>
-          <Definition label="Command (direct argv)">
-            <div className="flex max-w-full gap-1 overflow-x-auto pb-2">
-              {request.argv.map((argument, index) => (
-                <code key={`${argument}-${index}`} className="border bg-muted px-2 py-1">
-                  {argument}
-                </code>
-              ))}
-            </div>
-          </Definition>
+          {request.operation === "command_execution" ? (
+            <Definition label="Command (direct argv)">
+              <div className="flex max-w-full gap-1 overflow-x-auto pb-2">
+                {request.argv.map((argument, index) => (
+                  <code key={`${argument}-${index}`} className="border bg-muted px-2 py-1">
+                    {argument}
+                  </code>
+                ))}
+              </div>
+            </Definition>
+          ) : null}
           <Definition label="cwd (inside checkout)" value={request.cwd} />
           <Definition label="Reason" value={request.reason ?? "No reason supplied"} />
           <Definition label="Requested permissions">
@@ -246,6 +301,29 @@ function ApprovalDetail({
               <li>Network: {request.requested_permissions.network ? "requested" : "none"}</li>
             </ul>
           </Definition>
+          {request.automation_advice ? (
+            <Definition label="AI advice">
+              <div className="grid gap-1 border bg-muted/30 p-3 text-foreground">
+                <span>Decision: <strong>{request.automation_advice.decision ? "allow (1)" : "disallow (0)"}</strong></span>
+                <span>Evaluator: {request.automation_advice.model} / {request.automation_advice.reasoning}</span>
+                <span>Policy: {compactDigest(request.automation_advice.policy_digest)}</span>
+              </div>
+            </Definition>
+          ) : null}
+          {request.allowances ? (
+            <Definition label="Effective allowances">
+              <ul className="list-inside list-disc border bg-muted/30 p-3 text-foreground">
+                <li>Read checkout: {String(request.allowances.filesystem_read_checkout)}</li>
+                <li>Write scope: {request.allowances.filesystem_write}</li>
+                <li>Commands: {request.allowances.command_policy}</li>
+                <li>Network: {String(request.allowances.network)}</li>
+                <li>MCP: {String(request.allowances.mcp)}</li>
+                <li>Subagents: {String(request.allowances.subagents)}</li>
+                <li>External effects: {String(request.allowances.external_effects)}</li>
+                <li>Digest: {compactDigest(request.allowances.allowance_digest)}</li>
+              </ul>
+            </Definition>
+          ) : null}
           <Definition label="Route" value={request.route} />
           <Definition label="Repository" value={request.repository_id} />
           <Definition
@@ -256,7 +334,7 @@ function ApprovalDetail({
 
           <div className="flex items-start gap-3 border border-pending bg-pending/5 p-3 text-pending">
             <AlertTriangle className="mt-0.5 shrink-0" />
-            <span>Any change to argv, cwd, or permissions invalidates this decision.</span>
+            <span>Any change to host, profile, allowances, operation, argv, cwd, or permissions invalidates this decision.</span>
           </div>
 
           <div className="grid gap-2 sm:grid-cols-3">
@@ -292,7 +370,7 @@ function ApprovalDetail({
                 <span className="absolute top-0.5 -left-[1.6rem] size-3 rounded-full bg-pending" />
                 <div className="font-medium text-pending">Requested</div>
                 <div className="text-muted-foreground">
-                  Command requested by Codex App Server
+                  {request.operation} requested by {request.host}
                 </div>
               </li>
               <li className="relative pb-5">
@@ -309,24 +387,6 @@ function ApprovalDetail({
             </ol>
           </div>
 
-          <Separator />
-          <div>
-            <h3 className="mb-3 text-sm font-semibold">Auto-approval policy</h3>
-            <div className="grid gap-2 border p-3 sm:grid-cols-2">
-              {[
-                "Trusted direct cargo test only",
-                "Exact TestPlan argv",
-                "Isolated target/temp writes only",
-                "No network",
-                "Maximum 2 executions",
-              ].map((item) => (
-                <div key={item} className="flex items-center gap-2">
-                  <Check className="text-success" />
-                  {item}
-                </div>
-              ))}
-            </div>
-          </div>
         </div>
       </ScrollArea>
     </section>

@@ -8,8 +8,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream};
 use needle_core::{
-    ApprovalDecision, ApprovalDecisionSource, CapabilityMode, ChangeId, Digest,
-    EvidenceFailurePolicy, ModelPolicy, PatchOperation, WorkerProfile,
+    ApprovalAutomationPolicy, ApprovalDecision, ApprovalDecisionSource, CapabilityMode, ChangeId,
+    Digest, EvidenceFailurePolicy, ModelPolicy, PatchOperation, WorkerProfile,
     built_in_predicate_contracts, built_in_route_contracts, built_in_route_plans,
 };
 use needle_platform_codex::CodexWorker;
@@ -246,6 +246,7 @@ pub(crate) fn run(
             .route("/api/v1/approvals/{id}/decision", post(decide_approval))
             .route("/api/v1/routes/{id}/state", post(set_route_state))
             .route("/api/v1/settings", post(set_settings))
+            .route("/api/v1/approval-automation", post(set_approval_automation))
             .route("/api/v1/model-policy", post(set_model_policy))
             .route("/api/v1/needs", get(list_needs))
             .route("/api/v1/needs/{id}", get(get_need))
@@ -402,6 +403,8 @@ async fn control_plane(State(state): State<AppState>) -> Response {
         routes = built_in_routes();
     }
     let settings = state.store.settings().ok();
+    let approval_automation = state.store.approval_automation_policy().ok();
+    let approval_automation_digest = approval_automation.as_ref().map(|value| value.digest());
     let settings_digest = settings.as_ref().and_then(|value| configuration_digest(value).ok());
     let cache = match state.store.cache_records() {
         Ok(cache) => cache,
@@ -558,6 +561,8 @@ async fn control_plane(State(state): State<AppState>) -> Response {
             ,"resolver_concurrency": settings.multi_need_policy.resolver_concurrency
         })),
         "settings_digest": settings_digest,
+        "approval_automation": approval_automation,
+        "approval_automation_digest": approval_automation_digest,
         "cache": cache.into_iter().map(|record| serde_json::json!({
             "identity_digest": record.identity_digest,
             "logical_digest": record.logical_digest,
@@ -1267,6 +1272,35 @@ async fn set_settings(
         }
         Err(needle_runtime::StoreError::DefinitionDigest(_)) => {
             api_error(StatusCode::BAD_REQUEST, "settings are invalid")
+        }
+        Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+async fn set_approval_automation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(policy): Json<ApprovalAutomationPolicy>,
+) -> Response {
+    let current = match state.store.approval_automation_policy() {
+        Ok(policy) => policy,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    if let Err(error) = require_if_match(&headers, &current.digest().to_string()) {
+        return if_match_response(error, "approval automation policy changed");
+    }
+    if let Err(error) = policy.validate() {
+        return api_error(StatusCode::BAD_REQUEST, error);
+    }
+    match state.store.compare_and_set_approval_automation_policy(current.digest(), &policy) {
+        Ok(true) => Json(serde_json::json!({
+            "policy": policy,
+            "policy_digest": policy.digest()
+        }))
+        .into_response(),
+        Ok(false) => if_match_response(IfMatchError::Changed, "approval automation policy changed"),
+        Err(StoreError::DefinitionDigest(_)) => {
+            api_error(StatusCode::BAD_REQUEST, "approval automation policy is invalid")
         }
         Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }

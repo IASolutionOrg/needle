@@ -12,7 +12,7 @@ use std::process::Command;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct CompactWorkerResponse {
+pub struct CompactWorkerResponse {
     schema: String,
     artifacts: Vec<CompactGroup>,
     test_plan: Option<CompactTestPlan>,
@@ -20,7 +20,7 @@ pub(super) struct CompactWorkerResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SemanticCompactWorkerResponse {
+pub struct SemanticCompactWorkerResponse {
     schema: String,
     artifacts: Vec<SemanticWorkerArtifact>,
 }
@@ -65,7 +65,7 @@ struct CompactTestPlan {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct LegacyCompactWorkerResponse {
+pub struct LegacyCompactWorkerResponse {
     g: Vec<LegacyCompactGroup>,
     c: Vec<String>,
 }
@@ -86,24 +86,24 @@ struct GroupKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct GroupDiagnostic {
-    pub(super) index: Option<usize>,
-    pub(super) code: String,
+pub struct GroupDiagnostic {
+    pub index: Option<usize>,
+    pub code: String,
 }
 
 #[derive(Default)]
-pub(super) struct NormalizedResponse {
+pub struct NormalizedResponse {
     groups: BTreeMap<GroupKey, BTreeSet<String>>,
     commands: BTreeSet<String>,
     source_schema: Option<String>,
     test_plan: Option<TestPlan>,
     semantic_artifacts: Vec<SemanticWorkerArtifact>,
-    pub(super) diagnostics: Vec<GroupDiagnostic>,
-    pub(super) discarded_facts: u32,
+    pub diagnostics: Vec<GroupDiagnostic>,
+    pub discarded_facts: u32,
 }
 
 impl NormalizedResponse {
-    pub(super) fn schema_failure(error: String) -> Self {
+    pub fn schema_failure(error: String) -> Self {
         Self {
             diagnostics: vec![GroupDiagnostic {
                 index: None,
@@ -113,11 +113,11 @@ impl NormalizedResponse {
         }
     }
 
-    pub(super) fn has_facts(&self) -> bool {
+    pub fn has_facts(&self) -> bool {
         self.groups.values().any(|facts| !facts.is_empty()) || self.test_plan.is_some()
     }
 
-    pub(super) fn record_missing_requested_kinds(&mut self, requested: &[ArtifactKind]) {
+    pub fn record_missing_requested_kinds(&mut self, requested: &[ArtifactKind]) {
         for kind in requested {
             if self.has_requested_kind(kind) {
                 continue;
@@ -129,7 +129,7 @@ impl NormalizedResponse {
         }
     }
 
-    pub(super) fn discard_unrequested_kinds(&mut self, requested: &[ArtifactKind]) {
+    pub fn discard_unrequested_kinds(&mut self, requested: &[ArtifactKind]) {
         let requested_names = requested.iter().map(|kind| kind.0.as_str()).collect::<BTreeSet<_>>();
         let mut discarded = self
             .semantic_artifacts
@@ -160,14 +160,14 @@ impl NormalizedResponse {
         }
     }
 
-    pub(super) fn record_unrequested_kind(&mut self, kind: &str) {
+    pub fn record_unrequested_kind(&mut self, kind: &str) {
         let code = format!("unrequested_artifact_discarded:{}", diagnostic_atom(kind, 64));
         if !self.diagnostics.iter().any(|diagnostic| diagnostic.code == code) {
             self.diagnostics.push(GroupDiagnostic { index: None, code });
         }
     }
 
-    pub(super) fn missing_requested_kinds(&self, requested: &[ArtifactKind]) -> Vec<String> {
+    pub fn missing_requested_kinds(&self, requested: &[ArtifactKind]) -> Vec<String> {
         requested
             .iter()
             .filter(|kind| !self.has_requested_kind(kind))
@@ -180,7 +180,7 @@ impl NormalizedResponse {
             || self.groups.keys().any(|key| key.kind.as_str() == kind.0.as_str())
     }
 
-    pub(super) fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: Self) {
         let merged_test_plan = match (&self.test_plan, &other.test_plan) {
             (None, Some(value)) => Some(value.clone()),
             (Some(left), Some(right)) if left != right => None,
@@ -206,9 +206,7 @@ impl NormalizedResponse {
         self.discarded_facts = self.discarded_facts.saturating_add(other.discarded_facts);
     }
 
-    pub(super) fn artifact_result(
-        &self,
-    ) -> Option<(String, Vec<WorkerArtifact>, Option<TestPlan>)> {
+    pub fn artifact_result(&self) -> Option<(String, Vec<WorkerArtifact>, Option<TestPlan>)> {
         let schema_id = self.source_schema.clone()?;
         let artifacts = self
             .groups
@@ -223,11 +221,11 @@ impl NormalizedResponse {
         Some((schema_id, artifacts, self.test_plan.clone()))
     }
 
-    pub(super) fn semantic_artifacts(&self) -> &[SemanticWorkerArtifact] {
+    pub fn semantic_artifacts(&self) -> &[SemanticWorkerArtifact] {
         &self.semantic_artifacts
     }
 
-    pub(super) fn debug_snapshot(&self) -> Value {
+    pub fn debug_snapshot(&self) -> Value {
         json!({
             "accepted_artifacts": self.groups.iter().map(|(key, facts)| json!({
                 "kind": key.kind.as_str(),
@@ -248,7 +246,7 @@ impl NormalizedResponse {
         })
     }
 
-    pub(super) fn into_need_result(self, repository_root: &Path) -> Result<NeedResult, String> {
+    pub fn into_need_result(self, repository_root: &Path) -> Result<NeedResult, String> {
         let mut claims = Vec::new();
         let mut evidence = Vec::new();
         for (group_index, (key, facts)) in self.groups.into_iter().enumerate() {
@@ -285,7 +283,7 @@ impl NormalizedResponse {
     }
 }
 
-pub(super) fn normalize_response(
+pub fn normalize_response(
     response: CompactWorkerResponse,
     repository_root: &Path,
 ) -> NormalizedResponse {
@@ -366,7 +364,7 @@ pub(super) fn normalize_response(
     output
 }
 
-pub(super) fn normalize_semantic_response(
+pub fn normalize_semantic_response(
     response: SemanticCompactWorkerResponse,
     repository_root: &Path,
 ) -> NormalizedResponse {
@@ -389,6 +387,60 @@ pub(super) fn normalize_semantic_response(
         }
     }
     output
+}
+
+pub fn normalize_worker_output(
+    mut response: Value,
+    repository_root: &Path,
+    requested: &[ArtifactKind],
+) -> NormalizedResponse {
+    let unrequested = discard_unrequested_semantic_values(&mut response, requested);
+    let mut normalized =
+        match serde_json::from_value::<SemanticCompactWorkerResponse>(response.clone()) {
+            Ok(response) => normalize_semantic_response(response, repository_root),
+            Err(semantic_error) => {
+                match serde_json::from_value::<CompactWorkerResponse>(response.clone()) {
+                    Ok(response) => normalize_response(response, repository_root),
+                    Err(_) => match serde_json::from_value::<LegacyCompactWorkerResponse>(response)
+                    {
+                        Ok(response) => normalize_legacy_response(response, repository_root),
+                        Err(_) => NormalizedResponse::schema_failure(semantic_error.to_string()),
+                    },
+                }
+            }
+        };
+    for kind in unrequested {
+        normalized.record_unrequested_kind(&kind);
+    }
+    normalized
+}
+
+fn discard_unrequested_semantic_values(
+    response: &mut Value,
+    requested: &[ArtifactKind],
+) -> BTreeSet<String> {
+    if requested.is_empty()
+        || response.get("schema").and_then(Value::as_str)
+            != Some(needle_core::SEMANTIC_ARTIFACT_RESULT_SCHEMA_ID)
+    {
+        return BTreeSet::new();
+    }
+    let Some(artifacts) = response.get_mut("artifacts").and_then(Value::as_array_mut) else {
+        return BTreeSet::new();
+    };
+    let mut discarded = BTreeSet::new();
+    artifacts.retain(|artifact| {
+        let Some(kind) = artifact.get("kind").and_then(Value::as_str) else {
+            return true;
+        };
+        if requested.iter().any(|requested| requested.0 == kind) {
+            true
+        } else {
+            discarded.insert(kind.to_owned());
+            false
+        }
+    });
+    discarded
 }
 
 fn normalize_semantic_artifact(
@@ -646,7 +698,7 @@ fn adapt_semantic_artifact(artifact: &SemanticWorkerArtifact, output: &mut Norma
     }
 }
 
-pub(super) fn normalize_legacy_response(
+pub fn normalize_legacy_response(
     response: LegacyCompactWorkerResponse,
     repository_root: &Path,
 ) -> NormalizedResponse {
@@ -730,7 +782,7 @@ fn contains_unsafe_text(value: &str) -> bool {
             .any(|marker| value.contains(marker))
 }
 
-pub(super) fn worker_output_schema(requested: &[ArtifactKind]) -> Value {
+pub fn worker_output_schema(requested: &[ArtifactKind]) -> Value {
     let kinds = if requested.is_empty() {
         vec!["code-location".to_owned(), "behavior-trace".to_owned(), "test-plan".to_owned()]
     } else {
@@ -799,7 +851,7 @@ pub(super) fn worker_output_schema(requested: &[ArtifactKind]) -> Value {
     schema
 }
 
-pub(super) fn semantic_worker_output_schema_for_scenario(
+pub fn semantic_worker_output_schema_for_scenario(
     requested: &[ArtifactKind],
     runtime_scenario: Option<&str>,
 ) -> Value {
@@ -960,7 +1012,7 @@ fn bounded_strings(min: usize, max: usize, item_max: usize) -> Value {
     })
 }
 
-pub(super) fn repair_prompt(diagnostics: &[GroupDiagnostic]) -> String {
+pub fn repair_prompt(diagnostics: &[GroupDiagnostic]) -> String {
     let codes = diagnostics
         .iter()
         .map(|item| match item.index {
@@ -972,10 +1024,7 @@ pub(super) fn repair_prompt(diagnostics: &[GroupDiagnostic]) -> String {
     format!("repair_artifact invalid={codes}; return the full corrected artifact JSON only")
 }
 
-pub(super) fn should_repair(
-    policy: EvidenceFailurePolicy,
-    normalized: &NormalizedResponse,
-) -> bool {
+pub fn should_repair(policy: EvidenceFailurePolicy, normalized: &NormalizedResponse) -> bool {
     !normalized.has_facts()
         || (policy == EvidenceFailurePolicy::RepairOnce
             && normalized

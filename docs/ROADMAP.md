@@ -97,6 +97,40 @@ required by a second host. The contract must normalize:
 The existing runtime `WorkerExecutor` seam is not by itself proof that another
 host satisfies this contract.
 
+Phase 10-A/B is now implemented offline for Antigravity. The host-neutral contract
+binds an adapter revision and capability set to a digest and normalizes terminal
+status, structured output, usage, tool-event projections, sandbox state, and
+cleanup. The Antigravity adapter validates the official `agy` headless flags,
+consumes bounded NDJSON, rejects unsafe `always-proceed` permission mode, runs in
+a disposable checkout with `--sandbox`, and supports bounded cancellation. An
+offline simulator covers success, cancellation, cleanup, argument policy,
+unsafe-permission rejection, and conversion into the existing Explore artifact
+contract. The production resolver now has an explicit immutable-profile host
+dispatcher: Codex profiles use Codex, while Antigravity profiles use the
+user-installed `agy` binary. There is no implicit fallback. This remains Shadow
+conformance evidence because Antigravity profile activation and lifecycle/action
+execution are still gated on Gate A8.
+
+The first two bounded live Antigravity attempts failed closed after native directory requests were
+soft-denied and produced no artifact. A later transcript audit corrected the diagnosis: those native
+tools requested paths outside the isolated checkout, so the attempts did not prove that Antigravity
+cannot perform a correctly bound in-checkout read. The adapter now binds the exact checkout through
+process cwd, `--add-dir`, and a trusted repository-relative prompt. The obsolete global
+`read_file(...)` preflight has been removed; no host tool taxonomy moved into Needle. A fresh
+provider-backed Explore smoke has now passed with one turn, a correct `src/lib.rs` artifact, unchanged
+active checkout, and successful cleanup. Gate A8 remains open for the remaining action/lifecycle,
+accounting, and cross-host quality evidence, so Antigravity activation and fallback remain disabled.
+
+The control plane now also projects immutable role profiles into canonical, digest-addressed worker
+allowances and displays them before activation. A host-neutral Approval Inbox binds requests and
+decisions to host, role, profile, allowances, operation, and bounded payload. Configurable AI
+approval automation is implemented behind a safe default-off policy: advisory and decision modes
+accept only hard-policy read-only command candidates, run an isolated evaluator, require exact
+`0`/`1` output, and fall back to the human inbox on every uncertainty. Provider-backed validation of
+the binary evaluator contract now covers both outcomes: Luna/low returned the exact integer `1` for
+a safe read-only case and `0` for an ambiguous command, with no tool activity or checkout mutation.
+The policy remains default-off, and these bounded evaluator cases are not Gate A8 evidence.
+
 ## Milestone 5: Multi-host orchestration
 
 Enable orchestration through a non-Codex host only after that host passes the

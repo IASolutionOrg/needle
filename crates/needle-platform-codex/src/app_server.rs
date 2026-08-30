@@ -1,7 +1,9 @@
 use needle_core::{
-    ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, CommandClassification,
-    CommandExecutionEvidence, Digest, ReadOnlyCommandPolicy, RequestedPermissions,
-    TestCommandPolicy, TestPlan, WorkerConfig, WorkerObservationTrace,
+    AgentHost, ApprovalAutomationAdvice, ApprovalAutomationMode, ApprovalAutomationPolicy,
+    ApprovalDecision, ApprovalDecisionSource, ApprovalOperation, ApprovalPayloadDigestInputV2,
+    ApprovalRequest, CommandClassification, CommandExecutionEvidence, Digest,
+    ReadOnlyCommandPolicy, RequestedPermissions, RoleProfileProvenance, TestCommandPolicy,
+    TestPlan, WorkerConfig, WorkerObservationTrace,
 };
 use needle_runtime::{
     ApprovalBroker, ApprovalContext, RuntimeStore, command_evidence_from_output, parse_direct_argv,
@@ -10,6 +12,7 @@ use needle_runtime::{
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -19,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod main_session;
 
@@ -433,7 +436,31 @@ impl AppServerSession {
                     policy.maximum_executions_per_worker.saturating_add(1);
             }
         }
+        let (worker_role, role_profile, allowances) = if let Some(provenance) =
+            config.role_profile_provenance.as_ref()
+        {
+            provenance.validate().map_err(|error| error.to_string())?;
+            let revision = store
+                .read_role_profile_revision(&provenance.profile_id, provenance.revision)
+                .map_err(|error| error.to_string())?;
+            let actual = RoleProfileProvenance::from_revision(&revision)
+                .map_err(|error| error.to_string())?;
+            if &actual != provenance || revision.definition.host != AgentHost::Codex {
+                return Err(
+                    "Codex approval context does not match its immutable role profile".to_owned()
+                );
+            }
+            let allowances =
+                revision.definition.effective_allowances().map_err(|error| error.to_string())?;
+            (Some(revision.definition.role), Some(actual), Some(allowances))
+        } else {
+            (None, None, None)
+        };
         let approval_context = ApprovalContext {
+            host: AgentHost::Codex,
+            worker_role,
+            role_profile,
+            allowances,
             route: route.to_owned(),
             repository_id,
             checkout_root: checkout_root.to_path_buf(),
@@ -442,6 +469,7 @@ impl AppServerSession {
             test_plan,
             verifier_test_plans: verifier_test_plans.clone(),
             test_execution_available: test_execution.available,
+            ai_approval_eligible: sandbox_mode == "read-only",
         };
         let broker = ApprovalBroker::new(test_policies.into_values().collect())
             .with_read_only_policies(
@@ -556,17 +584,35 @@ impl AppServerSession {
         timeout: Duration,
         cancellation: Option<&AtomicBool>,
     ) -> Result<AppServerTurn, AppServerTurnFailure> {
-        let request_id = self.send_request(
-            "turn/start",
-            json!({
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": prompt}],
-                "cwd": self.approval_context.checkout_root,
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "outputSchema": output_schema
-            }),
-        )?;
+        self.run_turn_cancellable_inner(prompt, Some(output_schema), timeout, cancellation)
+    }
+
+    fn run_turn_cancellable_without_schema(
+        &mut self,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<AppServerTurn, AppServerTurnFailure> {
+        self.run_turn_cancellable_inner(prompt, None, timeout, None)
+    }
+
+    fn run_turn_cancellable_inner(
+        &mut self,
+        prompt: &str,
+        output_schema: Option<&Value>,
+        timeout: Duration,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<AppServerTurn, AppServerTurnFailure> {
+        let mut parameters = json!({
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "cwd": self.approval_context.checkout_root,
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user"
+        });
+        if let Some(output_schema) = output_schema {
+            parameters["outputSchema"] = output_schema.clone();
+        }
+        let request_id = self.send_request("turn/start", parameters)?;
         let response = self.wait_for_response(request_id, Duration::from_secs(30))?;
         let turn_id = response
             .pointer("/result/turn/id")
@@ -831,9 +877,19 @@ impl AppServerSession {
             .and_then(Value::as_str)
             .ok_or_else(|| "approval request has no turn id".to_owned())?
             .to_owned();
+        let cwd_string = cwd.to_string_lossy();
         let payload_digest =
-            ApprovalRequest::compute_payload_digest(&argv, &cwd.to_string_lossy(), &permissions)
-                .map_err(|error| error.to_string())?;
+            ApprovalRequest::compute_payload_digest_v2(ApprovalPayloadDigestInputV2 {
+                host: self.approval_context.host,
+                worker_role: self.approval_context.worker_role,
+                role_profile: self.approval_context.role_profile.as_ref(),
+                allowances: self.approval_context.allowances.as_ref(),
+                operation: ApprovalOperation::CommandExecution,
+                argv: &argv,
+                cwd: &cwd_string,
+                requested_permissions: &permissions,
+            })
+            .map_err(|error| error.to_string())?;
         let id =
             params.get("approvalId").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(
                 || {
@@ -843,7 +899,12 @@ impl AppServerSession {
                     .to_hex()
                 },
             );
-        let request = ApprovalRequest {
+        let mut request = ApprovalRequest {
+            host: self.approval_context.host,
+            worker_role: self.approval_context.worker_role,
+            role_profile: self.approval_context.role_profile.clone(),
+            allowances: self.approval_context.allowances.clone(),
+            operation: ApprovalOperation::CommandExecution,
             id: id.clone(),
             protocol_request_id: protocol_id,
             protocol_approval_id: params
@@ -855,7 +916,7 @@ impl AppServerSession {
             item_id: item_id.clone(),
             argv,
             command_display: (!command.is_empty()).then(|| command.to_owned()),
-            cwd: cwd.to_string_lossy().into_owned(),
+            cwd: cwd_string.into_owned(),
             reason: params.get("reason").and_then(Value::as_str).map(str::to_owned),
             requested_permissions: permissions,
             route: self.approval_context.route.clone(),
@@ -864,6 +925,8 @@ impl AppServerSession {
             expires_unix_ms: now_ms().saturating_add(APPROVAL_TIMEOUT_SECONDS * 1000),
             classification,
             payload_digest,
+            payload_digest_revision: 2,
+            automation_advice: None,
             decision: None,
             decision_source: None,
             decided_unix_ms: None,
@@ -876,6 +939,47 @@ impl AppServerSession {
                     .decide_approval(&id, decision, source, payload_digest)
                     .map_err(|error| error.to_string())?;
                 decision
+            }
+            None if matches!(request.classification, CommandClassification::PendingAiEligible) => {
+                let policy =
+                    self.store.approval_automation_policy().map_err(|error| error.to_string())?;
+                if policy.mode == ApprovalAutomationMode::Disabled {
+                    self.wait_for_web_decision(&request)?
+                } else {
+                    match self.evaluate_approval_with_codex(&request, &policy) {
+                        Ok(advice) => {
+                            match self.store.record_approval_automation_advice(
+                                &id,
+                                payload_digest,
+                                advice.clone(),
+                            ) {
+                                Ok(updated) => {
+                                    request = updated;
+                                    if policy.mode == ApprovalAutomationMode::Decide {
+                                        let decision = if advice.decision {
+                                            ApprovalDecision::Accept
+                                        } else {
+                                            ApprovalDecision::Decline
+                                        };
+                                        self.store
+                                            .decide_approval(
+                                                &id,
+                                                decision,
+                                                ApprovalDecisionSource::AiPolicy,
+                                                payload_digest,
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                        decision
+                                    } else {
+                                        self.wait_for_web_decision(&request)?
+                                    }
+                                }
+                                Err(_) => self.wait_for_web_decision(&request)?,
+                            }
+                        }
+                        Err(_) => self.wait_for_web_decision(&request)?,
+                    }
+                }
             }
             None if self.pending_approval_mode == PendingApprovalMode::FailFast => {
                 self.store
@@ -908,6 +1012,14 @@ impl AppServerSession {
             return Err(rejection);
         }
         Ok(())
+    }
+
+    fn evaluate_approval_with_codex(
+        &self,
+        request: &ApprovalRequest,
+        policy: &ApprovalAutomationPolicy,
+    ) -> Result<ApprovalAutomationAdvice, String> {
+        run_approval_evaluator(&self.store, None, request, policy)
     }
 
     fn wait_for_web_decision(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, String> {
@@ -1190,6 +1302,122 @@ impl Drop for AppServerSession {
         if !self.cleaned {
             let _ = self.cleanup_inner();
         }
+    }
+}
+
+fn run_approval_evaluator(
+    store: &RuntimeStore,
+    codex_home: Option<&Path>,
+    request: &ApprovalRequest,
+    policy: &ApprovalAutomationPolicy,
+) -> Result<ApprovalAutomationAdvice, String> {
+    policy.validate().map_err(str::to_owned)?;
+    if !matches!(request.classification, CommandClassification::PendingAiEligible)
+        || request.operation != ApprovalOperation::CommandExecution
+        || request.allowances.as_ref().is_none_or(|allowances| allowances.validate().is_err())
+    {
+        return Err("approval request is not eligible for AI review".to_owned());
+    }
+    let canonical_checkout = fs::canonicalize(&request.repository_root)
+        .map_err(|error| format!("cannot bind approval checkout: {error}"))?;
+    let argv = redact_approval_review_paths(&request.argv, &canonical_checkout)?;
+    let read_paths = redact_approval_review_paths(
+        &request.requested_permissions.read_paths,
+        &canonical_checkout,
+    )?;
+    let input = json!({
+        "schema": "needle.approval-review-input/1",
+        "host": request.host,
+        "worker_role": request.worker_role,
+        "operation": request.operation,
+        "argv": argv,
+        "cwd_scope": "isolated_read_only_checkout",
+        "requested_permissions": {
+            "write_paths": request.requested_permissions.write_paths,
+            "read_paths": read_paths,
+            "network": request.requested_permissions.network
+        },
+        "allowances": request.allowances,
+        "payload_digest": request.payload_digest
+    });
+    let input_bytes = serde_json::to_vec(&input).map_err(|error| error.to_string())?;
+    if input_bytes.len() > 8 * 1024 {
+        return Err("approval review input exceeds its byte limit".to_owned());
+    }
+    let input_digest = Digest::blake3(&input_bytes);
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let root =
+        env::temp_dir().join(format!("needle-approval-evaluator-{}-{suffix}", std::process::id()));
+    fs::create_dir(&root)
+        .map_err(|error| format!("cannot create approval evaluator directory: {error}"))?;
+    let target = root.join("target");
+    let temp = root.join("temp");
+    let result = (|| {
+        fs::create_dir(&target).map_err(|error| error.to_string())?;
+        fs::create_dir(&temp).map_err(|error| error.to_string())?;
+        let settings = store.settings().map_err(|error| error.to_string())?;
+        let config = WorkerConfig {
+            executable: settings.codex_executable,
+            model: policy.model.clone(),
+            reasoning: policy.reasoning.clone(),
+            service_tier: None,
+            timeout_seconds: policy.timeout_seconds,
+            max_turns: 1,
+            evidence_failure_policy: settings.evidence_failure_policy,
+            role_profile_provenance: None,
+        };
+        let mut evaluator = AppServerSession::start(
+            &config,
+            codex_home,
+            true,
+            "You are a binary authorization reviewer. Use only the supplied JSON data. Do not call tools. Return the JSON integer 1 only when the operation is clearly non-destructive and entirely inside every declared allowance; otherwise return 0. Return no prose.",
+            &root,
+            &target,
+            &temp,
+            input_digest,
+            Digest::blake3(b"needle-approval-evaluator-empty-workspace"),
+            "approval.review",
+            None,
+            false,
+            store.clone(),
+        )?;
+        evaluator.fail_fast_on_pending_approvals();
+        let turn = evaluator.run_turn_cancellable_without_schema(
+            &String::from_utf8(input_bytes).expect("serialized JSON is UTF-8"),
+            Duration::from_secs(policy.timeout_seconds),
+        );
+        let cleanup = evaluator.cleanup();
+        let turn = turn.map_err(|error| error.diagnostic)?;
+        cleanup?;
+        if !turn.command_evidence.is_empty()
+            || !turn.test_evidence.is_empty()
+            || !turn.observation_trace.observed_files.is_empty()
+            || turn.file_change_approvals_granted != 0
+        {
+            return Err("approval evaluator attempted to use a tool".to_owned());
+        }
+        let decision = match turn.response.as_u64() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => return Err("approval evaluator returned output other than 0 or 1".to_owned()),
+        };
+        Ok(ApprovalAutomationAdvice {
+            policy_digest: policy.digest(),
+            input_digest,
+            evaluator_host: policy.evaluator_host,
+            model: policy.model.clone(),
+            reasoning: policy.reasoning.clone(),
+            decision,
+            input_tokens: turn.input_tokens,
+            output_tokens: turn.output_tokens,
+            evaluated_unix_ms: now_ms(),
+        })
+    })();
+    let cleanup = fs::remove_dir_all(&root);
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(format!("approval evaluator cleanup failed: {error}")),
+        (Err(error), _) => Err(error),
     }
 }
 
@@ -1938,11 +2166,38 @@ fn get_content_path(argv: &[String]) -> Option<&str> {
     path
 }
 
+fn redact_approval_review_paths(
+    values: &[String],
+    canonical_checkout: &Path,
+) -> Result<Vec<String>, String> {
+    values
+        .iter()
+        .map(|value| {
+            let path = Path::new(value);
+            if !path.is_absolute() {
+                return Ok(value.clone());
+            }
+            let canonical = fs::canonicalize(path)
+                .map_err(|error| format!("cannot bind approval path: {error}"))?;
+            let relative = canonical
+                .strip_prefix(canonical_checkout)
+                .map_err(|_| "approval path escapes the isolated checkout".to_owned())?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            Ok(if relative.is_empty() {
+                "$CHECKOUT".to_owned()
+            } else {
+                format!("$CHECKOUT/{relative}")
+            })
+        })
+        .collect()
+}
+
 fn command_classification_name(classification: &CommandClassification) -> &'static str {
     match classification {
         CommandClassification::AutoApprovedTest { .. } => "auto_approved_test",
         CommandClassification::AutoApprovedReadOnly { .. } => "auto_approved_read_only",
         CommandClassification::PendingUser => "pending_user",
+        CommandClassification::PendingAiEligible => "pending_ai_eligible",
         CommandClassification::RejectedFileChange => "rejected_file_change",
         CommandClassification::RejectedNetwork => "rejected_network",
         CommandClassification::RejectedUnparseable => "rejected_unparseable",
@@ -2199,6 +2454,296 @@ mod tests {
         assert_eq!(parsed.write_paths, vec!["C:/target"]);
         assert_eq!(parsed.read_paths, vec!["C:/repo"]);
         assert!(parsed.network);
+    }
+
+    #[test]
+    fn approval_review_redacts_checkout_paths_and_rejects_outside_paths() {
+        let base = env::temp_dir().join(format!(
+            "needle-approval-redaction-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let checkout = base.join("checkout");
+        let outside = base.join("outside");
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let source = checkout.join("src/lib.rs");
+        fs::write(&source, b"fn answer() {}\n").unwrap();
+        let canonical_checkout = fs::canonicalize(&checkout).unwrap();
+
+        let redacted = redact_approval_review_paths(
+            &["unknown-tool".to_owned(), source.to_string_lossy().into_owned()],
+            &canonical_checkout,
+        )
+        .unwrap();
+        assert_eq!(redacted, vec!["unknown-tool", "$CHECKOUT/src/lib.rs"]);
+        assert!(
+            redact_approval_review_paths(
+                &[outside.to_string_lossy().into_owned()],
+                &canonical_checkout,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires one explicitly approved Luna provider session"]
+    fn live_approval_evaluator_returns_one_for_safe() {
+        let (fixture, policy, report) = live_approval_evaluator_setup(
+            "NEEDLE_APPROVAL_AI_ALLOW_REPORT",
+            "allow evidence must be append-only",
+        );
+        let advice = run_live_approval_evaluator_case(
+            &fixture,
+            &policy,
+            "allow",
+            &["git", "status"],
+            true,
+            &report,
+        );
+        assert!(advice.decision, "safe evaluator case returned 0");
+    }
+
+    #[test]
+    #[ignore = "requires one explicitly approved Luna provider session"]
+    fn live_approval_evaluator_returns_zero_for_ambiguous() {
+        let (fixture, policy, report) = live_approval_evaluator_setup(
+            "NEEDLE_APPROVAL_AI_DISALLOW_REPORT",
+            "disallow evidence must be append-only",
+        );
+        let advice = run_live_approval_evaluator_case(
+            &fixture,
+            &policy,
+            "disallow",
+            &["unknown-tool", "delete-all"],
+            false,
+            &report,
+        );
+        assert!(!advice.decision, "ambiguous evaluator case returned 1");
+    }
+
+    fn live_approval_evaluator_setup(
+        report_environment: &str,
+        report_diagnostic: &str,
+    ) -> (LiveApprovalEvaluatorFixture, ApprovalAutomationPolicy, PathBuf) {
+        const APPROVAL: &str = "APPROVO_1_SESSIONE_ANTIGRAVITY_E_2_SESSIONI_LUNA_SENZA_TOKEN_CAP";
+        assert_eq!(env::var("NEEDLE_APPROVAL_AI_LIVE_APPROVAL").as_deref(), Ok(APPROVAL));
+        let executable =
+            env::var("NEEDLE_APPROVAL_AI_CODEX").expect("NEEDLE_APPROVAL_AI_CODEX is required");
+        let auth_source = PathBuf::from(
+            env::var("NEEDLE_APPROVAL_AI_AUTH_SOURCE")
+                .expect("NEEDLE_APPROVAL_AI_AUTH_SOURCE is required"),
+        );
+        let report = PathBuf::from(
+            env::var(report_environment)
+                .unwrap_or_else(|_| panic!("{report_environment} is required")),
+        );
+        assert!(Path::new(&executable).is_file());
+        assert!(auth_source.is_file());
+        assert!(!report.exists(), "{report_diagnostic}");
+
+        let fixture = LiveApprovalEvaluatorFixture::new(&executable, &auth_source);
+        let policy = ApprovalAutomationPolicy {
+            mode: ApprovalAutomationMode::Decide,
+            timeout_seconds: 120,
+            ..ApprovalAutomationPolicy::default()
+        };
+        policy.validate().unwrap();
+        (fixture, policy, report)
+    }
+
+    struct LiveApprovalEvaluatorFixture {
+        root: PathBuf,
+        checkout: PathBuf,
+        codex_home: PathBuf,
+        store: Option<RuntimeStore>,
+    }
+
+    impl LiveApprovalEvaluatorFixture {
+        fn new(executable: &str, auth_source: &Path) -> Self {
+            let suffix =
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let root = env::temp_dir()
+                .join(format!("needle-live-approval-evaluator-{}-{suffix}", std::process::id()));
+            let checkout = root.join("checkout");
+            let codex_home = root.join("codex-home");
+            fs::create_dir_all(&checkout).unwrap();
+            fs::create_dir_all(&codex_home).unwrap();
+            fs::write(checkout.join("sentinel.txt"), b"immutable\n").unwrap();
+            fs::copy(auth_source, codex_home.join("auth.json")).unwrap();
+            fs::write(codex_home.join("config.toml"), b"").unwrap();
+            let store = RuntimeStore::new(root.join("needle.sqlite3"));
+            store
+                .initialize_defaults(&needle_runtime::RuntimeSettings {
+                    codex_executable: executable.to_owned(),
+                    worker_model: "gpt-5.6-luna".to_owned(),
+                    worker_reasoning: "low".to_owned(),
+                    worker_timeout_seconds: 120,
+                    evidence_failure_policy: needle_core::EvidenceFailurePolicy::DiscardInvalidFact,
+                    trusted_test_execution: false,
+                    multi_need_policy: needle_core::MultiNeedPolicy::default(),
+                })
+                .unwrap();
+            Self { root, checkout, codex_home, store: Some(store) }
+        }
+
+        fn store(&self) -> &RuntimeStore {
+            self.store.as_ref().expect("live approval evaluator store must be available")
+        }
+    }
+
+    impl Drop for LiveApprovalEvaluatorFixture {
+        fn drop(&mut self) {
+            drop(self.store.take());
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn live_approval_evaluator_fixture_releases_store_before_cleanup() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let auth_source =
+            env::temp_dir().join(format!("needle-live-approval-evaluator-auth-{suffix}.json"));
+        fs::write(&auth_source, b"{}").unwrap();
+        let executable = env::current_exe().unwrap();
+        let fixture = LiveApprovalEvaluatorFixture::new(
+            executable.to_str().expect("test executable path must be UTF-8"),
+            &auth_source,
+        );
+        let root = fixture.root.clone();
+        fs::remove_file(auth_source).unwrap();
+
+        drop(fixture);
+
+        assert!(!root.exists(), "live approval evaluator fixture root was not cleaned");
+    }
+
+    fn run_live_approval_evaluator_case(
+        fixture: &LiveApprovalEvaluatorFixture,
+        policy: &ApprovalAutomationPolicy,
+        case: &str,
+        argv: &[&str],
+        expected_decision: bool,
+        report_path: &Path,
+    ) -> ApprovalAutomationAdvice {
+        let sentinel = fixture.checkout.join("sentinel.txt");
+        let before = fs::read(&sentinel).unwrap();
+        let definition =
+            needle_core::RoleProfileDefinition::new(needle_core::RoleProfileDefinitionInput {
+                profile_id: needle_core::RoleProfileId::new(format!("reviewer.live-{case}"))
+                    .unwrap(),
+                role: needle_core::CodexRole::Reviewer,
+                host: AgentHost::Codex,
+                model: policy.model.clone(),
+                reasoning: needle_core::ReasoningLevel::Low,
+                service_tier: needle_core::ServiceTier::Default,
+                timeout_seconds: policy.timeout_seconds,
+                budget: needle_core::RoleProfileBudget {
+                    max_turns: 1,
+                    max_output_tokens: 16,
+                    max_cost_microusd: 1_000_000_000,
+                },
+                prompt_profile_digest: Digest::blake3(b"approval-live-prompt"),
+                output_contract_digest: Digest::blake3(b"approval-live-output"),
+                tool_policy: needle_core::ToolPolicy::ReadOnly,
+                command_policy: needle_core::CommandPolicy::ReadOnly,
+                filesystem_policy: needle_core::FilesystemPolicy::ReadOnlyCheckout,
+                network_policy: needle_core::NetworkPolicy::Denied,
+                test_policy: needle_core::TestPolicy::Disabled,
+                repair_policy: needle_core::RepairPolicy::None,
+                fallback_policy: needle_core::FallbackPolicy::Disabled,
+                concurrency: 1,
+                route_assignments: Vec::new(),
+            })
+            .unwrap();
+        let allowances = definition.effective_allowances().unwrap();
+        let argv = argv.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+        let permissions = RequestedPermissions::default();
+        let checkout = fs::canonicalize(&fixture.checkout).unwrap();
+        let cwd = checkout.to_string_lossy().into_owned();
+        let mut request = ApprovalRequest {
+            host: AgentHost::Codex,
+            worker_role: Some(needle_core::CodexRole::Reviewer),
+            role_profile: None,
+            allowances: Some(allowances),
+            operation: ApprovalOperation::CommandExecution,
+            id: format!("approval-live-{case}"),
+            protocol_request_id: json!(case),
+            protocol_approval_id: None,
+            thread_id: format!("thread-{case}"),
+            turn_id: format!("turn-{case}"),
+            item_id: format!("item-{case}"),
+            argv: argv.clone(),
+            command_display: Some(argv.join(" ")),
+            cwd: cwd.clone(),
+            reason: None,
+            requested_permissions: permissions.clone(),
+            route: "approval.review.live".to_owned(),
+            repository_id: Digest::blake3(b"approval-live-repository"),
+            repository_root: cwd,
+            expires_unix_ms: now_ms().saturating_add(120_000),
+            classification: CommandClassification::PendingAiEligible,
+            payload_digest: Digest([0; 32]),
+            payload_digest_revision: 2,
+            automation_advice: None,
+            decision: None,
+            decision_source: None,
+            decided_unix_ms: None,
+        };
+        request.payload_digest =
+            ApprovalRequest::compute_payload_digest_v2(ApprovalPayloadDigestInputV2 {
+                host: request.host,
+                worker_role: request.worker_role,
+                role_profile: request.role_profile.as_ref(),
+                allowances: request.allowances.as_ref(),
+                operation: request.operation,
+                argv: &request.argv,
+                cwd: &request.cwd,
+                requested_permissions: &request.requested_permissions,
+            })
+            .unwrap();
+        let started = Instant::now();
+        let outcome =
+            run_approval_evaluator(fixture.store(), Some(&fixture.codex_home), &request, policy);
+        let after = fs::read(&sentinel).unwrap();
+        let checkout_unchanged = before == after;
+        let report = match &outcome {
+            Ok(advice) => json!({
+                "schema": "needle.approval-ai-live/1",
+                "case": case,
+                "maximum_provider_sessions": 1,
+                "automatic_retries": 0,
+                "hard_output_token_limit_available": false,
+                "model": policy.model,
+                "reasoning": policy.reasoning,
+                "expected_decision": expected_decision,
+                "advice": advice,
+                "checkout_unchanged": checkout_unchanged,
+                "wall_time_ms": started.elapsed().as_millis(),
+            }),
+            Err(error) => json!({
+                "schema": "needle.approval-ai-live/1",
+                "case": case,
+                "maximum_provider_sessions": 1,
+                "automatic_retries": 0,
+                "hard_output_token_limit_available": false,
+                "model": policy.model,
+                "reasoning": policy.reasoning,
+                "expected_decision": expected_decision,
+                "error": error,
+                "checkout_unchanged": checkout_unchanged,
+                "wall_time_ms": started.elapsed().as_millis(),
+            }),
+        };
+        if let Some(parent) = report_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(checkout_unchanged);
+        outcome.unwrap_or_else(|error| {
+            panic!("live approval evaluator `{case}` failed after writing evidence: {error}")
+        })
     }
 
     #[test]

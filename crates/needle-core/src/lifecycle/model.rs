@@ -592,6 +592,7 @@ impl LifecycleApplyApproval {
             ApprovalDecisionSource::WebUser => 1,
             ApprovalDecisionSource::Timeout => 2,
             ApprovalDecisionSource::Runtime => 3,
+            ApprovalDecisionSource::AiPolicy => 4,
         });
         hasher.field_bytes(&decided_unix_ms.to_le_bytes());
         hasher.finish()

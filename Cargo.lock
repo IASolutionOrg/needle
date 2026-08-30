@@ -580,6 +580,7 @@ dependencies = [
  "mime_guess",
  "needle-bench",
  "needle-core",
+ "needle-platform-antigravity",
  "needle-platform-codex",
  "needle-runtime",
  "rusqlite",
@@ -617,6 +618,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "needle-platform-antigravity"
+version = "0.1.0"
+dependencies = [
+ "needle-core",
+ "needle-runtime",
+ "needle-worker-contract",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "needle-platform-codex"
 version = "0.1.0"
 dependencies = [
@@ -624,6 +637,7 @@ dependencies = [
  "needle-bench",
  "needle-core",
  "needle-runtime",
+ "needle-worker-contract",
  "serde",
  "serde_json",
  "sha2",
@@ -645,6 +659,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "needle-worker-contract"
+version = "0.1.0"
+dependencies = [
+ "needle-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

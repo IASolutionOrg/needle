@@ -39,6 +39,17 @@ fn fixture_input() -> RoleProfileDefinitionInput {
     }
 }
 
+#[test]
+fn antigravity_profile_is_authorable_but_not_activatable_before_gate_a8() {
+    let mut input = fixture_input();
+    input.host = needle_core::AgentHost::Antigravity;
+    let definition = needle_core::RoleProfileDefinition::new(input).unwrap();
+    let (worker, failures) = worker_projection(&definition);
+    assert_eq!(worker.unwrap().platform, "antigravity");
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("Gate A8"));
+}
+
 fn input_with_model(model: &str) -> Value {
     let mut input = serde_json::to_value(fixture_input()).unwrap();
     input["model"] = json!(model);

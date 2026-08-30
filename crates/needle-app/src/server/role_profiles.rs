@@ -6,8 +6,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use needle_core::{
-    CanonicalHasher, Digest, RoleProfileDefinition, RoleProfileDefinitionInput, RoleProfileId,
-    RoleProfileRevision, RoleProfileState, WorkerProfile,
+    AgentHost, CanonicalHasher, Digest, RoleProfileDefinition, RoleProfileDefinitionInput,
+    RoleProfileId, RoleProfileRevision, RoleProfileState, WorkerProfile,
 };
 use needle_runtime::{RoleProfileAuditRecord, RoleProfileStateRecord, RuntimeStore, StoreError};
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,7 @@ struct ProfileSummary {
     state: RoleProfileState,
     state_digest: Digest,
     updated_unix_ms: u64,
+    allowance_digest: Digest,
 }
 
 pub(super) fn routes(router: Router<AppState>) -> Router<AppState> {
@@ -153,6 +154,12 @@ pub(super) async fn list_role_profiles(
             state: profile_state,
             state_digest: state_record.state_digest,
             updated_unix_ms: state_record.updated_unix_ms,
+            allowance_digest: match revision.definition.effective_allowances() {
+                Ok(allowances) => allowances.allowance_digest,
+                Err(error) => {
+                    return store_error(StoreError::RoleProfileValidation(error.to_string()));
+                }
+            },
         });
     }
     Json(json!({"schema": SCHEMA, "items": items, "limit": limit})).into_response()
@@ -266,6 +273,13 @@ pub(super) async fn preflight(
         Err(error) => return preflight_failure("invalid", None, None, vec![error.to_string()]),
     };
     let (worker, worker_failures) = worker_projection(&definition);
+    let allowances = match definition.effective_allowances() {
+        Ok(allowances) => allowances,
+        Err(error) => {
+            return preflight_failure("invalid", Some(definition), worker, vec![error.to_string()]);
+        }
+    };
+    let allowance_digest = allowances.allowance_digest;
     let (operation, if_match) = match current_state_or_absence(&state.store, &id) {
         Ok(Some(state_record)) => ("revise", state_record.state_digest),
         Ok(None) => ("create", absence_digest(&id)),
@@ -283,7 +297,9 @@ pub(super) async fn preflight(
             "definition": definition,
             "definition_digest": definition.definition_digest,
             "worker_profile": worker,
-            "worker_profile_digest": worker.as_ref().map(|value| value.definition_digest)
+            "worker_profile_digest": worker.as_ref().map(|value| value.definition_digest),
+            "allowances": allowances,
+            "allowance_digest": allowance_digest
         }))
         .into_response()
     } else {
@@ -520,14 +536,19 @@ pub(super) fn control_plane_envelope(store: &RuntimeStore) -> Result<Value, Stor
             state: profile_state,
             state_digest: state.state_digest,
             updated_unix_ms: state.updated_unix_ms,
+            allowance_digest: revision
+                .definition
+                .effective_allowances()
+                .map_err(|error| StoreError::RoleProfileValidation(error.to_string()))?
+                .allowance_digest,
         });
     }
     Ok(json!({
         "schema": SCHEMA,
-        "status": "configuration_only",
-        "capability": "codex",
-        "codex": {"available": true, "execution_binding": false},
-        "non_codex": {"available": false, "reason": "only codex host profiles are supported"},
+        "status": "host_neutral_role_profiles",
+        "capability": "worker_hosts",
+        "codex": {"available": true, "execution_binding": true},
+        "antigravity": {"available": true, "execution_binding": false, "reason": "Gate A8 remains Shadow"},
         "items": summaries,
         "bounded": {"limit": DEFAULT_LIMIT}
     }))
@@ -543,6 +564,8 @@ fn profile_detail_response(
 fn profile_detail(state: &RoleProfileStateRecord, revision: &RoleProfileRevision) -> Value {
     let worker = revision.to_worker_profile().ok();
     let preflight = preflight_summary(&revision.definition);
+    let allowances = revision.definition.effective_allowances().ok();
+    let allowance_digest = allowances.as_ref().map(|value| value.allowance_digest);
     json!({
         "profile_id": revision.profile_id,
         "revision": revision.revision,
@@ -551,6 +574,8 @@ fn profile_detail(state: &RoleProfileStateRecord, revision: &RoleProfileRevision
         "definition_digest": revision.definition.definition_digest,
         "worker_profile": worker,
         "worker_profile_digest": worker.as_ref().map(|profile| profile.definition_digest),
+        "allowances": allowances,
+        "allowance_digest": allowance_digest,
         "preflight": preflight,
         "created_unix_ms": revision.created_unix_ms,
         "activated_unix_ms": revision.activated_unix_ms,
@@ -682,17 +707,27 @@ fn parse_json<T: for<'de> Deserialize<'de>>(body: &Bytes) -> Result<T, RoleProfi
 
 fn worker_projection(definition: &RoleProfileDefinition) -> (Option<WorkerProfile>, Vec<String>) {
     match definition.to_worker_profile() {
-        Ok(worker) => (Some(worker), Vec::new()),
+        Ok(worker) if definition.host == AgentHost::Codex => (Some(worker), Vec::new()),
+        Ok(worker) => (
+            Some(worker),
+            vec![
+                "antigravity execution remains disabled until its adapter passes Gate A8"
+                    .to_owned(),
+            ],
+        ),
         Err(error) => (None, vec![error.to_string()]),
     }
 }
 
 fn preflight_summary(definition: &RoleProfileDefinition) -> Value {
     let (worker, failures) = worker_projection(definition);
+    let allowances = definition.effective_allowances().ok();
+    let allowance_digest = allowances.as_ref().map(|value| value.allowance_digest);
     json!({
         "passed": failures.is_empty(),
         "failures": failures.into_iter().take(16).collect::<Vec<_>>(),
         "worker_profile_digest": worker.as_ref().map(|value| value.definition_digest),
+        "allowance_digest": allowance_digest,
     })
 }
 
@@ -719,6 +754,8 @@ fn preflight_failure(
     worker: Option<WorkerProfile>,
     failures: Vec<String>,
 ) -> Response {
+    let allowances = definition.as_ref().and_then(|value| value.effective_allowances().ok());
+    let allowance_digest = allowances.as_ref().map(|value| value.allowance_digest);
     role_json(
         StatusCode::UNPROCESSABLE_ENTITY,
         json!({
@@ -729,7 +766,9 @@ fn preflight_failure(
             "definition": definition,
             "definition_digest": definition.as_ref().map(|value| value.definition_digest),
             "worker_profile": worker,
-            "worker_profile_digest": worker.as_ref().map(|value| value.definition_digest)
+            "worker_profile_digest": worker.as_ref().map(|value| value.definition_digest),
+            "allowances": allowances,
+            "allowance_digest": allowance_digest
         }),
     )
 }

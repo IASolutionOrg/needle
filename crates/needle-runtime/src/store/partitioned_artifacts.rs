@@ -1,15 +1,14 @@
 use super::partitioned_heads::{PartitionedActionHeadRecord, ShadowPartitionedActionHeadAdvance};
 use super::{
-    ACTION_REQUEST_STORAGE_FORMAT_REVISION, RuntimeStore, StoreError,
+    ACTION_REQUEST_STORAGE_FORMAT_REVISION, ActionExecutionUsage, RuntimeStore, StoreError,
     insert_action_request_observation, insert_action_request_row, now_ms,
 };
 use crate::{ShadowPartitionManifestPublication, ShadowPartitionedActionArtifactPublication};
 use needle_core::{
     ActionArtifactValidationCertificate, ActionRequest, Artifact, ArtifactId,
-    ArtifactValidationCertificateId, Digest, LifecycleUsage,
-    MAX_ACTION_ARTIFACT_VALIDATION_CERTIFICATE_WIRE_BYTES, MAX_REFRESH_ATTEMPT_WIRE_BYTES,
-    MAX_REFRESH_ECONOMIC_WIRE_BYTES, RefreshAttempt, RefreshEconomicAssessment,
-    RefreshEconomicDecision, RefreshOutcome, ReuseDescriptor,
+    ArtifactValidationCertificateId, Digest, MAX_ACTION_ARTIFACT_VALIDATION_CERTIFICATE_WIRE_BYTES,
+    MAX_REFRESH_ATTEMPT_WIRE_BYTES, MAX_REFRESH_ECONOMIC_WIRE_BYTES, RefreshAttempt,
+    RefreshEconomicAssessment, RefreshEconomicDecision, RefreshOutcome, ReuseDescriptor,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -69,7 +68,7 @@ impl RuntimeStore {
         manifest: &ShadowPartitionManifestPublication,
         publication: &ShadowPartitionedActionArtifactPublication,
         transition: Option<&needle_core::ManifestTransition>,
-        usage: &LifecycleUsage,
+        usage: ActionExecutionUsage<'_>,
     ) -> Result<(), StoreError> {
         let prepared_manifest =
             super::partition_manifest_store::prepare_manifest_publication(manifest)?;

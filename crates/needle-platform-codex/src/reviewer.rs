@@ -9,6 +9,11 @@ use needle_core::{
 use needle_runtime::{
     IsolatedCheckout, RuntimeStore, capture_git_snapshot, materialize_patch_artifact,
 };
+use needle_worker_contract::{
+    REVIEW_FINDING_FORMAT_INSTRUCTIONS, REVIEWER_INSTRUCTIONS,
+    full_reviewer_output_schema as shared_full_reviewer_output_schema, full_reviewer_prompt,
+    normalize_full_review_output,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,8 +24,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const REVIEW_REFRESH_INSTRUCTIONS: &str = "Return exactly one inspection result for every supplied target_id. Retained-finding targets must be revalidated as still_valid or stale. Changed-path targets must be inspected as clean or findings. Use inconclusive only when the target cannot be inspected; Needle will discard the refresh and run a fresh full review. Include the findings field only when the outcome is findings, and include every newly discovered finding for that target. Produce a fresh whole-review verdict after completing every target.";
-const REVIEW_FINDING_FORMAT_INSTRUCTIONS: &str = "Every new finding rule must contain only ASCII letters, digits, dot, underscore, or hyphen. Every new finding path must be a repository-relative forward-slash path with no empty, dot, or parent components. Keep all finding and evidence material within the declared schema bounds.";
-
 #[derive(Clone, Debug)]
 pub(crate) struct CodexReviewWorker {
     data_directory: PathBuf,
@@ -292,14 +295,6 @@ impl CodexReviewWorker {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DeclaredReview {
-    verdict: DeclaredVerdict,
-    acceptance_coverage: Vec<DeclaredCoverage>,
-    findings: Vec<DeclaredFinding>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct DeclaredRefreshReview {
     verdict: DeclaredVerdict,
     acceptance_coverage: Vec<DeclaredCoverage>,
@@ -415,7 +410,17 @@ fn normalize_review_turn(
             output_tokens,
             response_digest,
         ),
-        None => normalize_full_review(turn.response, request, output_tokens, response_digest),
+        None => normalize_full_review_output(turn.response, request, output_tokens)
+            .map(|normalized| NormalizedReview {
+                verdict: normalized.verdict,
+                acceptance_coverage: normalized.acceptance_coverage,
+                findings: normalized.findings,
+                inspection_context_digest: None,
+                inspection_coverage: Vec::new(),
+                output_tokens: normalized.output_tokens,
+                response_digest: normalized.response_digest,
+            })
+            .map_err(ReviewRunError::from),
     };
     normalized.map_err(|mut error| {
         error.provider_turn_completed = true;
@@ -459,46 +464,6 @@ fn normalize_acceptance_coverage(
     }
     coverage.sort_by_key(|item| item.criterion_digest);
     Ok(coverage)
-}
-
-fn normalize_full_review(
-    response: Value,
-    request: &ChangeRequest,
-    output_tokens: Option<u64>,
-    response_digest: Digest,
-) -> Result<NormalizedReview, ReviewRunError> {
-    let declared: DeclaredReview = serde_json::from_value(response)
-        .map_err(|error| format!("review worker returned invalid output: {error}"))?;
-    if declared.findings.len() > needle_core::MAX_REVIEW_FINDINGS {
-        return Err("review output exceeded its closed cardinality".to_owned().into());
-    }
-    let coverage = normalize_acceptance_coverage(declared.acceptance_coverage, request)?;
-    let mut findings = Vec::with_capacity(declared.findings.len());
-    let mut finding_ids = BTreeSet::new();
-    for (index, finding) in declared.findings.into_iter().enumerate() {
-        let finding = match finding {
-            DeclaredFinding::New { rule, severity, path, line, message, evidence } => {
-                normalize_new_finding(
-                    index,
-                    DeclaredNewFinding { rule, severity, path, line, message, evidence },
-                )?
-            }
-        };
-        if !finding_ids.insert(finding.id) {
-            continue;
-        }
-        findings.push(finding);
-    }
-    let verdict = normalize_verdict(declared.verdict, &coverage, &findings)?;
-    Ok(NormalizedReview {
-        verdict,
-        acceptance_coverage: coverage,
-        findings,
-        inspection_context_digest: None,
-        inspection_coverage: Vec::new(),
-        output_tokens,
-        response_digest,
-    })
 }
 
 fn normalize_refresh_review(
@@ -721,7 +686,7 @@ fn normalize_new_finding(
 }
 
 fn reviewer_instructions() -> String {
-    "You are Needle's independent read-only diff reviewer. Review the actual patched filesystem in the disposable checkout against every supplied acceptance criterion. You have no patcher transcript. Do not modify files, run tests, use network, hooks, plugins, MCP, project instructions, memory, or other agents. Inspect only through the provided bounded repository tools. Report concrete file-and-rule findings with evidence. Return only closed JSON matching the output schema.".to_owned()
+    REVIEWER_INSTRUCTIONS.to_owned()
 }
 
 fn reviewer_prompt(
@@ -729,6 +694,9 @@ fn reviewer_prompt(
     patch: &needle_core::PatchArtifact,
     advisory: Option<&ReviewRefreshAdvisory>,
 ) -> String {
+    if advisory.is_none() {
+        return full_reviewer_prompt(request, patch);
+    }
     serde_json::to_string(&json!({
         "operation": if advisory.is_some() {
             "refresh_aware_full_diff_review"
@@ -764,33 +732,7 @@ fn reviewer_output_schema(advisory: Option<&ReviewRefreshAdvisory>) -> Value {
 }
 
 fn full_reviewer_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["verdict", "acceptance_coverage", "findings"],
-        "properties": {
-            "verdict": {"type": "string", "enum": ["approved", "rejected", "inconclusive"]},
-            "acceptance_coverage": {
-                "type": "array",
-                "maxItems": needle_core::MAX_REVIEW_COVERAGE,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["criterion", "status", "evidence"],
-                    "properties": {
-                        "criterion": {"type": "string"},
-                        "status": {"type": "string", "enum": ["addressed", "partial", "unaddressed"]},
-                        "evidence": {"type": "string"}
-                    }
-                }
-            },
-            "findings": {
-                "type": "array",
-                "maxItems": needle_core::MAX_REVIEW_FINDINGS,
-                "items": new_finding_schema()
-            }
-        }
-    })
+    shared_full_reviewer_output_schema()
 }
 
 fn refresh_reviewer_output_schema(targets: &[ReviewInspectionTarget]) -> Value {

@@ -95,6 +95,7 @@ type ActivationConfirmation = {
   revision: number
   definitionDigest: string
   stateDigest: string
+  allowanceDigest: string
 }
 
 type DeactivationConfirmation = {
@@ -114,7 +115,8 @@ function sameActivationConfirmation(
       confirmation.profileId === target.profileId &&
       confirmation.revision === target.revision &&
       confirmation.definitionDigest === target.definitionDigest &&
-      confirmation.stateDigest === target.stateDigest,
+      confirmation.stateDigest === target.stateDigest &&
+      confirmation.allowanceDigest === target.allowanceDigest,
   )
 }
 
@@ -163,6 +165,7 @@ export default function RoleProfilesEditor() {
           revision: selectedRevision ?? detail.data.profile.revision,
           definitionDigest: detail.data.profile.definition_digest,
           stateDigest: detail.data.profile.state_digest,
+          allowanceDigest: detail.data.profile.allowance_digest ?? "",
         }
       : null
   const deactivationTarget =
@@ -244,6 +247,8 @@ export default function RoleProfilesEditor() {
             definition_digest: body.definition_digest ?? null,
             worker_profile: body.worker_profile ?? null,
             worker_profile_digest: body.worker_profile_digest ?? null,
+            allowances: body.allowances ?? null,
+            allowance_digest: body.allowance_digest ?? null,
           })
         }
       }
@@ -327,6 +332,7 @@ export default function RoleProfilesEditor() {
   if (profiles.isError) return <div className="p-6 text-sm text-destructive">Unable to load role profiles: {apiErrorMessage(profiles.error)}</div>
 
   const profileItems = profiles.data?.items ?? []
+  const visibleAllowances = preflightResult?.allowances ?? detail.data?.profile.allowances ?? null
 
   return (
     <div className="grid gap-5 p-4 md:p-6 xl:grid-cols-[minmax(15rem,0.28fr)_minmax(0,1fr)]">
@@ -334,7 +340,7 @@ export default function RoleProfilesEditor() {
         <div className="border-b px-4 py-3">
           <h1 className="text-lg font-semibold">Role profiles</h1>
           <p className="mt-1 text-xs text-muted-foreground">
-            Canonical Codex configuration only; no worker or session binding.
+            Canonical worker configuration and effective allowances for every supported host.
           </p>
         </div>
         <div className="p-3">
@@ -358,7 +364,7 @@ export default function RoleProfilesEditor() {
                     {item.profile_id}
                     <StateBadge state={item.state} />
                   </span>
-                  <span className="text-xs text-muted-foreground">{item.role} · revision {item.latest_revision}</span>
+                  <span className="text-xs text-muted-foreground">{item.host} · {item.role} · revision {item.latest_revision}</span>
                 </button>
               ))}
               <Button size="sm" variant="outline" className="mt-2" onClick={startNewProfile}>
@@ -368,7 +374,7 @@ export default function RoleProfilesEditor() {
           )}
         </div>
         <div className="border-t px-4 py-3 text-xs text-muted-foreground">
-          Codex host is fixed and read-only. Non-Codex hosts are unavailable.
+          Antigravity profiles can be authored for Phase 10 conformance, but activation remains blocked until Gate A8 passes.
         </div>
       </aside>
 
@@ -386,7 +392,7 @@ export default function RoleProfilesEditor() {
           <div className="grid gap-4 p-4 md:grid-cols-2 xl:grid-cols-3">
             <Field label="Profile id"><Input value={draft.profile_id} readOnly={Boolean(selectedId)} onChange={(event) => setField("profile_id", event.target.value)} /></Field>
             <Field label="Role"><select className="h-9 border bg-background px-2 text-sm" value={draft.role} onChange={(event) => setField("role", event.target.value as RoleProfileRole)}>{roles.map((role) => <option key={role} value={role}>{role}</option>)}</select></Field>
-            <Field label="Host (read-only Codex)"><Input value={draft.host} readOnly disabled /></Field>
+            <Field label="Host"><select className="h-9 border bg-background px-2 text-sm" value={draft.host} onChange={(event) => setField("host", event.target.value as RoleProfileDefinitionInput["host"])}><option value="codex">codex</option><option value="antigravity">antigravity</option></select></Field>
             <Field label="Model"><Input value={draft.model} onChange={(event) => setField("model", event.target.value)} /></Field>
             <Field label="Reasoning"><select className="h-9 border bg-background px-2 text-sm" value={draft.reasoning} onChange={(event) => setField("reasoning", event.target.value as RoleProfileDefinitionInput["reasoning"])}>{["low", "medium", "high", "xhigh"].map((value) => <option key={value}>{value}</option>)}</select></Field>
             <Field label="Service tier"><select className="h-9 border bg-background px-2 text-sm" value={draft.service_tier} onChange={(event) => setField("service_tier", event.target.value as RoleProfileDefinitionInput["service_tier"])}><option value="default">default</option><option value="priority">priority</option></select></Field>
@@ -414,16 +420,40 @@ export default function RoleProfilesEditor() {
           {preflightResult?.failures.length ? <div className="border-t px-4 py-3 text-sm text-destructive">{preflightResult.failures.join("; ")}</div> : null}
         </section>
 
+        {visibleAllowances ? (
+          <section className="border bg-panel">
+            <div className="border-b px-4 py-3">
+              <h3 className="text-sm font-semibold">Effective worker allowances</h3>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Immutable projection of the exact role-profile revision. These are capabilities, not host command names.
+              </p>
+            </div>
+            <div className="grid gap-2 p-4 text-xs md:grid-cols-2 xl:grid-cols-3">
+              <div>Host: <code>{visibleAllowances.host}</code></div>
+              <div>Read checkout: <code>{String(visibleAllowances.filesystem_read_checkout)}</code></div>
+              <div>Write scope: <code>{visibleAllowances.filesystem_write}</code></div>
+              <div>Commands: <code>{visibleAllowances.command_policy}</code></div>
+              <div>Network: <code>{String(visibleAllowances.network)}</code></div>
+              <div>MCP: <code>{String(visibleAllowances.mcp)}</code></div>
+              <div>Subagents: <code>{String(visibleAllowances.subagents)}</code></div>
+              <div>External effects: <code>{String(visibleAllowances.external_effects)}</code></div>
+              <div>Human approval outside allowance: <code>{String(visibleAllowances.human_approval_required)}</code></div>
+              <div className="break-all md:col-span-2 xl:col-span-3">Allowance digest: <code>{visibleAllowances.allowance_digest}</code></div>
+            </div>
+          </section>
+        ) : null}
+
         {detail.data ? (
           <section className="grid gap-4 border bg-panel p-4 lg:grid-cols-2">
             <div className="grid gap-2 text-xs">
               <h3 className="text-sm font-semibold">Revision and activation</h3>
               <div>Definition digest: <code>{detail.data.profile.definition_digest}</code></div>
               <div>Worker compatibility digest: <code>{detail.data.profile.worker_profile_digest ?? "—"}</code></div>
+              <div>Allowance digest: <code>{detail.data.profile.allowance_digest ?? "—"}</code></div>
               <div>Request-time preflight: <Badge variant={detail.data.profile.preflight.passed ? "default" : "destructive"}>{detail.data.profile.preflight.passed ? "passed" : "failed"}</Badge></div>
               {detail.data.profile.preflight.failures.length ? <div className="text-destructive">{detail.data.profile.preflight.failures.join("; ")}</div> : null}
               <div>State digest / If-Match: <code>{detail.data.profile.state_digest}</code></div>
-              <label className="flex items-center gap-2"><input type="checkbox" checked={activationConfirmed} onChange={(event) => setActivationConfirmation(event.target.checked && activationTarget ? activationTarget : null)} />Confirm exact digest activation</label>
+              <label className="flex items-center gap-2"><input type="checkbox" checked={activationConfirmed} onChange={(event) => setActivationConfirmation(event.target.checked && activationTarget ? activationTarget : null)} />Confirm exact definition and allowance digests</label>
               <Button size="sm" onClick={() => void activateRevision()} disabled={!activationConfirmed || activate.isPending}>Activate selected revision</Button>
               <label className="flex items-center gap-2"><input type="checkbox" checked={deactivationConfirmed} onChange={(event) => setDeactivationConfirmation(event.target.checked && deactivationTarget ? deactivationTarget : null)} />Confirm current active digest deactivation</label>
               <Button size="sm" variant="outline" onClick={() => void deactivateProfile()} disabled={!deactivationConfirmed || deactivate.isPending}>Deactivate active revision</Button>

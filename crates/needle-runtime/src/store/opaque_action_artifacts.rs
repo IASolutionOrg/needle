@@ -1,11 +1,12 @@
 use super::partitioned_artifacts::{insert_artifact, insert_immutable_json};
 use super::{
-    RuntimeStore, StoreError, insert_action_request_observation, insert_action_request_row,
+    ActionExecutionUsage, RuntimeStore, StoreError, insert_action_request_observation,
+    insert_action_request_row,
 };
 use crate::ShadowOpaqueActionArtifactPublication;
 use needle_core::{
     ActionContractId, ActionOutputValidationCertificate, ActionRequest, Artifact, ArtifactId,
-    Digest, LifecycleUsage, MAX_ACTION_OUTPUT_VALIDATION_CERTIFICATE_WIRE_BYTES,
+    Digest, MAX_ACTION_OUTPUT_VALIDATION_CERTIFICATE_WIRE_BYTES,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
@@ -53,7 +54,7 @@ impl RuntimeStore {
         operation_id: Digest,
         request: &ActionRequest,
         publication: &ShadowOpaqueActionArtifactPublication,
-        usage: &LifecycleUsage,
+        usage: ActionExecutionUsage<'_>,
     ) -> Result<(), StoreError> {
         let prepared = prepare_opaque_publication(request, publication)?;
         let mut connection = self.connection()?;

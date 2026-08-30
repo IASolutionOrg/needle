@@ -56,6 +56,13 @@ impl ChangeActionProvider for PatchProvider {
             review_manifest: None,
             review_transition: None,
             usage: LifecycleUsage { worker_turns: 1, output_tokens: 7, cost_microusd: 11 },
+            host_usage: Some(HostUsage {
+                input_tokens: 13,
+                output_tokens: 7,
+                thinking_tokens: 2,
+                cache_read_tokens: 3,
+                total_tokens: 20,
+            }),
         })
     }
 }
@@ -124,6 +131,7 @@ fn shadow_action_execution_publishes_atomically_and_replays_by_operation() {
         first.usage,
         LifecycleUsage { worker_turns: 1, output_tokens: 7, cost_microusd: 11 }
     );
+    assert_eq!(first.host_usage.as_ref().map(|usage| usage.input_tokens), Some(13));
     assert_eq!(first.request.format_revision, 3);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -132,6 +140,7 @@ fn shadow_action_execution_publishes_atomically_and_replays_by_operation() {
     assert_eq!(replay.artifact.id, first.artifact.id);
     assert_eq!(replay.validation_certificate, first.validation_certificate);
     assert_eq!(replay.usage, first.usage);
+    assert_eq!(replay.host_usage, first.host_usage);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     drop(service);
@@ -237,7 +246,7 @@ fn failed_operation_completion_rolls_back_the_entire_opaque_publication() {
             envelope.operation_id,
             &request,
             &publication,
-            &provider.usage,
+            crate::store::ActionExecutionUsage::new(&provider.usage, provider.host_usage.as_ref(),),
         ),
         Err(StoreError::ActionExecutionConflict(_))
     ));

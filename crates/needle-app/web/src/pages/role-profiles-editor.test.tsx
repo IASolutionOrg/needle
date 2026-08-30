@@ -135,7 +135,7 @@ test("role profiles editor surfaces list failures", async () => {
   expect(await screen.findByText(/Unable to load role profiles: temporary failure/)).toBeVisible()
 })
 
-test("new profile form keeps unsupported host and network controls read-only", async () => {
+test("new profile form exposes Antigravity authoring but keeps network denied", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn(async () =>
@@ -147,9 +147,12 @@ test("new profile form keeps unsupported host and network controls read-only", a
   )
   renderEditor()
   fireEvent.click(await screen.findByRole("button", { name: "Start a profile" }))
-  expect(screen.getByLabelText("Host (read-only Codex)")).toBeDisabled()
+  const host = screen.getByLabelText("Host")
+  expect(host).toBeEnabled()
+  fireEvent.change(host, { target: { value: "antigravity" } })
+  expect(host).toHaveValue("antigravity")
   expect(screen.getByLabelText("Network policy (fixed denied)")).toBeDisabled()
-  expect(screen.getByText(/Non-Codex hosts are unavailable/)).toBeVisible()
+  expect(screen.getByText(/activation remains blocked until Gate A8 passes/)).toBeVisible()
 })
 
 test("role profiles editor keeps the bounded list loading state visible", () => {
@@ -253,7 +256,7 @@ test("role profiles editor invalidates activation and deactivation confirmations
   vi.stubGlobal("fetch", fetchMock)
   renderEditor()
   await screen.findByDisplayValue("gpt-5-mini")
-  const activation = screen.getByLabelText("Confirm exact digest activation")
+  const activation = screen.getByLabelText("Confirm exact definition and allowance digests")
   const deactivation = screen.getByLabelText("Confirm current active digest deactivation")
   const activateButton = screen.getByRole("button", { name: "Activate selected revision" })
   const deactivateButton = screen.getByRole("button", { name: "Deactivate active revision" })
@@ -266,7 +269,7 @@ test("role profiles editor invalidates activation and deactivation confirmations
 
   fireEvent.click(screen.getByRole("button", { name: /Revision 1/ }))
   await screen.findByText("Revision and activation")
-  expect(screen.getByLabelText("Confirm exact digest activation")).not.toBeChecked()
+  expect(screen.getByLabelText("Confirm exact definition and allowance digests")).not.toBeChecked()
   expect(screen.getByLabelText("Confirm current active digest deactivation")).not.toBeChecked()
   expect(screen.getByRole("button", { name: "Activate selected revision" })).toBeDisabled()
   expect(screen.getByRole("button", { name: "Deactivate active revision" })).toBeDisabled()
@@ -382,7 +385,7 @@ test("role profiles editor confirms activation and sends the exact revision dige
   await screen.findByDisplayValue("gpt-5-mini")
   const activateButton = screen.getByRole("button", { name: "Activate selected revision" })
   expect(activateButton).toBeDisabled()
-  fireEvent.click(screen.getByLabelText("Confirm exact digest activation"))
+  fireEvent.click(screen.getByLabelText("Confirm exact definition and allowance digests"))
   expect(activateButton).toBeEnabled()
   fireEvent.click(activateButton)
   await waitFor(() => expect(activationBody).toBeDefined())

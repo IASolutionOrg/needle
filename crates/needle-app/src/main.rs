@@ -16,6 +16,7 @@ use needle_core::{
     RepairPolicy, RoleProfileBudget, RoleProfileDefinition, RoleProfileDefinitionInput,
     RoleProfileId, ServiceTier, TestPlan, TestPolicy, ToolPolicy, WorkerConfig,
 };
+use needle_platform_antigravity::inspect_installation as inspect_antigravity_installation;
 use needle_platform_codex::{
     CodexWorker, CompactInput, HookConfig, SessionEndInput, SessionStartInput, StopInput,
     StopOutput, UserPromptSubmitInput, handle_post_compact, handle_pre_compact, handle_session_end,
@@ -421,6 +422,7 @@ fn run_doctor(arguments: Vec<String>) -> Result<(), AppError> {
     let snapshot = env::current_dir()
         .ok()
         .and_then(|cwd| capture_git_snapshot(&cwd).ok().map(|(_, snapshot)| snapshot));
+    let antigravity = inspect_antigravity_installation();
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -435,6 +437,29 @@ fn run_doctor(arguments: Vec<String>) -> Result<(), AppError> {
                 "incompatibility_reason": value.incompatibility_reason,
                 "isolation_verified": value.verified(),
             })),
+            "antigravity": {
+                "ide_executable": antigravity.ide_executable,
+                "cli_executable": antigravity.cli_executable,
+                "cli": antigravity.cli_preflight.as_ref().map(|value| json!({
+                    "version": value.host_version,
+                    "supported": value.supported,
+                    "required_flags_present": value.required_flags_present,
+                    "contract_digest": value.contract.definition_digest,
+                    "incompatibility_reason": value.incompatibility_reason,
+                    "isolation_verified": value.verified(),
+                })),
+                "cli_error": antigravity.cli_error,
+                "execution_enabled": false,
+                "status": if antigravity.cli_preflight.as_ref().is_some_and(|value| value.verified()) {
+                    "offline_conformance_only"
+                } else if antigravity.cli_executable.is_some() {
+                    "cli_incompatible"
+                } else if antigravity.ide_executable.is_some() {
+                    "ide_present_cli_headless_missing"
+                } else {
+                    "not_installed"
+                },
+            },
             "repository_snapshot": snapshot,
             "product_scope": "snapshot_exact",
             "runtime_mode": "on_demand",

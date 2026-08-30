@@ -88,11 +88,21 @@ impl CodexChangeActionProvider {
             ));
         }
         let turns = u64::from(worker_turns);
+        let output_tokens = output_tokens.unwrap_or_else(|| {
+            u64::from(revision.definition.budget.max_output_tokens).saturating_mul(turns)
+        });
+        let output_token_limit =
+            u64::from(revision.definition.budget.max_output_tokens).saturating_mul(turns);
+        if worker_turns > u32::from(revision.definition.budget.max_turns)
+            || output_tokens > output_token_limit
+        {
+            return Err(ChangeActionProviderError::new(
+                "action worker usage exceeded the frozen role-profile budget",
+            ));
+        }
         Ok(LifecycleUsage {
             worker_turns,
-            output_tokens: output_tokens.unwrap_or_else(|| {
-                u64::from(revision.definition.budget.max_output_tokens).saturating_mul(turns)
-            }),
+            output_tokens,
             cost_microusd: revision.definition.budget.max_cost_microusd.saturating_mul(turns),
         })
     }
@@ -544,6 +554,7 @@ impl ChangeActionProvider for CodexChangeActionProvider {
                     review_manifest: None,
                     review_transition: None,
                     usage: self.worker_usage(worker_output_tokens)?,
+                    host_usage: None,
                 })
             }
             ChangeActionInput::TestsExecute {
@@ -585,6 +596,7 @@ impl ChangeActionProvider for CodexChangeActionProvider {
                     review_manifest: None,
                     review_transition: None,
                     usage: LifecycleUsage { worker_turns: 1, output_tokens: 0, cost_microusd: 0 },
+                    host_usage: None,
                 })
             }
             ChangeActionInput::ReviewDiff {
@@ -718,6 +730,7 @@ impl ChangeActionProvider for CodexChangeActionProvider {
                     review_manifest: Some(publication),
                     review_transition: transition,
                     usage,
+                    host_usage: None,
                 })
             }
             ChangeActionInput::PatchVerify {
@@ -801,6 +814,7 @@ impl ChangeActionProvider for CodexChangeActionProvider {
                     review_manifest: None,
                     review_transition: None,
                     usage,
+                    host_usage: None,
                 })
             }
             ChangeActionInput::PatchApply {
@@ -958,6 +972,7 @@ impl ChangeActionProvider for CodexChangeActionProvider {
                     review_manifest: None,
                     review_transition: None,
                     usage: LifecycleUsage::default(),
+                    host_usage: None,
                 })
             }
         }

@@ -1,9 +1,10 @@
-use super::{RuntimeStore, StoreError, now_ms, parse_digest};
+use super::{ActionExecutionUsage, RuntimeStore, StoreError, now_ms, parse_digest};
 use needle_core::{
-    ArtifactId, ArtifactRequestId, ArtifactValidationCertificateId, Digest, LifecycleUsage,
-    PartitionManifestId,
+    ArtifactId, ArtifactRequestId, ArtifactValidationCertificateId, Digest, HostUsage,
+    LifecycleUsage, PartitionManifestId,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ActionExecutionOperationClaim {
@@ -15,6 +16,7 @@ pub(crate) enum ActionExecutionOperationClaim {
         validation_certificate: ArtifactValidationCertificateId,
         partition_manifest: Option<PartitionManifestId>,
         usage: LifecycleUsage,
+        host_usage: Option<HostUsage>,
     },
 }
 
@@ -68,6 +70,8 @@ impl RuntimeStore {
                         artifact.ok_or_else(|| conflict("completed operation has no artifact"))?;
                     let certificate = certificate
                         .ok_or_else(|| conflict("completed operation has no certificate"))?;
+                    let persisted_usage =
+                        usage.as_deref().map(decode_usage).transpose()?.unwrap_or_default();
                     ActionExecutionOperationClaim::Completed {
                         artifact: ArtifactId::new(parse_digest(&artifact)?),
                         validation_certificate: ArtifactValidationCertificateId::new(parse_digest(
@@ -76,10 +80,8 @@ impl RuntimeStore {
                         partition_manifest: manifest
                             .map(|value| parse_digest(&value).map(PartitionManifestId::new))
                             .transpose()?,
-                        usage: usage
-                            .map(|value| serde_json::from_str(&value))
-                            .transpose()?
-                            .unwrap_or_default(),
+                        usage: persisted_usage.lifecycle(),
+                        host_usage: persisted_usage.host_usage,
                     }
                 } else {
                     return Err(conflict("operation has an unsupported state"));
@@ -98,7 +100,7 @@ pub(super) fn complete_action_execution_operation_in_transaction(
     artifact: ArtifactId,
     validation_certificate: ArtifactValidationCertificateId,
     partition_manifest: Option<PartitionManifestId>,
-    usage: &LifecycleUsage,
+    usage: ActionExecutionUsage<'_>,
 ) -> Result<(), StoreError> {
     let existing = connection
         .query_row(
@@ -124,7 +126,7 @@ pub(super) fn complete_action_execution_operation_in_transaction(
         artifact.to_string(),
         validation_certificate.to_string(),
         partition_manifest.map(|value| value.to_string()),
-        serde_json::to_string(usage)?,
+        serde_json::to_string(&PersistedActionExecutionUsage::new(usage.lifecycle, usage.host))?,
     );
     if existing.0 != expected.0 {
         return Err(conflict("operation request binding changed"));
@@ -163,10 +165,79 @@ pub(super) fn complete_action_execution_operation_in_transaction(
     Ok(())
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedActionExecutionUsage {
+    worker_turns: u32,
+    output_tokens: u64,
+    cost_microusd: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_usage: Option<HostUsage>,
+}
+
+impl PersistedActionExecutionUsage {
+    fn new(usage: &LifecycleUsage, host_usage: Option<&HostUsage>) -> Self {
+        Self {
+            worker_turns: usage.worker_turns,
+            output_tokens: usage.output_tokens,
+            cost_microusd: usage.cost_microusd,
+            host_usage: host_usage.cloned(),
+        }
+    }
+
+    fn lifecycle(&self) -> LifecycleUsage {
+        LifecycleUsage {
+            worker_turns: self.worker_turns,
+            output_tokens: self.output_tokens,
+            cost_microusd: self.cost_microusd,
+        }
+    }
+}
+
+fn decode_usage(value: &str) -> Result<PersistedActionExecutionUsage, serde_json::Error> {
+    serde_json::from_str(value)
+}
+
 fn sql_time(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| conflict("operation timestamp exceeds SQLite range"))
 }
 
 fn conflict(message: impl Into<String>) -> StoreError {
     StoreError::ActionExecutionConflict(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_usage_decodes_legacy_rows_without_host_usage() {
+        let decoded =
+            decode_usage(r#"{"worker_turns":1,"output_tokens":5,"cost_microusd":10}"#).unwrap();
+
+        assert_eq!(
+            decoded.lifecycle(),
+            LifecycleUsage { worker_turns: 1, output_tokens: 5, cost_microusd: 10 }
+        );
+        assert_eq!(decoded.host_usage, None);
+    }
+
+    #[test]
+    fn persisted_usage_round_trips_exact_host_accounting() {
+        let lifecycle = LifecycleUsage { worker_turns: 1, output_tokens: 7, cost_microusd: 11 };
+        let host = HostUsage {
+            input_tokens: 13,
+            output_tokens: 7,
+            thinking_tokens: 2,
+            cache_read_tokens: 3,
+            total_tokens: 20,
+        };
+        let encoded =
+            serde_json::to_string(&PersistedActionExecutionUsage::new(&lifecycle, Some(&host)))
+                .unwrap();
+        let decoded = decode_usage(&encoded).unwrap();
+
+        assert_eq!(decoded.lifecycle(), lifecycle);
+        assert_eq!(decoded.host_usage, Some(host));
+    }
 }

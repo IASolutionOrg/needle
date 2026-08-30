@@ -4,6 +4,20 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 export type ApprovalDecision = "accept" | "decline" | "cancel"
 
 export interface ApprovalRequest {
+  host: "codex" | "antigravity"
+  worker_role: RoleProfileRole | null
+  role_profile: {
+    profile_id: string
+    revision: number
+    definition_digest: string
+  } | null
+  allowances: EffectiveWorkerAllowancesV1 | null
+  operation:
+    | "command_execution"
+    | "filesystem_change"
+    | "network_access"
+    | "mcp_invocation"
+    | "external_effect"
   id: string
   thread_id: string
   turn_id: string
@@ -24,6 +38,7 @@ export interface ApprovalRequest {
   expires_unix_ms: number
   classification:
     | "pending_user"
+    | "pending_ai_eligible"
     | "rejected_file_change"
     | "rejected_network"
     | "rejected_unparseable"
@@ -32,7 +47,20 @@ export interface ApprovalRequest {
     | { auto_approved_test: { policy_id: string } }
     | { auto_approved_read_only: { policy_id: string } }
   payload_digest: string
+  payload_digest_revision: number
+  automation_advice: {
+    policy_digest: string
+    input_digest: string
+    evaluator_host: "codex" | "antigravity"
+    model: string
+    reasoning: string
+    decision: boolean
+    input_tokens: number | null
+    output_tokens: number | null
+    evaluated_unix_ms: number
+  } | null
   decision: ApprovalDecision | null
+  decision_source: "auto_policy" | "ai_policy" | "web_user" | "timeout" | "runtime" | null
 }
 
 export interface RouteDefinition {
@@ -248,6 +276,7 @@ export type ModelPolicyInput =
         native_fallback: boolean
       }
     }
+
   | {
       cheapest_validated_first: {
         profiles: Array<{
@@ -258,6 +287,15 @@ export type ModelPolicyInput =
         native_fallback: boolean
       }
     }
+
+export interface ApprovalAutomationPolicy {
+  schema: "needle.approval-automation-policy/1"
+  mode: "disabled" | "advisory" | "decide"
+  evaluator_host: "codex"
+  model: string
+  reasoning: "none" | "low" | "medium" | "high" | "xhigh" | "max"
+  timeout_seconds: number
+}
 
 export interface ControlPlane {
   schema: string
@@ -278,14 +316,16 @@ export interface ControlPlane {
   plans: RoutePlan[]
   settings: SettingsConfig | null
   settings_digest: string | null
+  approval_automation: ApprovalAutomationPolicy | null
+  approval_automation_digest: string | null
   model_policy: ModelPolicy | null
   model_policy_digest: string | null
   role_profiles?: {
     schema: string
-    status: "configuration_only"
-    capability: "codex"
+    status: "host_neutral_role_profiles"
+    capability: "worker_hosts"
     codex: { available: boolean; execution_binding: boolean }
-    non_codex: { available: boolean; reason: string }
+    antigravity: { available: boolean; execution_binding: boolean; reason: string }
     items: RoleProfileSummary[]
     bounded: { limit: number }
   }
@@ -933,7 +973,7 @@ export type RoleProfileRole =
   | "auditor"
 export type RoleProfileReasoning = "low" | "medium" | "high" | "xhigh"
 export type RoleProfileServiceTier = "default" | "priority"
-export type RoleProfileHost = "codex"
+export type RoleProfileHost = "codex" | "antigravity"
 
 export interface RoleProfileBudget {
   max_turns: number
@@ -967,12 +1007,28 @@ export interface RoleProfileDefinition extends RoleProfileDefinitionInput {
   definition_digest: string
 }
 
+export interface EffectiveWorkerAllowancesV1 {
+  schema: "needle.worker-allowances/1"
+  host: RoleProfileHost
+  filesystem_read_checkout: boolean
+  filesystem_write: "denied" | "disposable_checkout"
+  command_policy: "denied" | "read_only" | "certified_tests"
+  network: boolean
+  mcp: boolean
+  subagents: boolean
+  external_effects: boolean
+  human_approval_required: boolean
+  role_profile_definition_digest: string
+  allowance_digest: string
+}
+
 export type RoleProfileState = "draft" | "active" | "inactive"
 
 export interface RoleProfilePreflightSummary {
   passed: boolean
   failures: string[]
   worker_profile_digest: string | null
+  allowance_digest: string | null
 }
 
 export interface RoleProfileSummary {
@@ -986,6 +1042,7 @@ export interface RoleProfileSummary {
   state: RoleProfileState
   state_digest: string
   updated_unix_ms: number
+  allowance_digest: string
 }
 
 export interface RoleProfileRevisionSummary {
@@ -1009,6 +1066,8 @@ export interface RoleProfileDetail {
   definition_digest: string
   worker_profile: WorkerProfile | null
   worker_profile_digest: string | null
+  allowances: EffectiveWorkerAllowancesV1 | null
+  allowance_digest: string | null
   preflight: RoleProfilePreflightSummary
   created_unix_ms: number
   activated_unix_ms: number | null
@@ -1074,6 +1133,8 @@ export interface RoleProfilePreflightResponse {
   definition_digest: string | null
   worker_profile: WorkerProfile | null
   worker_profile_digest: string | null
+  allowances: EffectiveWorkerAllowancesV1 | null
+  allowance_digest: string | null
 }
 
 export interface RoleProfileMutationResponse {
@@ -1508,6 +1569,42 @@ export function useSettingsUpdate() {
         } | null
         throw new Error(
           body?.error ?? `Settings update failed with ${response.status}`
+        )
+      }
+      return response.json()
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["control-plane"] })
+    },
+  })
+}
+
+export function useApprovalAutomationUpdate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({
+      policy,
+      digest,
+    }: {
+      policy: ApprovalAutomationPolicy
+      digest: string
+    }) => {
+      const response = await fetch("/api/v1/approval-automation", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          "if-match": `"${digest}"`,
+          "x-csrf-token": csrfToken(),
+        },
+        body: JSON.stringify(policy),
+      })
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as {
+          error?: string
+        } | null
+        throw new Error(
+          body?.error ?? `Approval automation update failed with ${response.status}`
         )
       }
       return response.json()

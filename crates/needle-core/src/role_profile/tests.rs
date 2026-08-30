@@ -141,6 +141,60 @@ fn compatibility_projection_preserves_existing_worker_digest_semantics() {
 }
 
 #[test]
+fn antigravity_is_a_distinct_host_without_changing_codex_identity() {
+    let codex = RoleProfileDefinition::new(input()).unwrap();
+    assert_eq!(
+        codex.definition_digest.to_string(),
+        "b3:e53953c09f87b0a76a0b453a360f878749cf2d0702ee0c6f3bd3dfc879b2191a"
+    );
+
+    let mut antigravity_input = input();
+    antigravity_input.host = AgentHost::Antigravity;
+    let antigravity = RoleProfileDefinition::new(antigravity_input).unwrap();
+    assert_eq!(antigravity.host.as_str(), "antigravity");
+    assert_ne!(antigravity.definition_digest, codex.definition_digest);
+    assert_eq!(antigravity.to_worker_profile().unwrap().platform, "antigravity");
+
+    let serialized = serde_json::to_string(&antigravity).unwrap();
+    assert!(serialized.contains("\"host\":\"antigravity\""));
+    let decoded: RoleProfileDefinition = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(decoded, antigravity);
+}
+
+#[test]
+fn effective_allowances_are_digest_bound_without_changing_profile_identity() {
+    let definition = RoleProfileDefinition::new(input()).unwrap();
+    let profile_digest = definition.definition_digest;
+    let allowances = definition.effective_allowances().unwrap();
+
+    allowances.validate().unwrap();
+    assert_eq!(allowances.schema, EFFECTIVE_WORKER_ALLOWANCES_SCHEMA_V1);
+    assert_eq!(allowances.role_profile_definition_digest, profile_digest);
+    assert!(allowances.filesystem_read_checkout);
+    assert_eq!(allowances.filesystem_write, FilesystemWriteAllowance::Denied);
+    assert_eq!(allowances.command_policy, CommandPolicy::ReadOnly);
+    assert!(!allowances.network);
+    assert!(!allowances.mcp);
+    assert!(!allowances.subagents);
+    assert!(!allowances.external_effects);
+    assert!(allowances.human_approval_required);
+    assert_eq!(definition.definition_digest, profile_digest);
+
+    let mut implementer = input();
+    implementer.profile_id = RoleProfileId::new("implementer.default").unwrap();
+    implementer.role = CodexRole::Implementer;
+    implementer.tool_policy = ToolPolicy::IsolatedWrite;
+    implementer.filesystem_policy = FilesystemPolicy::DisposableCheckout;
+    let implementer = RoleProfileDefinition::new(implementer).unwrap();
+    let implementer_allowances = implementer.effective_allowances().unwrap();
+    assert_eq!(
+        implementer_allowances.filesystem_write,
+        FilesystemWriteAllowance::DisposableCheckout
+    );
+    assert_ne!(implementer_allowances.allowance_digest, allowances.allowance_digest);
+}
+
+#[test]
 fn reordered_input_json_has_the_same_canonical_identity() {
     let original = input();
     let prompt = original.prompt_profile_digest.to_string();

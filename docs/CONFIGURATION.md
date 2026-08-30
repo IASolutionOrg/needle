@@ -42,25 +42,49 @@ Credentials are neither imported nor exported.
 
 ## Current agent-host scope
 
-Worker execution and orchestration currently use Codex App Server from the
-user's existing Codex installation. Needle uses the host's authentication and
-does not install a private Codex copy. The web control
-plane can edit Codex model policy, runtime bounds, and canonical named role
-profiles. The HTTP/editor changes configuration only; the product hook and MCP
-entry points bind an explicitly selected active revision to each new session.
+Production worker execution and orchestration currently use Codex App Server
+from the user's existing Codex installation. Needle uses the host's
+authentication and does not install a private Codex copy.
 
-The planned Phase 10 sequence adds host adapters that invoke each user's own
-headless runtime, for example `claude` for Claude Code and `agy` for
-Antigravity. Configuration interoperability does not authorize Needle to launch
-or orchestrate those hosts yet. Each adapter has separate compatibility,
-isolation, and validation requirements. See the [product roadmap](ROADMAP.md).
+Phase 10-A/B adds the first second-host foundation for Antigravity. A role-profile
+draft may select `host=antigravity`, and the control plane preserves that host in
+the canonical definition identity. Activation remains fail-closed until Gate A8
+passes. The Shadow adapter invokes the user's official `agy` headless CLI,
+requires its structured NDJSON, schema, usage, timeout, and sandbox surface, and
+runs inside a disposable checkout. It never invokes the Antigravity IDE binary
+or its private language-server executable. `needle doctor` reports the IDE and
+CLI separately. The resolver has an explicit immutable-profile dispatcher for
+standalone Explore, but Antigravity profiles cannot yet become active, so this
+path remains unreachable in ordinary production sessions until Gate A8.
 
-## Canonical Codex role profiles
+Antigravity execution is bound to one exact disposable checkout in three independent places: the
+child process starts with that checkout as its current directory, the adapter passes
+`--add-dir <checkout>`, and the trusted prompt names the checkout and requires repository-relative
+outputs. Needle does not require a global `read_file(...)` permission rule and does not classify
+Antigravity's native tool names. Host-native tools remain opaque implementation details; the kernel
+only reasons about the canonical filesystem, command, network, MCP, subagent, and external-effect
+allowances described below. Unsafe `read_file(*)`, always-proceed, and
+`--dangerously-skip-permissions` configurations remain unsupported.
 
-Named Codex role profiles are persisted in the local SQLite database as
+The two earlier live attempts are retained as failed-closed evidence, but their original diagnosis
+was too strong: transcript review showed that native directory tools requested paths outside the
+isolated checkout, so their denial did not prove an incompatibility between an in-checkout read and
+Antigravity's permission system. The corrected binding has now completed one provider-backed Explore
+smoke successfully: it returned a bounded `src/lib.rs` artifact in one turn, preserved the active
+checkout, and cleaned the disposable checkout. Gate A8 remains open for the other action, lifecycle,
+accounting, and cross-host quality criteria; the smoke alone does not enable production routing.
+
+No non-Codex profile is production-routable yet. Cross-host fallback remains
+disabled, and a separately approved provider-backed validation is required
+before Antigravity activation. See the [product roadmap](ROADMAP.md).
+
+## Canonical agent role profiles
+
+Named role profiles are persisted in the local SQLite database as
 canonical, immutable definition revisions. The supported roles are
 `explorer`, `implementer`, `test_runner`, `reviewer`, `verifier`, and `auditor`;
-the host is always `codex`. Definitions are stored separately from runtime
+the authorable hosts are `codex` and `antigravity`, while only `codex` may be
+activated until Gate A8 passes. Definitions are stored separately from runtime
 settings and `ModelPolicy`, and are not automatically selected or activated.
 
 The safe policy vocabulary is deliberately closed:
@@ -107,6 +131,42 @@ The product hook selects a profile with `NEEDLE_ROLE_PROFILE_ID`. If that
 variable is missing or invalid, the hook remains fail-open but records no
 session row, so the runtime cannot silently attribute the session to a current
 active revision. MCP uses the required `--role-profile <id>` selector.
+
+## Effective worker allowances and approval automation
+
+Every immutable role-profile revision projects to a canonical
+`EffectiveWorkerAllowancesV1`. The projection records the selected host and the effective
+filesystem-read, filesystem-write, command, network, MCP, subagent, and external-effect boundaries.
+Its digest is independent from, and bound alongside, the role-profile definition digest. The local
+Role Profiles page displays both digests and the complete effective allowances before activation;
+the confirmation is invalidated if either digest changes.
+
+The Approval Inbox is host-neutral. A pending request records the host, worker role, immutable
+profile binding, allowance projection, operation kind, bounded operation payload, and a v2 payload
+digest. Human decisions use compare-and-swap against that exact request, so a changed command,
+checkout scope, host, profile, allowance set, or operation cannot inherit an older approval.
+
+The dashboard also exposes a local AI reviewer policy with three modes:
+
+- `disabled` (default): every AI-eligible request waits for the user;
+- `advisory`: the evaluator records `allow`/`disallow` advice, but the user still decides;
+- `decide`: valid evaluator output applies the approval decision automatically.
+
+The default evaluator configuration is the user's Codex host with model `gpt-5.6-luna`, reasoning
+`low`, and a 30-second timeout. Changing the policy is digest-bound and local. AI eligibility is a
+hard safety predicate, not a command-name allowlist: it is limited to direct, read-only command
+requests inside the exact checkout, under an immutable allowance set that denies writes, network,
+MCP, subagents, and external effects. Apply and every other side effect are never AI-eligible.
+
+The evaluator receives only a canonical bounded JSON description, never the repository path or
+contents. It runs in a fresh empty read-only workspace and its final text must parse as the bare JSON
+integer `0` or `1`; an App Server Structured Output schema is deliberately omitted because that API
+requires an object at the schema root.
+Any timeout, malformed output, tool activity, file observation, nested approval, policy mismatch, or
+persistence failure falls back to the human inbox. A provider-backed Luna/low smoke has returned `1`
+for the safe `git status` case and `0` for an ambiguous `unknown-tool delete-all` case, both without
+tool activity or checkout mutation. The feature remains disabled by default as a deliberate safety
+default; these two bounded cases validate the binary evaluator contract, not the broader Gate A8.
 
 ## Export and import
 

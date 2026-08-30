@@ -1,15 +1,16 @@
 use crate::{ProofCandidate, built_in_presets, built_in_routes};
 use needle_core::{
-    ActionRequest, ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, Artifact,
+    ActionRequest, ApprovalAutomationAdvice, ApprovalAutomationPolicy, ApprovalDecision,
+    ApprovalDecisionSource, ApprovalPayloadDigestInputV2, ApprovalRequest, Artifact,
     ArtifactRequest, ArtifactRequestId, ArtifactValidationCertificate, CacheLookup,
     CacheResolution, CapabilityClass, CapabilityMode, CommandClassification,
-    CommandExecutionEvidence, Digest, EvidenceFailurePolicy, MainTurnOutcome, ModelPolicy,
-    MultiNeedPolicy, Need, NeedCacheEntry, NeedCacheIdentity, NeedFragment, NeedIr, NeedStep,
-    NeedStepRelation, NeedStepState, Preset, ReuseDescriptor, ReuseSufficiencyCertificate,
-    RoleProfileId, RoleProfileProvenance, RoleProfileRevision, Route, SelectedPlan,
-    SemanticInterrupt, TestPlan, WorkerConfig, WorkerFailure, WorkerOutcome, WorkerProfile,
-    built_in_capability_classes, built_in_claim_capability_classes, built_in_predicate_contracts,
-    built_in_route_contracts, built_in_route_plans,
+    CommandExecutionEvidence, Digest, EvidenceFailurePolicy, HostUsage, LifecycleUsage,
+    MainTurnOutcome, ModelPolicy, MultiNeedPolicy, Need, NeedCacheEntry, NeedCacheIdentity,
+    NeedFragment, NeedIr, NeedStep, NeedStepRelation, NeedStepState, Preset, ReuseDescriptor,
+    ReuseSufficiencyCertificate, RoleProfileId, RoleProfileProvenance, RoleProfileRevision, Route,
+    SelectedPlan, SemanticInterrupt, TestPlan, WorkerConfig, WorkerFailure, WorkerOutcome,
+    WorkerProfile, built_in_capability_classes, built_in_claim_capability_classes,
+    built_in_predicate_contracts, built_in_route_contracts, built_in_route_plans,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,18 @@ pub use action_assurance::{
     ProviderBackedActionAssuranceInput,
 };
 pub(crate) use action_execution_operations::ActionExecutionOperationClaim;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ActionExecutionUsage<'a> {
+    lifecycle: &'a LifecycleUsage,
+    host: Option<&'a HostUsage>,
+}
+
+impl<'a> ActionExecutionUsage<'a> {
+    pub(crate) fn new(lifecycle: &'a LifecycleUsage, host: Option<&'a HostUsage>) -> Self {
+        Self { lifecycle, host }
+    }
+}
 pub use action_safety::ActionSafetyMetrics;
 pub use activation::{ActivationRecord, ActivationScope, ActivationStatus};
 pub use changes::{
@@ -3195,6 +3208,82 @@ impl RuntimeStore {
         })
     }
 
+    pub fn approval_automation_policy(&self) -> Result<ApprovalAutomationPolicy, StoreError> {
+        let connection = self.connection()?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='approval_automation_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let policy: ApprovalAutomationPolicy =
+            value.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default();
+        policy
+            .validate()
+            .map_err(|_| StoreError::DefinitionDigest("approval_automation_policy".to_owned()))?;
+        Ok(policy)
+    }
+
+    pub fn set_approval_automation_policy(
+        &self,
+        policy: &ApprovalAutomationPolicy,
+    ) -> Result<(), StoreError> {
+        policy
+            .validate()
+            .map_err(|_| StoreError::DefinitionDigest("approval_automation_policy".to_owned()))?;
+        let value = serde_json::to_string(policy)?;
+        if value.len() > 4 * 1024 {
+            return Err(StoreError::DefinitionDigest("approval_automation_policy".to_owned()));
+        }
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO settings(key, value) VALUES('approval_automation_policy', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [value],
+        )?;
+        Ok(())
+    }
+
+    pub fn compare_and_set_approval_automation_policy(
+        &self,
+        expected_digest: Digest,
+        policy: &ApprovalAutomationPolicy,
+    ) -> Result<bool, StoreError> {
+        policy
+            .validate()
+            .map_err(|_| StoreError::DefinitionDigest("approval_automation_policy".to_owned()))?;
+        let value = serde_json::to_string(policy)?;
+        if value.len() > 4 * 1024 {
+            return Err(StoreError::DefinitionDigest("approval_automation_policy".to_owned()));
+        }
+        let mut connection = self.connection()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current_json: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE key='approval_automation_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current: ApprovalAutomationPolicy =
+            current_json.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default();
+        current
+            .validate()
+            .map_err(|_| StoreError::DefinitionDigest("approval_automation_policy".to_owned()))?;
+        if current.digest() != expected_digest {
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO settings(key, value) VALUES('approval_automation_policy', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [value],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn set_runtime_settings(&self, settings: &RuntimeSettings) -> Result<(), StoreError> {
         let safe_token = |value: &str, maximum: usize| {
             !value.is_empty()
@@ -5770,6 +5859,80 @@ impl RuntimeStore {
         Ok(request)
     }
 
+    pub fn record_approval_automation_advice(
+        &self,
+        id: &str,
+        expected_payload_digest: Digest,
+        advice: ApprovalAutomationAdvice,
+    ) -> Result<ApprovalRequest, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let json: Option<String> = transaction
+            .query_row(
+                "SELECT request_json FROM approval_requests
+                 WHERE approval_id=?1 AND status='pending'",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Err(StoreError::ApprovalConflict(id.to_owned()));
+        };
+        let mut request: ApprovalRequest = serde_json::from_str(&json)?;
+        let policy_json: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE key='approval_automation_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let policy: ApprovalAutomationPolicy =
+            policy_json.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default();
+        policy.validate().map_err(|_| StoreError::ApprovalConflict(id.to_owned()))?;
+        let recomputed_payload =
+            ApprovalRequest::compute_payload_digest_v2(ApprovalPayloadDigestInputV2 {
+                host: request.host,
+                worker_role: request.worker_role,
+                role_profile: request.role_profile.as_ref(),
+                allowances: request.allowances.as_ref(),
+                operation: request.operation,
+                argv: &request.argv,
+                cwd: &request.cwd,
+                requested_permissions: &request.requested_permissions,
+            })?;
+        if request.payload_digest != expected_payload_digest
+            || request.payload_digest_revision != 2
+            || recomputed_payload != request.payload_digest
+            || advice.input_digest == Digest([0; 32])
+            || policy.mode == needle_core::ApprovalAutomationMode::Disabled
+            || advice.policy_digest != policy.digest()
+            || advice.evaluator_host != policy.evaluator_host
+            || advice.model != policy.model
+            || advice.reasoning != policy.reasoning
+            || !matches!(request.classification, CommandClassification::PendingAiEligible)
+            || request.operation != needle_core::ApprovalOperation::CommandExecution
+            || request.allowances.as_ref().is_none_or(|allowances| {
+                allowances.validate().is_err()
+                    || allowances.host != request.host
+                    || allowances.command_policy != needle_core::CommandPolicy::ReadOnly
+                    || allowances.filesystem_write != needle_core::FilesystemWriteAllowance::Denied
+            })
+            || !request.requested_permissions.write_paths.is_empty()
+            || request.requested_permissions.network
+        {
+            return Err(StoreError::ApprovalConflict(id.to_owned()));
+        }
+        request.automation_advice = Some(advice);
+        transaction.execute(
+            "UPDATE approval_requests SET request_json=?2
+             WHERE approval_id=?1 AND status='pending'",
+            params![id, serde_json::to_string(&request)?],
+        )?;
+        transaction.commit()?;
+        Ok(request)
+    }
+
     pub fn expire_approvals(&self) -> Result<u64, StoreError> {
         let decided_unix_ms = now_ms();
         let mut connection = self.connection()?;
@@ -7447,6 +7610,27 @@ mod tests {
             multi_need_policy: MultiNeedPolicy::default(),
         };
         store.initialize_defaults(&initial).unwrap();
+        let default_automation = store.approval_automation_policy().unwrap();
+        assert_eq!(default_automation.mode, needle_core::ApprovalAutomationMode::Disabled);
+        assert_eq!(default_automation.model, "gpt-5.6-luna");
+        assert_eq!(default_automation.reasoning, "low");
+        let default_digest = default_automation.digest();
+        let mut enabled_automation = default_automation;
+        enabled_automation.mode = needle_core::ApprovalAutomationMode::Advisory;
+        assert!(
+            store
+                .compare_and_set_approval_automation_policy(default_digest, &enabled_automation)
+                .unwrap()
+        );
+        assert_eq!(store.approval_automation_policy().unwrap(), enabled_automation);
+        let mut stale_update = enabled_automation.clone();
+        stale_update.mode = needle_core::ApprovalAutomationMode::Decide;
+        assert!(
+            !store
+                .compare_and_set_approval_automation_policy(default_digest, &stale_update)
+                .unwrap()
+        );
+        assert_eq!(store.approval_automation_policy().unwrap(), enabled_automation);
         let mut updated = initial.clone();
         updated.worker_model = "gpt-5.6-sol".to_owned();
         updated.worker_reasoning = "high".to_owned();
@@ -7772,6 +7956,11 @@ mod tests {
         let argv = vec!["cargo".to_owned(), "test".to_owned()];
         let cwd = "C:/sandbox";
         ApprovalRequest {
+            host: needle_core::AgentHost::Codex,
+            worker_role: None,
+            role_profile: None,
+            allowances: None,
+            operation: needle_core::ApprovalOperation::CommandExecution,
             id: id.to_owned(),
             protocol_request_id: serde_json::json!(1),
             protocol_approval_id: None,
@@ -7790,6 +7979,8 @@ mod tests {
             classification: CommandClassification::PendingUser,
             payload_digest: ApprovalRequest::compute_payload_digest(&argv, cwd, &permissions)
                 .unwrap(),
+            payload_digest_revision: 1,
+            automation_advice: None,
             decision: None,
             decision_source: None,
             decided_unix_ms: None,
@@ -7826,6 +8017,89 @@ mod tests {
                 ApprovalDecisionSource::WebUser,
                 request.payload_digest,
             ),
+            Err(StoreError::ApprovalConflict(_))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn approval_automation_advice_is_bound_to_current_policy_and_payload() {
+        let (path, store) = temporary_store();
+        store.initialize().unwrap();
+        let definition =
+            needle_core::RoleProfileDefinition::new(needle_core::RoleProfileDefinitionInput {
+                profile_id: needle_core::RoleProfileId::new("reviewer.approval").unwrap(),
+                role: needle_core::CodexRole::Reviewer,
+                host: needle_core::AgentHost::Codex,
+                model: "gpt-5.6-luna".to_owned(),
+                reasoning: needle_core::ReasoningLevel::Low,
+                service_tier: needle_core::ServiceTier::Default,
+                timeout_seconds: 30,
+                budget: needle_core::RoleProfileBudget {
+                    max_turns: 1,
+                    max_output_tokens: 64,
+                    max_cost_microusd: 100,
+                },
+                prompt_profile_digest: Digest::blake3(b"prompt"),
+                output_contract_digest: Digest::blake3(b"output"),
+                tool_policy: needle_core::ToolPolicy::ReadOnly,
+                command_policy: needle_core::CommandPolicy::ReadOnly,
+                filesystem_policy: needle_core::FilesystemPolicy::ReadOnlyCheckout,
+                network_policy: needle_core::NetworkPolicy::Denied,
+                test_policy: needle_core::TestPolicy::Disabled,
+                repair_policy: needle_core::RepairPolicy::None,
+                fallback_policy: needle_core::FallbackPolicy::Disabled,
+                concurrency: 1,
+                route_assignments: Vec::new(),
+            })
+            .unwrap();
+        let allowances = definition.effective_allowances().unwrap();
+        let mut policy = store.approval_automation_policy().unwrap();
+        let default_digest = policy.digest();
+        policy.mode = needle_core::ApprovalAutomationMode::Advisory;
+        assert!(store.compare_and_set_approval_automation_policy(default_digest, &policy).unwrap());
+
+        let mut request = approval("ai-advice", now_ms() + 60_000);
+        request.worker_role = Some(needle_core::CodexRole::Reviewer);
+        request.allowances = Some(allowances);
+        request.classification = CommandClassification::PendingAiEligible;
+        request.payload_digest_revision = 2;
+        request.payload_digest =
+            ApprovalRequest::compute_payload_digest_v2(ApprovalPayloadDigestInputV2 {
+                host: request.host,
+                worker_role: request.worker_role,
+                role_profile: request.role_profile.as_ref(),
+                allowances: request.allowances.as_ref(),
+                operation: request.operation,
+                argv: &request.argv,
+                cwd: &request.cwd,
+                requested_permissions: &request.requested_permissions,
+            })
+            .unwrap();
+        store.enqueue_approval(&request).unwrap();
+        let advice = ApprovalAutomationAdvice {
+            policy_digest: policy.digest(),
+            input_digest: Digest::blake3(b"bounded-input"),
+            evaluator_host: policy.evaluator_host,
+            model: policy.model.clone(),
+            reasoning: policy.reasoning.clone(),
+            decision: true,
+            input_tokens: Some(12),
+            output_tokens: Some(1),
+            evaluated_unix_ms: now_ms(),
+        };
+        let recorded = store
+            .record_approval_automation_advice(&request.id, request.payload_digest, advice.clone())
+            .unwrap();
+        assert_eq!(recorded.automation_advice, Some(advice.clone()));
+
+        let mut changed = policy.clone();
+        changed.mode = needle_core::ApprovalAutomationMode::Decide;
+        assert!(
+            store.compare_and_set_approval_automation_policy(policy.digest(), &changed).unwrap()
+        );
+        assert!(matches!(
+            store.record_approval_automation_advice(&request.id, request.payload_digest, advice,),
             Err(StoreError::ApprovalConflict(_))
         ));
         let _ = fs::remove_file(path);

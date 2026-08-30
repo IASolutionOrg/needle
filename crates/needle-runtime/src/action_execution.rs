@@ -5,8 +5,8 @@ use crate::{
 };
 use needle_core::{
     ActionRequest, Artifact, ArtifactId, ArtifactRequest, ArtifactValidationCertificateId,
-    CacheScope, CapabilityMode, ChangeActionInput, DependencyManifest, Digest, LifecycleUsage,
-    Need, NeedExecution, NeedExecutionEnvelopeV1, NeedFragment, SemanticWorld,
+    CacheScope, CapabilityMode, ChangeActionInput, DependencyManifest, Digest, HostUsage,
+    LifecycleUsage, Need, NeedExecution, NeedExecutionEnvelopeV1, NeedFragment, SemanticWorld,
     built_in_route_contracts, compile_need, need_fragment,
 };
 use thiserror::Error;
@@ -29,6 +29,7 @@ pub struct ChangeActionProviderOutput {
     pub review_manifest: Option<ShadowPartitionManifestPublication>,
     pub review_transition: Option<needle_core::ManifestTransition>,
     pub usage: LifecycleUsage,
+    pub host_usage: Option<HostUsage>,
 }
 
 pub trait ChangeActionProvider: Send + Sync {
@@ -59,6 +60,7 @@ pub struct ActionExecutionResult {
     pub validation_certificate: ArtifactValidationCertificateId,
     pub partition_manifest: Option<needle_core::PartitionManifestId>,
     pub usage: LifecycleUsage,
+    pub host_usage: Option<HostUsage>,
     pub authority: CapabilityMode,
     pub completion_reused: bool,
     pub idempotent_replay: bool,
@@ -110,6 +112,7 @@ where
                 validation_certificate,
                 partition_manifest,
                 usage,
+                host_usage,
             } => {
                 let artifact =
                     self.store.semantic_artifact(&artifact.to_string())?.ok_or_else(|| {
@@ -136,6 +139,7 @@ where
                     validation_certificate,
                     partition_manifest,
                     usage,
+                    host_usage,
                     authority: CapabilityMode::Shadow,
                     completion_reused: false,
                     idempotent_replay: true,
@@ -171,6 +175,7 @@ where
         )?;
         let output = provider.output;
         let usage = provider.usage;
+        let host_usage = provider.host_usage;
 
         let result = match (
             &compiled.definition.coverage,
@@ -192,7 +197,7 @@ where
                     envelope.operation_id,
                     &request,
                     &publication,
-                    &usage,
+                    crate::store::ActionExecutionUsage::new(&usage, host_usage.as_ref()),
                 )?;
                 ActionExecutionResult {
                     operation_id: envelope.operation_id,
@@ -202,6 +207,7 @@ where
                     validation_certificate: publication.certificate().id,
                     partition_manifest: None,
                     usage: usage.clone(),
+                    host_usage: host_usage.clone(),
                     authority: CapabilityMode::Shadow,
                     completion_reused: false,
                     idempotent_replay: false,
@@ -227,7 +233,7 @@ where
                     &manifest,
                     &publication,
                     transition.as_ref(),
-                    &usage,
+                    crate::store::ActionExecutionUsage::new(&usage, host_usage.as_ref()),
                 )?;
                 ActionExecutionResult {
                     operation_id: envelope.operation_id,
@@ -237,6 +243,7 @@ where
                     validation_certificate: publication.certificate().id,
                     partition_manifest: Some(manifest.manifest.id),
                     usage: usage.clone(),
+                    host_usage: host_usage.clone(),
                     authority: CapabilityMode::Shadow,
                     completion_reused: false,
                     idempotent_replay: false,

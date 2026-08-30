@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/needle-core",
     "crates/needle-runtime",
+    "crates/needle-worker-contract",
     "crates/needle-platform-codex",
+    "crates/needle-platform-antigravity",
     "crates/needle-bench",
     "crates/needle-app",
 ]

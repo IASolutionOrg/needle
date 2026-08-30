@@ -1,6 +1,7 @@
 use needle_core::{
-    ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, CommandClassification,
-    CommandExecutionEvidence, Digest, ReadOnlyCommandPolicy, RequestedPermissions, TestCommand,
+    AgentHost, ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, CodexRole,
+    CommandClassification, CommandExecutionEvidence, Digest, EffectiveWorkerAllowancesV1,
+    ReadOnlyCommandPolicy, RequestedPermissions, RoleProfileProvenance, TestCommand,
     TestCommandPolicy, TestPlan,
 };
 use std::collections::BTreeMap;
@@ -15,6 +16,10 @@ const MAX_GET_CONTENT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ApprovalContext {
+    pub host: AgentHost,
+    pub worker_role: Option<CodexRole>,
+    pub role_profile: Option<RoleProfileProvenance>,
+    pub allowances: Option<EffectiveWorkerAllowancesV1>,
     pub route: String,
     pub repository_id: Digest,
     pub checkout_root: PathBuf,
@@ -25,6 +30,7 @@ pub struct ApprovalContext {
     /// `test_plan` and retain their historical two-execution budget.
     pub verifier_test_plans: Option<Vec<TestPlan>>,
     pub test_execution_available: bool,
+    pub ai_approval_eligible: bool,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -215,9 +221,12 @@ impl ApprovalBroker {
             parse_read_only_command_argv(command_display),
             parse_read_only_command_argv(command_action),
         ) else {
-            return (
-                parse_direct_argv(command_action).unwrap_or_default(),
-                CommandClassification::PendingUser,
+            return ai_pending_candidate(
+                command_display,
+                command_action,
+                cwd,
+                permissions,
+                context,
             );
         };
         if display_argv != argv
@@ -269,9 +278,65 @@ impl ApprovalBroker {
             | CommandClassification::Expired => {
                 Some((ApprovalDecision::Decline, ApprovalDecisionSource::Runtime))
             }
-            CommandClassification::PendingUser => None,
+            CommandClassification::PendingUser | CommandClassification::PendingAiEligible => None,
         }
     }
+}
+
+fn ai_pending_candidate(
+    command_display: &str,
+    command_action: &str,
+    cwd: &Path,
+    permissions: &RequestedPermissions,
+    context: &ApprovalContext,
+) -> (Vec<String>, CommandClassification) {
+    let action = parse_direct_argv(command_action).unwrap_or_default();
+    let display = parse_direct_argv(command_display).unwrap_or_default();
+    let eligible = context.ai_approval_eligible
+        && !action.is_empty()
+        && action == display
+        && argv_path_arguments_are_within(&action, &context.checkout_root)
+        && same_canonical_path(cwd, &context.checkout_root)
+        && permissions.write_paths.is_empty()
+        && !permissions.network
+        && read_permissions_are_within(permissions, &context.checkout_root)
+        && context.allowances.as_ref().is_some_and(|allowances| {
+            allowances.validate().is_ok()
+                && allowances.host == context.host
+                && allowances.command_policy == needle_core::CommandPolicy::ReadOnly
+                && !allowances.network
+                && !allowances.mcp
+                && !allowances.subagents
+                && !allowances.external_effects
+                && allowances.filesystem_write == needle_core::FilesystemWriteAllowance::Denied
+        });
+    (
+        action,
+        if eligible {
+            CommandClassification::PendingAiEligible
+        } else {
+            CommandClassification::PendingUser
+        },
+    )
+}
+
+fn argv_path_arguments_are_within(argv: &[String], checkout_root: &Path) -> bool {
+    let Ok(checkout_root) = fs::canonicalize(checkout_root) else {
+        return false;
+    };
+    argv.iter().all(|argument| {
+        let path = Path::new(argument);
+        let components = path.components().collect::<Vec<_>>();
+        if components.iter().any(|component| matches!(component, Component::ParentDir)) {
+            return false;
+        }
+        if path.is_absolute() {
+            return fs::canonicalize(path).is_ok_and(|path| path.starts_with(&checkout_root));
+        }
+        !components
+            .iter()
+            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    })
 }
 
 fn same_canonical_path(left: &Path, right: &Path) -> bool {
@@ -837,6 +902,11 @@ mod tests {
         ];
         let permissions = RequestedPermissions::default();
         ApprovalRequest {
+            host: AgentHost::Codex,
+            worker_role: None,
+            role_profile: None,
+            allowances: None,
+            operation: needle_core::ApprovalOperation::CommandExecution,
             id: "shared-protocol-approval".to_owned(),
             protocol_request_id: serde_json::json!(1),
             protocol_approval_id: Some("shared-protocol-approval".to_owned()),
@@ -857,6 +927,8 @@ mod tests {
             },
             payload_digest: ApprovalRequest::compute_payload_digest(&argv, ".", &permissions)
                 .unwrap(),
+            payload_digest_revision: 1,
+            automation_advice: None,
             decision: Some(ApprovalDecision::Accept),
             decision_source: Some(ApprovalDecisionSource::AutoPolicy),
             decided_unix_ms: Some(1),
@@ -865,6 +937,10 @@ mod tests {
 
     fn context(root: &Path) -> ApprovalContext {
         ApprovalContext {
+            host: AgentHost::Codex,
+            worker_role: None,
+            role_profile: None,
+            allowances: None,
             route: "tests.relevant".to_owned(),
             repository_id: Digest::blake3("repo"),
             checkout_root: root.join("checkout"),
@@ -888,7 +964,93 @@ mod tests {
             }),
             verifier_test_plans: None,
             test_execution_available: true,
+            ai_approval_eligible: false,
         }
+    }
+
+    fn read_only_allowances() -> needle_core::EffectiveWorkerAllowancesV1 {
+        needle_core::RoleProfileDefinition::new(needle_core::RoleProfileDefinitionInput {
+            profile_id: needle_core::RoleProfileId::new("reviewer.ai-approval").unwrap(),
+            role: needle_core::CodexRole::Reviewer,
+            host: AgentHost::Codex,
+            model: "gpt-5.6-luna".to_owned(),
+            reasoning: needle_core::ReasoningLevel::Low,
+            service_tier: needle_core::ServiceTier::Default,
+            timeout_seconds: 30,
+            budget: needle_core::RoleProfileBudget {
+                max_turns: 1,
+                max_output_tokens: 64,
+                max_cost_microusd: 100,
+            },
+            prompt_profile_digest: Digest::blake3(b"prompt"),
+            output_contract_digest: Digest::blake3(b"output"),
+            tool_policy: needle_core::ToolPolicy::ReadOnly,
+            command_policy: needle_core::CommandPolicy::ReadOnly,
+            filesystem_policy: needle_core::FilesystemPolicy::ReadOnlyCheckout,
+            network_policy: needle_core::NetworkPolicy::Denied,
+            test_policy: needle_core::TestPolicy::Disabled,
+            repair_policy: needle_core::RepairPolicy::None,
+            fallback_policy: needle_core::FallbackPolicy::Disabled,
+            concurrency: 1,
+            route_assignments: Vec::new(),
+        })
+        .unwrap()
+        .effective_allowances()
+        .unwrap()
+    }
+
+    #[test]
+    fn ai_eligibility_is_a_hard_read_only_boundary_not_a_command_taxonomy() {
+        let root =
+            std::env::temp_dir().join(format!("needle-ai-approval-context-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        prepare_read_fixture(&root);
+        let mut context = context(&root);
+        context.test_plan = None;
+        context.test_execution_available = false;
+        context.ai_approval_eligible = true;
+        context.allowances = Some(read_only_allowances());
+        let cwd = context.checkout_root.clone();
+        let mut broker = ApprovalBroker::default();
+        let (_, classification) = broker.classify_command(
+            Some("git status"),
+            Some("git status"),
+            &cwd,
+            &RequestedPermissions::default(),
+            &context,
+        );
+        assert_eq!(classification, CommandClassification::PendingAiEligible);
+
+        let (_, classification) = broker.classify_command(
+            Some("git status"),
+            Some("git status"),
+            &context.target_root,
+            &RequestedPermissions::default(),
+            &context,
+        );
+        assert!(!matches!(classification, CommandClassification::PendingAiEligible));
+
+        let outside = if cfg!(windows) { "C:/Windows" } else { "/etc" };
+        let command = format!("unknown-tool {outside}");
+        let (_, classification) = broker.classify_command(
+            Some(&command),
+            Some(&command),
+            &cwd,
+            &RequestedPermissions::default(),
+            &context,
+        );
+        assert!(!matches!(classification, CommandClassification::PendingAiEligible));
+
+        context.ai_approval_eligible = false;
+        let (_, classification) = broker.classify_command(
+            Some("git status"),
+            Some("git status"),
+            &cwd,
+            &RequestedPermissions::default(),
+            &context,
+        );
+        assert_eq!(classification, CommandClassification::PendingUser);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn read_only_broker(repository_id: Digest) -> ApprovalBroker {
