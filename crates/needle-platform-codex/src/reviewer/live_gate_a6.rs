@@ -581,6 +581,7 @@ fn provider_backed_review_refresh_is_noninferior_across_two_opaque_ecosystems() 
         reasoning: reasoning.clone(),
         service_tier: service_tier.clone(),
         timeout_seconds,
+        max_turns: 2,
         evidence_failure_policy: needle_core::EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };

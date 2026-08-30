@@ -6,7 +6,8 @@ run. It is a development workflow, not a supported installation path.
 ## Requirements
 
 - Rust `1.90.0` with `rustfmt` and `clippy`;
-- Codex `0.144.0` for the currently validated App Server adapter;
+- a user-installed Codex CLI exposing the required App Server methods and
+  generated schemas;
 - Node.js `22.22.0` or newer and npm for building the embedded frontend assets.
   Node.js is not needed at runtime.
 
@@ -14,11 +15,12 @@ run. It is a development workflow, not a supported installation path.
 rustup toolchain install 1.90.0 --component rustfmt --component clippy
 ```
 
-Use the native Codex package. On Windows the managed development layout is the
-official `codex-package-x86_64-pc-windows-msvc` archive with its `bin`,
-`codex-path`, and `codex-resources` directories intact, not a copied standalone
-`codex.exe`, launcher script, or shell. Unsupported versions, incomplete
-packages, or missing App Server capabilities fail preflight.
+Needle accepts a native Codex executable and, on Windows, the official
+`codex.cmd`/`codex.bat` CLI launcher. It rejects arbitrary scripts and shells.
+Compatibility is capability-based: Needle checks the App Server flags,
+generates a bounded schema bundle, validates the methods and fields it uses, and
+records the version plus protocol digest. Missing capabilities fail closed;
+known schema fixtures are reported separately from compatible newer versions.
 
 ## Build
 
@@ -42,13 +44,13 @@ Use an explicit data directory so the profile is isolated and disposable:
 ```text
 cargo run --locked -p needle-app -- init \
   --data-dir .needle-data \
-  --codex <path-to-native-codex> \
+  --codex <path-to-codex-launcher> \
   --worker-model <worker-model> \
   --worker-reasoning medium \
   --evidence-failure-policy discard_invalid_fact
 ```
 
-Initialization records the native launcher, worker profile, timeout, evidence
+Initialization records the resolved host launcher, worker profile, timeout, evidence
 failure policy, trusted-test setting, default routes, plans, and model policy in
 SQLite. `repair_once` permits at most one bounded repair in the same temporary
 worker thread.
@@ -58,7 +60,7 @@ Trusted test execution is opt-in:
 ```text
 cargo run --locked -p needle-app -- init \
   --data-dir .needle-data \
-  --codex <path-to-native-codex> \
+  --codex <path-to-codex-launcher> \
   --worker-model <worker-model> \
   --worker-reasoning medium \
   --trust-test-execution

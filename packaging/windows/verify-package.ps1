@@ -36,6 +36,7 @@ if (Test-Path -LiteralPath $work) {
 
 $extracted = Join-Path $work "extracted"
 $installed = Join-Path $work "installed"
+$preservedInstalled = Join-Path $work "preserved-installed"
 $data = Join-Path $work "data"
 Expand-Archive -LiteralPath $archivePath -DestinationPath $extracted
 
@@ -43,21 +44,17 @@ $requiredArchiveFiles = @(
     "needle.exe",
     "install.ps1",
     "uninstall.ps1",
-    "CODEX_RUNTIME.md",
     "LICENSE.md",
-    "README.md",
-    "runtime\bin\codex.exe",
-    "runtime\bin\codex-code-mode-host.exe",
-    "runtime\codex-path\rg.exe",
-    "runtime\codex-resources\codex-command-runner.exe",
-    "runtime\codex-resources\codex-windows-sandbox-setup.exe",
-    "runtime\codex-package.json"
+    "README.md"
 )
 foreach ($relativePath in $requiredArchiveFiles) {
     $path = Join-Path $extracted $relativePath
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Needle archive is incomplete: missing $relativePath"
     }
+}
+if (Test-Path -LiteralPath (Join-Path $extracted "runtime")) {
+    throw "Needle archive must not contain a bundled host runtime"
 }
 
 $packagedNeedle = Join-Path $extracted "needle.exe"
@@ -66,20 +63,36 @@ if ($LASTEXITCODE -ne 0) {
     throw "Packaged Needle executable failed its version probe"
 }
 
+$legacyRuntime = Join-Path $installed "runtime"
+$legacyRuntimeFiles = @(
+    "bin\codex.exe",
+    "bin\codex-code-mode-host.exe",
+    "codex-path\rg.exe",
+    "codex-resources\codex-command-runner.exe",
+    "codex-resources\codex-windows-sandbox-setup.exe",
+    "codex-package.json"
+)
+foreach ($relativePath in $legacyRuntimeFiles) {
+    $path = Join-Path $legacyRuntime $relativePath
+    [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($path)) | Out-Null
+    Set-Content -LiteralPath $path -Value "legacy Needle runtime fixture"
+}
+$preservedInstallFile = Join-Path $installed "preserve.txt"
+Set-Content -LiteralPath $preservedInstallFile -Value "unmanaged installation content"
+
 & (Join-Path $extracted "install.ps1") -InstallDirectory $installed -SkipPathUpdate
 $installedNeedle = Join-Path $installed "needle.exe"
-$installedRuntime = Join-Path $installed "runtime"
 $installedUninstaller = Join-Path $installed "uninstall.ps1"
 foreach ($path in @($installedNeedle, $installedUninstaller)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Needle isolated installation is incomplete: missing $path"
     }
 }
-foreach ($relativePath in $requiredArchiveFiles | Where-Object { $_.StartsWith("runtime\") }) {
-    $path = Join-Path $installed $relativePath
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "Needle isolated installation is incomplete: missing $relativePath"
-    }
+if (Test-Path -LiteralPath (Join-Path $installed "runtime")) {
+    throw "Needle installer must remove the complete legacy managed runtime"
+}
+if (-not (Test-Path -LiteralPath $preservedInstallFile -PathType Leaf)) {
+    throw "Needle installer removed unrelated installation content"
 }
 
 & $installedNeedle uninstall --help | Out-Null
@@ -90,7 +103,6 @@ if ($LASTEXITCODE -ne 0) {
     -ParentProcessId $PID `
     -InstallDirectory $installed `
     -Executable $installedNeedle `
-    -RuntimeDirectory $installedRuntime `
     -ValidateOnly
 if ($LASTEXITCODE -ne 0) {
     throw "Installed Needle uninstaller failed validation"
@@ -151,6 +163,44 @@ try {
 if ((Test-Path -LiteralPath $stderr) -and
     -not [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $stderr -Raw))) {
     throw "Installed Needle server wrote unexpected diagnostics: $(Get-Content -LiteralPath $stderr -Raw)"
+}
+
+& $installedUninstaller `
+    -ParentProcessId ([int]::MaxValue) `
+    -InstallDirectory $installed `
+    -Executable $installedNeedle
+foreach ($path in @($installedNeedle, $installedUninstaller)) {
+    if (Test-Path -LiteralPath $path) {
+        throw "Needle uninstaller did not remove managed file: $path"
+    }
+}
+if (-not (Test-Path -LiteralPath $preservedInstallFile -PathType Leaf)) {
+    throw "Needle uninstaller removed unrelated installation content"
+}
+
+$preservedRuntime = Join-Path $preservedInstalled "runtime"
+$preservedRuntimeMarker = Join-Path $preservedRuntime "user-host.txt"
+[System.IO.Directory]::CreateDirectory($preservedRuntime) | Out-Null
+Set-Content -LiteralPath $preservedRuntimeMarker -Value "unmanaged user host fixture"
+& (Join-Path $extracted "install.ps1") `
+    -InstallDirectory $preservedInstalled `
+    -SkipPathUpdate
+$preservedNeedle = Join-Path $preservedInstalled "needle.exe"
+$preservedUninstaller = Join-Path $preservedInstalled "uninstall.ps1"
+if (-not (Test-Path -LiteralPath $preservedRuntimeMarker -PathType Leaf)) {
+    throw "Needle installer removed an unmanaged host runtime"
+}
+& $preservedUninstaller `
+    -ParentProcessId ([int]::MaxValue) `
+    -InstallDirectory $preservedInstalled `
+    -Executable $preservedNeedle
+foreach ($path in @($preservedNeedle, $preservedUninstaller)) {
+    if (Test-Path -LiteralPath $path) {
+        throw "Needle uninstaller did not remove managed file: $path"
+    }
+}
+if (-not (Test-Path -LiteralPath $preservedRuntimeMarker -PathType Leaf)) {
+    throw "Needle uninstaller removed an unmanaged host runtime"
 }
 
 Write-Host "Needle Windows package verification passed."

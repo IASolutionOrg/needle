@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
     [string]$SourceBinary = (Join-Path $PSScriptRoot "needle.exe"),
-    [string]$SourceCodexRuntime = (Join-Path $PSScriptRoot "runtime"),
     [string]$SourceUninstaller = (Join-Path $PSScriptRoot "uninstall.ps1"),
     [string]$InstallDirectory = (Join-Path $env:LOCALAPPDATA "Programs\Needle"),
     [switch]$SkipPathUpdate
@@ -13,41 +12,51 @@ Set-StrictMode -Version Latest
 if (-not (Test-Path -LiteralPath $SourceBinary -PathType Leaf)) {
     throw "Needle binary was not found at $SourceBinary"
 }
-if (-not (Test-Path -LiteralPath $SourceCodexRuntime -PathType Container)) {
-    throw "Needle's managed Codex runtime was not found at $SourceCodexRuntime"
-}
 if (-not (Test-Path -LiteralPath $SourceUninstaller -PathType Leaf)) {
     throw "Needle's managed uninstaller was not found at $SourceUninstaller"
 }
 
-$requiredRuntimeFiles = @(
-    "bin\codex.exe",
-    "bin\codex-code-mode-host.exe",
-    "codex-path\rg.exe",
-    "codex-resources\codex-command-runner.exe",
-    "codex-resources\codex-windows-sandbox-setup.exe",
-    "codex-package.json"
-)
-foreach ($relativePath in $requiredRuntimeFiles) {
-    $runtimePath = Join-Path $SourceCodexRuntime $relativePath
-    if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
-        throw "Needle's managed Codex runtime is incomplete: missing $relativePath"
-    }
-}
-
 $source = (Resolve-Path -LiteralPath $SourceBinary).Path
-$runtimeSource = (Resolve-Path -LiteralPath $SourceCodexRuntime).Path
 $uninstallerSource = (Resolve-Path -LiteralPath $SourceUninstaller).Path
 [System.IO.Directory]::CreateDirectory($InstallDirectory) | Out-Null
+$separators = [char[]]@(
+    [System.IO.Path]::DirectorySeparatorChar,
+    [System.IO.Path]::AltDirectorySeparatorChar
+)
+$install = [System.IO.Path]::GetFullPath($InstallDirectory).TrimEnd($separators)
+$legacyRuntime = Join-Path $install "runtime"
+if (Test-Path -LiteralPath $legacyRuntime -PathType Container) {
+    $legacyRuntime = [System.IO.Path]::GetFullPath($legacyRuntime).TrimEnd($separators)
+    $comparer = [System.StringComparer]::OrdinalIgnoreCase
+    if (-not $comparer.Equals([System.IO.Path]::GetDirectoryName($legacyRuntime), $install) -or
+        -not $comparer.Equals([System.IO.Path]::GetFileName($legacyRuntime), "runtime")) {
+        throw "Legacy Needle runtime is outside the installation directory"
+    }
+    $requiredLegacyRuntimeFiles = @(
+        "bin\codex.exe",
+        "bin\codex-code-mode-host.exe",
+        "codex-path\rg.exe",
+        "codex-resources\codex-command-runner.exe",
+        "codex-resources\codex-windows-sandbox-setup.exe",
+        "codex-package.json"
+    )
+    $legacyRuntimeItem = Get-Item -LiteralPath $legacyRuntime -Force
+    $legacyRuntimeIsManaged = -not [bool](
+        $legacyRuntimeItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint
+    )
+    foreach ($relativePath in $requiredLegacyRuntimeFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $legacyRuntime $relativePath) -PathType Leaf)) {
+            $legacyRuntimeIsManaged = $false
+            break
+        }
+    }
+    if ($legacyRuntimeIsManaged) {
+        Remove-Item -LiteralPath $legacyRuntime -Recurse -Force
+    }
+}
 $destination = Join-Path $InstallDirectory "needle.exe"
 if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($source, $destination)) {
     Copy-Item -LiteralPath $source -Destination $destination -Force
-}
-
-$runtimeDirectory = Join-Path $InstallDirectory "runtime"
-[System.IO.Directory]::CreateDirectory($runtimeDirectory) | Out-Null
-if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($runtimeSource, $runtimeDirectory)) {
-    Get-ChildItem -LiteralPath $runtimeSource | Copy-Item -Destination $runtimeDirectory -Recurse -Force
 }
 
 $uninstallerDestination = Join-Path $InstallDirectory "uninstall.ps1"

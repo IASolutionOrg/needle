@@ -197,7 +197,7 @@ fn run_init(arguments: Vec<String>) -> Result<(), AppError> {
     validate_model_value(&worker_model, "worker model")?;
     validate_reasoning(&worker_reasoning)?;
     let codex_executable =
-        option_value(&arguments, "--codex").unwrap_or_else(|| "codex".to_owned());
+        resolve_codex(option_value(&arguments, "--codex"))?.to_string_lossy().into_owned();
     let worker_timeout_seconds = option_value(&arguments, "--worker-timeout-seconds")
         .map(|value| value.parse::<u64>())
         .transpose()
@@ -217,8 +217,12 @@ fn run_init(arguments: Vec<String>) -> Result<(), AppError> {
     let isolation = CodexWorker::verify_isolation(&codex_executable).map_err(AppError::Runtime)?;
     if !isolation.verified() {
         return Err(AppError::Runtime(format!(
-            "Codex {} is not in the exact validated set or lacks required isolation flags",
-            isolation.codex_version
+            "Codex {} is not App Server protocol-compatible: {}",
+            isolation.codex_version,
+            isolation
+                .incompatibility_reason
+                .as_deref()
+                .unwrap_or("required capabilities are missing")
         )));
     }
     let data_directory = product_data_directory(&arguments)?;
@@ -240,6 +244,8 @@ fn run_init(arguments: Vec<String>) -> Result<(), AppError> {
             "status": "initialized",
             "database": store.path(),
             "codex_version": isolation.codex_version,
+            "codex_protocol_schema_digest": isolation.protocol_schema_digest,
+            "codex_known_fixture_validated": isolation.known_fixture_validated,
             "scope": "snapshot_exact",
         }))?
     );
@@ -424,6 +430,9 @@ fn run_doctor(arguments: Vec<String>) -> Result<(), AppError> {
                 "version": value.codex_version,
                 "supported": value.supported,
                 "required_flags_present": value.required_flags_present,
+                "protocol_schema_digest": value.protocol_schema_digest,
+                "known_fixture_validated": value.known_fixture_validated,
+                "incompatibility_reason": value.incompatibility_reason,
                 "isolation_verified": value.verified(),
             })),
             "repository_snapshot": snapshot,
@@ -997,6 +1006,7 @@ fn transport_preflight_run(arguments: &[String]) -> Result<(), AppError> {
         reasoning,
         service_tier: Some(service_tier),
         timeout_seconds: 30,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -3422,50 +3432,72 @@ fn profile_value(arguments: &[String], names: &[&str]) -> Result<String, AppErro
 fn resolve_codex(value: Option<String>) -> Result<PathBuf, AppError> {
     if let Some(path) = value {
         let path = PathBuf::from(path);
-        reject_shell_launcher(&path)?;
-        if path.is_file()
-            && Command::new(&path)
-                .arg("--version")
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-        {
+        validate_codex_launcher(&path)?;
+        if codex_launcher_is_usable(&path) {
             return Ok(path);
         }
         return Err(AppError::Usage(format!(
-            "--codex is not an executable file: {}",
+            "--codex does not identify a usable Codex CLI installation: {}",
             path.display()
         )));
     }
-    if let Some(path) = managed_codex_executable() {
-        return Ok(path);
+    for candidate in host_codex_candidates() {
+        if validate_codex_launcher(&candidate).is_ok() && codex_launcher_is_usable(&candidate) {
+            return Ok(candidate);
+        }
     }
-    let probe = Command::new("codex").arg("--version").output();
-    match probe {
-        Ok(output) if output.status.success() => Ok(PathBuf::from("codex")),
-        _ => Err(AppError::Runtime(
-            "Needle's managed Codex runtime is missing; reinstall Needle or repair the installation"
-                .to_owned(),
-        )),
-    }
+    Err(AppError::Runtime(
+        "No compatible user-installed Codex CLI was found. Install or update Codex so `codex app-server` is available, or pass its launcher with --codex"
+            .to_owned(),
+    ))
 }
 
-fn managed_codex_executable() -> Option<PathBuf> {
-    let current_executable = env::current_exe().ok()?;
-    let candidate = managed_codex_candidate(&current_executable)?;
-    if !managed_codex_package_is_complete(&candidate) {
-        return None;
+fn codex_launcher_is_usable(path: &Path) -> bool {
+    let is_command_name = path.components().count() == 1;
+    if !is_command_name && !path.is_file() {
+        return false;
     }
-    let output = Command::new(&candidate).arg("--version").output().ok()?;
-    output.status.success().then_some(candidate)
+    Command::new(path).arg("--version").output().is_ok_and(|output| output.status.success())
 }
 
-fn managed_codex_candidate(needle_executable: &Path) -> Option<PathBuf> {
+fn host_codex_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    #[cfg(windows)]
+    {
+        candidates.extend(["codex.exe", "codex.cmd", "codex"].map(PathBuf::from));
+        candidates.extend(windows_desktop_codex_candidates());
+    }
+    #[cfg(not(windows))]
+    candidates.push(PathBuf::from("codex"));
+    candidates
+}
+
+#[cfg(windows)]
+fn windows_desktop_codex_candidates() -> Vec<PathBuf> {
+    let Some(local_app_data) = env::var_os("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let bin = PathBuf::from(local_app_data).join("OpenAI/Codex/bin");
+    let Ok(entries) = fs::read_dir(bin) else {
+        return Vec::new();
+    };
+    let mut candidates = entries
+        .take(32)
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("codex.exe"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.reverse();
+    candidates
+}
+
+pub(crate) fn legacy_managed_codex_candidate(needle_executable: &Path) -> Option<PathBuf> {
     let file_name = if cfg!(windows) { "codex.exe" } else { "codex" };
     Some(needle_executable.parent()?.join("runtime").join("bin").join(file_name))
 }
 
-fn managed_codex_package_is_complete(codex_executable: &Path) -> bool {
+pub(crate) fn legacy_managed_codex_package_is_complete(codex_executable: &Path) -> bool {
     if !codex_executable.is_file() {
         return false;
     }
@@ -3491,6 +3523,24 @@ fn managed_codex_package_is_complete(codex_executable: &Path) -> bool {
     true
 }
 
+fn validate_codex_launcher(path: &Path) -> Result<(), AppError> {
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    let file_stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or_default();
+    let extension = extension.to_ascii_lowercase();
+    let file_stem = file_stem.to_ascii_lowercase();
+    let trusted_windows_cli_launcher =
+        cfg!(windows) && matches!(extension.as_str(), "bat" | "cmd") && file_stem == "codex";
+    if trusted_windows_cli_launcher {
+        return Ok(());
+    }
+    reject_shell_launcher(path).map_err(|_| {
+        AppError::Usage(format!(
+            "Codex launcher must be the Codex executable or its official codex.cmd/codex.bat wrapper, not an arbitrary shell or script: {}",
+            path.display()
+        ))
+    })
+}
+
 fn reject_shell_launcher(path: &Path) -> Result<(), AppError> {
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
     let file_stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or_default();
@@ -3504,8 +3554,7 @@ fn reject_shell_launcher(path: &Path) -> Result<(), AppError> {
     );
     if script_extension || shell_executable {
         return Err(AppError::Usage(format!(
-            "Codex launcher must be a native executable, not a shell or script: {}; \
-             provide the platform Codex binary directly",
+            "launcher must be a native executable, not a shell or script: {}",
             path.display()
         )));
     }
@@ -4364,20 +4413,24 @@ mod tests {
     }
 
     #[test]
-    fn codex_launcher_rejects_shells_but_accepts_native_binaries() {
+    fn codex_launcher_rejects_arbitrary_scripts_but_accepts_official_launchers() {
         for path in [
-            "codex.cmd",
-            "codex.bat",
+            "other.cmd",
+            "other.bat",
             "codex.ps1",
             "codex.sh",
             "powershell.exe",
             "pwsh.exe",
             "cmd.exe",
         ] {
-            assert!(reject_shell_launcher(Path::new(path)).is_err(), "{path}");
+            assert!(validate_codex_launcher(Path::new(path)).is_err(), "{path}");
         }
-        assert!(reject_shell_launcher(Path::new("codex.exe")).is_ok());
-        assert!(reject_shell_launcher(Path::new("codex")).is_ok());
+        assert!(validate_codex_launcher(Path::new("codex.exe")).is_ok());
+        assert!(validate_codex_launcher(Path::new("codex")).is_ok());
+        if cfg!(windows) {
+            assert!(validate_codex_launcher(Path::new("codex.cmd")).is_ok());
+            assert!(validate_codex_launcher(Path::new("codex.bat")).is_ok());
+        }
     }
 
     #[test]
@@ -4386,7 +4439,7 @@ mod tests {
         let needle = root.join(if cfg!(windows) { "needle.exe" } else { "needle" });
         let expected_name = if cfg!(windows) { "codex.exe" } else { "codex" };
         assert_eq!(
-            managed_codex_candidate(&needle),
+            legacy_managed_codex_candidate(&needle),
             Some(root.join("runtime").join("bin").join(expected_name))
         );
     }
@@ -4410,10 +4463,10 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, []).unwrap();
         }
-        assert!(managed_codex_package_is_complete(&codex));
+        assert!(legacy_managed_codex_package_is_complete(&codex));
 
         fs::remove_file(runtime.join("codex-resources/codex-command-runner.exe")).unwrap();
-        assert!(!managed_codex_package_is_complete(&codex));
+        assert!(!legacy_managed_codex_package_is_complete(&codex));
         fs::remove_dir_all(root).unwrap();
     }
 

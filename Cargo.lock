@@ -626,6 +626,7 @@ dependencies = [
  "needle-runtime",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

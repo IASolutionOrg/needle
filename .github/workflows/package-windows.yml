@@ -6,10 +6,6 @@ on:
 permissions:
   contents: read
 
-env:
-  CODEX_RUNTIME_VERSION: 0.144.0
-  CODEX_RUNTIME_PACKAGE_SHA256: 4046964ac24104bb79217077a86c96b20edae5a5f548a71442a164d3f9598a35
-
 jobs:
   package:
     runs-on: windows-latest
@@ -45,34 +41,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist/needle-windows-x64 | Out-Null
-          New-Item -ItemType Directory -Path dist/needle-windows-x64/runtime | Out-Null
           Copy-Item target/release/needle.exe dist/needle-windows-x64/needle.exe
-          $codexAsset = "codex-package-x86_64-pc-windows-msvc.tar.gz"
-          $codexUrl = "https://github.com/openai/codex/releases/download/rust-v$env:CODEX_RUNTIME_VERSION/$codexAsset"
-          $codexArchive = Join-Path $env:RUNNER_TEMP $codexAsset
-          Invoke-WebRequest -Uri $codexUrl -OutFile $codexArchive
-          $actualCodexHash = (Get-FileHash $codexArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualCodexHash -ne $env:CODEX_RUNTIME_PACKAGE_SHA256) {
-            throw "Codex runtime checksum mismatch: expected $env:CODEX_RUNTIME_PACKAGE_SHA256, got $actualCodexHash"
-          }
-          tar -xzf $codexArchive -C dist/needle-windows-x64/runtime
-          $requiredRuntimeFiles = @(
-            "bin/codex.exe",
-            "bin/codex-code-mode-host.exe",
-            "codex-path/rg.exe",
-            "codex-resources/codex-command-runner.exe",
-            "codex-resources/codex-windows-sandbox-setup.exe",
-            "codex-package.json"
-          )
-          foreach ($relativePath in $requiredRuntimeFiles) {
-            $runtimePath = Join-Path "dist/needle-windows-x64/runtime" $relativePath
-            if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
-              throw "Codex runtime package is incomplete: missing $relativePath"
-            }
-          }
           Copy-Item packaging/windows/install.ps1 dist/needle-windows-x64/install.ps1
           Copy-Item packaging/windows/uninstall.ps1 dist/needle-windows-x64/uninstall.ps1
-          Copy-Item packaging/windows/CODEX_RUNTIME.md dist/needle-windows-x64/CODEX_RUNTIME.md
           Copy-Item LICENSE.md dist/needle-windows-x64/LICENSE.md
           Copy-Item docs/INSTALLATION.md dist/needle-windows-x64/README.md
           Compress-Archive -Path dist/needle-windows-x64/* -DestinationPath dist/needle-windows-x64.zip

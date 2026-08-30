@@ -10,6 +10,7 @@ const TEST_COMMAND: &str = "cargo test suite::focused -- --exact";
 const R44_TEST_COMMAND: &str =
     "cargo test --offline --test integration misc::glob_always_case_insensitive -- --exact";
 const MAIN_DIRECT_READ_COMMAND: &str = "rg -n flag_definition src/lib.rs";
+const WORKER_NATIVE_READ_COMMAND: &str = "Get-Content -LiteralPath src/lib.rs -TotalCount 64";
 const MAIN_DIRECT_R84_SCRIPT: &str = "powershell.exe -NoProfile -Command '$p = \"crates/core/flags/defs.rs\"; Get-Content -LiteralPath $p | ForEach-Object { $_ }'";
 const DEFAULT_MAIN_NEED: &str = "@@need\n\
 @route locate.implementation\n\
@@ -120,10 +121,9 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Some("app-server")
-            if arguments.get(1).map(String::as_str) == Some("generate-json-schema") =>
+            if command_arguments.get(1).map(String::as_str) == Some("generate-json-schema") =>
         {
-            println!("--experimental");
-            Ok(())
+            generate_app_server_schema(command_arguments)
         }
         Some("app-server") => serve_app_server(),
         Some("mcp")
@@ -137,6 +137,62 @@ fn run() -> Result<(), String> {
         Some("delete") => Ok(()),
         _ => Err("unsupported simulator invocation".to_owned()),
     }
+}
+
+fn generate_app_server_schema(arguments: &[String]) -> Result<(), String> {
+    let out_index = arguments
+        .iter()
+        .position(|argument| argument == "--out")
+        .ok_or_else(|| "schema generation requires --out".to_owned())?;
+    let root = arguments
+        .get(out_index + 1)
+        .map(PathBuf::from)
+        .ok_or_else(|| "schema generation requires an output directory".to_owned())?;
+    fs::create_dir_all(root.join("v2"))
+        .map_err(|error| format!("cannot create simulated schema directory: {error}"))?;
+
+    let methods = json!({
+        "methods": [
+            "thread/start",
+            "turn/start",
+            "turn/interrupt",
+            "thread/delete",
+            "item/agentMessage/delta",
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "turn/completed",
+            "thread/tokenUsage/updated"
+        ]
+    });
+    write_schema(root.join("codex_app_server_protocol.schemas.json"), &methods)?;
+    write_schema(root.join("codex_app_server_protocol.v2.schemas.json"), &methods)?;
+    for (relative, properties) in [
+        ("v2/ThreadStartParams.json", &["approvalPolicy", "cwd", "model", "sandbox"][..]),
+        (
+            "v2/TurnStartParams.json",
+            &["approvalPolicy", "input", "outputSchema", "sandboxPolicy", "threadId"][..],
+        ),
+        ("v2/TurnInterruptParams.json", &["threadId", "turnId"][..]),
+        ("CommandExecutionRequestApprovalParams.json", &["itemId", "threadId", "turnId"][..]),
+        ("CommandExecutionRequestApprovalResponse.json", &["decision"][..]),
+        ("FileChangeRequestApprovalResponse.json", &["decision"][..]),
+        ("v2/ThreadTokenUsageUpdatedNotification.json", &["threadId", "tokenUsage"][..]),
+        ("v2/TurnCompletedNotification.json", &["threadId", "turn"][..]),
+    ] {
+        let properties = properties
+            .iter()
+            .map(|property| ((*property).to_owned(), json!({})))
+            .collect::<serde_json::Map<_, _>>();
+        write_schema(root.join(relative), &json!({"type": "object", "properties": properties}))?;
+    }
+    Ok(())
+}
+
+fn write_schema(path: PathBuf, schema: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec(schema)
+        .map_err(|error| format!("cannot encode simulated schema: {error}"))?;
+    fs::write(&path, bytes)
+        .map_err(|error| format!("cannot write simulated schema {}: {error}", path.display()))
 }
 
 fn serve_exec_simulator(arguments: &[String]) -> Result<(), String> {
@@ -400,6 +456,16 @@ impl Simulator {
                     .pointer("/params/developerInstructions")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if self.scenario == "worker_native_read_only" {
+                    if message.pointer("/params/dynamicTools").is_some() {
+                        return Err(
+                            "worker registered redundant dynamic repository tools".to_owned()
+                        );
+                    }
+                    if !developer_instructions.contains("host's native read-only tools") {
+                        return Err("worker omitted native repository-tool instructions".to_owned());
+                    }
+                }
                 if ((is_ripgrep_main_scenario(&self.scenario) && !self.main_mode)
                     || self.scenario.starts_with("main_direct_"))
                     && !developer_instructions
@@ -443,13 +509,17 @@ impl Simulator {
         respond(output, id, json!({"turn": {"id": turn_id}}))?;
         if matches!(
             self.scenario.as_str(),
-            "main_direct_read_only" | "main_direct_r84_pending_approval"
+            "main_direct_read_only"
+                | "main_direct_r84_pending_approval"
+                | "worker_native_read_only"
         ) {
             self.emit_usage(output)?;
-            let (approval_id, command) = if self.scenario == "main_direct_read_only" {
-                ("main-direct-read-only", MAIN_DIRECT_READ_COMMAND)
-            } else {
-                ("main-direct-r84-pending", MAIN_DIRECT_R84_SCRIPT)
+            let (approval_id, command) = match self.scenario.as_str() {
+                "main_direct_read_only" => ("main-direct-read-only", MAIN_DIRECT_READ_COMMAND),
+                "worker_native_read_only" => {
+                    ("worker-native-read-only", WORKER_NATIVE_READ_COMMAND)
+                }
+                _ => ("main-direct-r84-pending", MAIN_DIRECT_R84_SCRIPT),
             };
             let item_id = format!("{approval_id}-item");
             let request_id = json!(8800 + self.turn);
@@ -1143,6 +1213,7 @@ impl Simulator {
             .unwrap_or_else(|| match self.scenario.as_str() {
                 "worker_r44" => R44_TEST_COMMAND.to_owned(),
                 "main_direct_read_only" => MAIN_DIRECT_READ_COMMAND.to_owned(),
+                "worker_native_read_only" => WORKER_NATIVE_READ_COMMAND.to_owned(),
                 "main_direct_r84_pending_approval" => MAIN_DIRECT_R84_SCRIPT.to_owned(),
                 _ => TEST_COMMAND.to_owned(),
             });
@@ -1226,6 +1297,9 @@ impl Simulator {
                 "The unbounded script was declined.",
                 output,
             );
+        }
+        if self.scenario == "worker_native_read_only" {
+            return self.complete_turn(&pending.turn_id, semantic_flag_location_artifact(), output);
         }
         if pending.test_plan && self.scenario == "verifier_worker" {
             self.verifier_next_plan = self.verifier_next_plan.saturating_add(1);

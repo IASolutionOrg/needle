@@ -199,6 +199,7 @@ pub(super) fn run(arguments: &[String]) -> Result<(), AppError> {
         reasoning: worker_reasoning.clone(),
         service_tier: Some(service_tier.clone()),
         timeout_seconds,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };

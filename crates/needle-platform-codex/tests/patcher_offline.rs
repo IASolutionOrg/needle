@@ -55,6 +55,7 @@ fn rejected_completed_patcher_turn_is_accounted_once_without_a_patch() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -137,6 +138,7 @@ fn patcher_changes_only_disposable_checkout_and_persists_filesystem_patch() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -279,6 +281,7 @@ fn repairable_patch_gets_exactly_one_revision_and_independent_reverification() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -368,6 +371,7 @@ fn run_certified_plan_scenario(name: &str, plan_count: usize, duplicate: bool, s
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };

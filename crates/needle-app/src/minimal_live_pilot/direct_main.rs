@@ -33,6 +33,7 @@ pub(super) fn observe(context: DirectObservation<'_>) -> Result<MinimalLiveArm, 
         reasoning: context.context.main_reasoning.to_owned(),
         service_tier: Some(context.context.service_tier.to_owned()),
         timeout_seconds: context.context.timeout.as_secs(),
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };

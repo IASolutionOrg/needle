@@ -50,6 +50,7 @@ pub(super) fn run_supervised_main(
         reasoning: context.main_reasoning.to_owned(),
         service_tier: Some(context.service_tier.to_owned()),
         timeout_seconds: context.timeout.as_secs(),
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };

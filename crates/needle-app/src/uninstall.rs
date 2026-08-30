@@ -1,5 +1,6 @@
 use super::{
-    AppError, managed_codex_candidate, managed_codex_package_is_complete, product_data_directory,
+    AppError, legacy_managed_codex_candidate, legacy_managed_codex_package_is_complete,
+    product_data_directory,
 };
 use std::env;
 use std::fs;
@@ -18,7 +19,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 struct ManagedInstallation {
     root: PathBuf,
     executable: PathBuf,
-    runtime: PathBuf,
+    legacy_runtime: Option<PathBuf>,
     uninstaller: PathBuf,
 }
 
@@ -83,7 +84,7 @@ fn run_windows() -> Result<(), AppError> {
     println!("Installation:         {}", installation.root.display());
     println!("Preserved product data: {}", data_directory.display());
     println!(
-        "\nThe managed executable, runtime, uninstaller, and matching user PATH entry will be removed after this process exits. Unrelated files are preserved."
+        "\nThe managed executable, uninstaller, matching user PATH entry, and any verified legacy Needle-owned Codex runtime will be removed after this process exits. User-installed host runtimes and unrelated files are preserved."
     );
     Ok(())
 }
@@ -109,24 +110,10 @@ fn managed_installation(executable: &Path) -> Result<ManagedInstallation, AppErr
             AppError::Runtime("the Needle executable has no parent directory".to_owned())
         })?
         .to_path_buf();
-    let codex = managed_codex_candidate(&executable).ok_or_else(|| {
-        AppError::Runtime("the managed Codex runtime path cannot be resolved".to_owned())
-    })?;
-    if !managed_codex_package_is_complete(&codex) {
-        return Err(AppError::Runtime(
-            "the current executable is not inside a complete managed Needle installation; no files were removed"
-                .to_owned(),
-        ));
-    }
-    let runtime = fs::canonicalize(root.join("runtime")).map_err(|error| {
-        AppError::Runtime(format!("cannot resolve the managed runtime directory: {error}"))
-    })?;
-    if runtime.parent() != Some(root.as_path()) {
-        return Err(AppError::Runtime(
-            "the managed runtime escapes the Needle installation directory; no files were removed"
-                .to_owned(),
-        ));
-    }
+    let legacy_runtime = legacy_managed_codex_candidate(&executable)
+        .filter(|codex| legacy_managed_codex_package_is_complete(codex))
+        .and_then(|_| fs::canonicalize(root.join("runtime")).ok())
+        .filter(|runtime| runtime.parent() == Some(root.as_path()));
     let uninstaller = root.join("uninstall.ps1");
     let installed_script = fs::read_to_string(&uninstaller).map_err(|error| {
         AppError::Runtime(format!(
@@ -140,7 +127,7 @@ fn managed_installation(executable: &Path) -> Result<ManagedInstallation, AppErr
             uninstaller.display()
         )));
     }
-    Ok(ManagedInstallation { root, executable, runtime, uninstaller })
+    Ok(ManagedInstallation { root, executable, legacy_runtime, uninstaller })
 }
 
 #[cfg(windows)]
@@ -158,9 +145,10 @@ fn uninstaller_command(installation: &ManagedInstallation) -> Result<Command, Ap
         .arg(powershell_path(&installation.root))
         .arg("-Executable")
         .arg(powershell_path(&installation.executable))
-        .arg("-RuntimeDirectory")
-        .arg(powershell_path(&installation.runtime))
         .creation_flags(CREATE_NO_WINDOW);
+    if let Some(runtime) = &installation.legacy_runtime {
+        command.arg("-LegacyRuntimeDirectory").arg(powershell_path(runtime));
+    }
     Ok(command)
 }
 
@@ -296,6 +284,20 @@ mod tests {
     }
 
     #[test]
+    fn managed_layout_does_not_require_a_bundled_host_runtime() {
+        let root = temporary_root("host-installed");
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join(if cfg!(windows) { "needle.exe" } else { "needle" });
+        fs::write(&executable, []).unwrap();
+        fs::write(root.join("uninstall.ps1"), UNINSTALL_SCRIPT).unwrap();
+
+        let installation = managed_installation(&executable).unwrap();
+
+        assert!(installation.legacy_runtime.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn managed_layout_requires_the_bundled_uninstaller() {
         let installation = managed_layout("managed");
         fs::write(&installation.uninstaller, "Write-Host 'not managed'").unwrap();
@@ -315,7 +317,7 @@ mod tests {
 
         let error = managed_installation(&executable).unwrap_err().to_string();
 
-        assert!(error.contains("not inside a complete managed Needle installation"));
+        assert!(error.contains("managed uninstaller is unavailable"));
         assert!(executable.is_file());
         fs::remove_dir_all(root).unwrap();
     }
@@ -352,14 +354,14 @@ mod tests {
             .arg(powershell_path(&installation.root))
             .arg("-Executable")
             .arg(powershell_path(&installation.executable))
-            .arg("-RuntimeDirectory")
-            .arg(powershell_path(&installation.runtime))
+            .arg("-LegacyRuntimeDirectory")
+            .arg(powershell_path(installation.legacy_runtime.as_ref().unwrap()))
             .status()
             .unwrap();
 
         assert!(status.success());
         assert!(!installation.executable.exists());
-        assert!(!installation.runtime.exists());
+        assert!(!installation.legacy_runtime.as_ref().unwrap().exists());
         assert!(!installation.uninstaller.exists());
         assert_eq!(fs::read_to_string(&unrelated).unwrap(), "user content");
         fs::remove_dir_all(installation.root).unwrap();

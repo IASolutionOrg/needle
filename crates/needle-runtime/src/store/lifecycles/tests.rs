@@ -1258,6 +1258,7 @@ impl crate::WorkerExecutor for SuccessfulExploreWorker {
             worker_model: config.model.clone(),
             worker_reasoning: config.reasoning.clone(),
             codex_version: "test".to_owned(),
+            host_protocol_schema_digest: None,
             input_tokens: Some(1),
             cached_input_tokens: Some(0),
             output_tokens: Some(1),

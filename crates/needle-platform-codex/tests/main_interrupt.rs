@@ -74,6 +74,7 @@ fn direct_main_completes_without_semantic_interrupt() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -125,6 +126,7 @@ fn pilot_main_auto_approves_one_bounded_repository_read() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -175,6 +177,7 @@ fn pilot_main_fails_fast_on_r84_style_script_and_preserves_usage() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -230,6 +233,7 @@ fn semantic_message_interrupts_before_tools_and_continues_same_thread() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -295,6 +299,7 @@ fn nested_continuation_need_is_preserved_and_classified_before_cleanup() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -362,6 +367,7 @@ fn sequential_turns_accept_two_needs_then_return_a_final_response() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -590,6 +596,7 @@ fn r35_cache_main_simulation_returns_the_frontier_answer_without_tools() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -658,6 +665,7 @@ fn malformed_subject_is_interrupted_and_preserved_before_validation() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -725,6 +733,7 @@ fn supervised_main_resolves_with_worker_then_continues_without_discovery() {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };
@@ -824,6 +833,7 @@ fn main_session(scenario: &str) -> (PathBuf, PathBuf, CodexMainSession) {
         reasoning: "medium".to_owned(),
         service_tier: Some("default".to_owned()),
         timeout_seconds: 10,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };

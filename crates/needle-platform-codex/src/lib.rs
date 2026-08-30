@@ -3,6 +3,7 @@
 
 mod action_provider;
 mod app_server;
+mod compatibility;
 mod debug_log;
 mod lifecycle_adapter;
 mod lifecycle_test_plan;

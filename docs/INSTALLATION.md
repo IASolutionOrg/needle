@@ -25,9 +25,11 @@ Then run:
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer copies `needle.exe` and Needle's pinned Codex worker runtime to
+The installer copies `needle.exe` and the Needle uninstaller to
 `%LOCALAPPDATA%\Programs\Needle`, then adds that directory to the user `PATH`.
-Users do not need to install Codex CLI separately. Open a new terminal after
+It does not bundle, download, or own a Codex runtime. Install and sign in to
+Codex separately; either the standalone/Desktop-provided `codex.exe` or the
+official CLI launcher must expose `codex app-server`. Open a new terminal after
 installation.
 
 ## Enable Needle
@@ -38,8 +40,11 @@ Open PowerShell or Command Prompt inside a Git repository and run:
 needle enable
 ```
 
-On the first enable, Needle verifies its managed Codex runtime, loads the models
-available to the current Codex account, and shows an interactive model picker.
+On the first enable, Needle locates the user's Codex installation, generates and
+validates its bounded App Server protocol schema, loads the models available to
+the current Codex account, and shows an interactive model picker. This works for
+CLI-only users; Codex Desktop is an optional client integration, not a runtime
+dependency.
 Use the arrow keys to move, Enter to confirm, or Escape to cancel.
 Non-interactive setup can provide the model explicitly:
 
@@ -203,10 +208,12 @@ needle uninstall
 
 The command removes only Needle-managed Codex CLI hooks and the managed Codex
 Desktop skill, removes the matching installation directory from the user
-`PATH`, and schedules deletion of `needle.exe`, the bundled Codex runtime, and
-the managed uninstaller after the command exits. A modified or incomplete
-installation is rejected before integrations or files are removed. Files in
-the installation directory that are not managed by Needle are preserved.
+`PATH`, and schedules deletion of `needle.exe` and the managed uninstaller after
+the command exits. An exact legacy Needle-owned runtime is also removed during
+upgrade or uninstall; the user's Codex installation is never removed. A
+modified or incomplete installation is rejected before integrations or files
+are removed. Files in the installation directory that are not managed by
+Needle are preserved.
 
 Product data is intentionally retained in `%LOCALAPPDATA%\Needle`, including
 settings, SQLite state, cached context, and debug logs. This keeps uninstall

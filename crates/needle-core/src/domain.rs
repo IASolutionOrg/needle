@@ -105,6 +105,8 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub service_tier: Option<String>,
     pub timeout_seconds: u64,
+    #[serde(default = "default_worker_max_turns")]
+    pub max_turns: u8,
     #[serde(default)]
     pub evidence_failure_policy: EvidenceFailurePolicy,
     #[serde(default)]
@@ -114,12 +116,13 @@ pub struct WorkerConfig {
 impl WorkerConfig {
     pub fn digest(&self) -> Digest {
         Digest::blake3(format!(
-            "needle-worker-config\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            "needle-worker-config\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             self.executable,
             self.model,
             self.reasoning,
             self.service_tier.as_deref().unwrap_or_default(),
             self.timeout_seconds,
+            self.max_turns,
             self.evidence_failure_policy.as_str(),
             self.role_profile_provenance
                 .as_ref()
@@ -132,6 +135,10 @@ impl WorkerConfig {
                 .unwrap_or_default(),
         ))
     }
+}
+
+const fn default_worker_max_turns() -> u8 {
+    2
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -183,6 +190,8 @@ pub struct WorkerOutcome {
     pub worker_model: String,
     pub worker_reasoning: String,
     pub codex_version: String,
+    #[serde(default)]
+    pub host_protocol_schema_digest: Option<Digest>,
     pub input_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -437,5 +446,74 @@ mod tests {
             Preset::new("p", "P", "line\r\nline").definition_digest,
             Preset::new("p", "P", "line\nline").definition_digest
         );
+    }
+
+    #[test]
+    fn legacy_worker_outcome_without_host_protocol_digest_remains_decodable() {
+        let outcome = WorkerOutcome {
+            result: NeedResult {
+                complete: true,
+                summary: "fixture".to_owned(),
+                claims: Vec::new(),
+                evidence: Vec::new(),
+                suggested_reads: Vec::new(),
+                suggested_commands: Vec::new(),
+                uncertainty: Vec::new(),
+            },
+            artifact_result: None,
+            semantic_artifact_result: None,
+            worker_model: "fixture".to_owned(),
+            worker_reasoning: "low".to_owned(),
+            codex_version: "0.144.0".to_owned(),
+            host_protocol_schema_digest: Some(Digest::blake3(b"schema")),
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            duration_ms: 1,
+            process_status: "success".to_owned(),
+            logical_worker_spawns: 1,
+            worker_turns: 1,
+            repair_performed: false,
+            discarded_facts: 0,
+            worker_session_id: None,
+            session_cleanup_success: Some(true),
+            role_profile_provenance: None,
+        };
+        let mut legacy = serde_json::to_value(outcome).unwrap();
+        legacy.as_object_mut().unwrap().remove("host_protocol_schema_digest");
+
+        let decoded: WorkerOutcome = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(decoded.host_protocol_schema_digest, None);
+    }
+
+    #[test]
+    fn legacy_worker_request_without_semantic_fragment_remains_decodable() {
+        let request = WorkerRequest {
+            root_task: "fixture".to_owned(),
+            need_key: NeedKey::new("locate.implementation").unwrap(),
+            need_body: "Locate the fixture.".to_owned(),
+            preset: Preset::new("locate.implementation", "Locate", "fixture"),
+            repository_root: "repository".to_owned(),
+            repository_snapshot: RepositorySnapshot {
+                identity_revision: REPOSITORY_SNAPSHOT_IDENTITY_REVISION,
+                repository_id: Digest::blake3(b"repository"),
+                head_sha: "0".repeat(40),
+                tracked_changes_digest: Digest::blake3(b"tracked"),
+                untracked_content_digest: Digest::blake3(b"untracked"),
+                source_digest: Digest::blake3(b"source"),
+            },
+            declared_test_plan: None,
+            trusted_test_execution: false,
+            requested_artifact_kinds: Vec::new(),
+            preferred_artifact_kinds: Vec::new(),
+            semantic_fragment: None,
+        };
+        let mut legacy = serde_json::to_value(request).unwrap();
+        legacy.as_object_mut().unwrap().remove("semantic_fragment");
+
+        let decoded: WorkerRequest = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(decoded.semantic_fragment, None);
     }
 }

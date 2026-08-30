@@ -64,32 +64,35 @@ cargo test --locked -p needle-app --test mcp_stdio
 
 ## Codex compatibility
 
-Use a native executable and generate the experimental App Server schema from
-the exact supported Codex version:
+Generate the experimental App Server schema from the candidate user-installed
+Codex CLI:
 
 ```text
-codex app-server generate-json-schema --experimental
+codex app-server generate-json-schema --experimental --out <directory>
 ```
 
-Do not assume schemas are compatible across releases. Update the checked
-fixture and focused compatibility tests together.
+Needle validates required methods and fields rather than accepting one exact
+version. A matching checked fixture provides stronger known-version evidence;
+a newer schema can still be protocol-compatible when all required capabilities
+are present.
 
 ## Troubleshooting
 
 ### Native launcher rejected
 
-**Symptom:** initialization rejects `.cmd`, `.bat`, `.ps1`, or a shell.
+**Symptom:** initialization rejects a launcher script or shell.
 
-**Action:** point `--codex` to the native platform executable. Shell support in
-command approval is a separate worker-test boundary and does not make a shell a
-valid Codex launcher.
+**Action:** point `--codex` to the native platform executable or, on Windows,
+the official `codex.cmd`/`codex.bat` launcher. Arbitrary scripts and shells stay
+rejected. Shell support in command approval is a separate worker-test boundary.
 
 ### Unsupported App Server schema
 
 **Symptom:** preflight reports a missing method, field, or approval shape.
 
-**Action:** verify the exact Codex version, regenerate its experimental schema,
-and compare the compatibility fixture. Do not weaken validation globally.
+**Action:** update Codex, regenerate its experimental schema, and inspect the
+reported missing capability. A fixture mismatch alone means “compatible but not
+fixture-validated”; a required capability mismatch fails closed.
 
 ### Approval remains pending
 

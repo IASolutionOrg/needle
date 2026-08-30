@@ -690,6 +690,7 @@ impl RoleProfileRevision {
                 ServiceTier::Priority => Some("priority".to_owned()),
             },
             timeout_seconds: self.definition.timeout_seconds,
+            max_turns: self.definition.budget.max_turns,
             evidence_failure_policy: match self.definition.repair_policy {
                 RepairPolicy::None => EvidenceFailurePolicy::DiscardInvalidFact,
                 RepairPolicy::Once => EvidenceFailurePolicy::RepairOnce,

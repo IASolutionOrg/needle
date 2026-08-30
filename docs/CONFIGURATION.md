@@ -20,7 +20,7 @@ tests, experiments, or parallel profiles.
 
 ```text
 needle init \
-  --codex <native-executable> \
+  --codex <codex-launcher> \
   --worker-model <model> \
   --worker-reasoning <low|medium|high|xhigh> \
   [--worker-timeout-seconds <seconds>] \
@@ -31,7 +31,7 @@ needle init \
 
 Persistent runtime settings are:
 
-- native Codex executable;
+- resolved user-installed Codex launcher;
 - worker model and reasoning;
 - worker timeout;
 - evidence failure policy;
@@ -42,17 +42,18 @@ Credentials are neither imported nor exported.
 
 ## Current agent-host scope
 
-Worker execution and orchestration currently use Codex only. The web control
+Worker execution and orchestration currently use Codex App Server from the
+user's existing Codex installation. Needle uses the host's authentication and
+does not install a private Codex copy. The web control
 plane can edit Codex model policy, runtime bounds, and canonical named role
 profiles. The HTTP/editor changes configuration only; the product hook and MCP
 entry points bind an explicitly selected active revision to each new session.
 
-The planned sequence is Codex-first role configuration and lifecycle
-orchestration, followed by configuration-only interoperability for Claude Code
-and Cursor, then OpenCode and Antigravity. Configuration interoperability does
-not authorize Needle to launch or orchestrate those hosts. Non-Codex execution
-is a later milestone with separate compatibility, isolation, and validation
-requirements. See the [product roadmap](ROADMAP.md).
+The planned Phase 10 sequence adds host adapters that invoke each user's own
+headless runtime, for example `claude` for Claude Code and `agy` for
+Antigravity. Configuration interoperability does not authorize Needle to launch
+or orchestrate those hosts yet. Each adapter has separate compatibility,
+isolation, and validation requirements. See the [product roadmap](ROADMAP.md).
 
 ## Canonical Codex role profiles
 

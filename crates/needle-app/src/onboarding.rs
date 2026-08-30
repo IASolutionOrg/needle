@@ -1,5 +1,5 @@
 use super::{
-    AppError, VERSION, managed_codex_executable, product_data_directory, resolve_codex,
+    AppError, VERSION, legacy_managed_codex_candidate, product_data_directory, resolve_codex,
     validate_model_value, validate_reasoning,
 };
 use dialoguer::{Select, theme::ColorfulTheme};
@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::env;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
@@ -56,7 +56,7 @@ pub(crate) fn run_enable(arguments: Vec<String>) -> Result<(), AppError> {
     let store = RuntimeStore::new(data_directory.join("needle.sqlite3"));
     store.initialize().map_err(runtime_error)?;
     let settings = match store.settings() {
-        Ok(settings) => settings,
+        Ok(settings) => reconcile_legacy_managed_host(&store, settings)?,
         Err(StoreError::MissingSetting(_)) => initialize_first_run(&store, &arguments)?,
         Err(error) => return Err(runtime_error(error)),
     };
@@ -64,8 +64,12 @@ pub(crate) fn run_enable(arguments: Vec<String>) -> Result<(), AppError> {
         CodexWorker::verify_isolation(&settings.codex_executable).map_err(AppError::Runtime)?;
     if !isolation.verified() {
         return Err(AppError::Runtime(format!(
-            "Codex {} is not in the exact validated set or lacks required isolation flags; Needle remains disabled",
-            isolation.codex_version
+            "Codex {} is not App Server protocol-compatible: {}; Needle remains disabled",
+            isolation.codex_version,
+            isolation
+                .incompatibility_reason
+                .as_deref()
+                .unwrap_or("required capabilities are missing")
         )));
     }
     let profile_id = ensure_default_profile(&store, &settings, DEFAULT_MAX_COST_MICROUSD)?;
@@ -91,6 +95,8 @@ pub(crate) fn run_enable(arguments: Vec<String>) -> Result<(), AppError> {
                 "activation": activation,
                 "effective": status,
                 "codex_version": isolation.codex_version,
+                "codex_protocol_schema_digest": isolation.protocol_schema_digest,
+                "codex_known_fixture_validated": isolation.known_fixture_validated,
                 "runtime_mode": "on_demand",
                 "transport": "surface_specific",
                 "codex_installations": codex_installations,
@@ -167,7 +173,7 @@ fn render_enable_success(summary: &EnableSummary<'_>, use_color: bool) -> String
     };
 
     format!(
-        "{title}\n\nRepository:     {}\nScope:          {scope}\nWorker model:   {}\nProfile:        {}\nCodex runtime:  {} - Verified\nCodex CLI:      {cli}\nCodex Desktop:  {desktop}\nMode:           On demand{migration}\n\n{next_step}",
+        "{title}\n\nRepository:     {}\nScope:          {scope}\nWorker model:   {}\nProfile:        {}\nCodex host:     {} - Protocol compatible\nCodex CLI:      {cli}\nCodex Desktop:  {desktop}\nMode:           On demand{migration}\n\n{next_step}",
         display_path(summary.repository),
         summary.worker_model,
         summary.profile_id,
@@ -331,6 +337,9 @@ pub(crate) fn run_status(arguments: Vec<String>) -> Result<(), AppError> {
                     "version": report.codex_version,
                     "supported": report.supported,
                     "required_flags_present": report.required_flags_present,
+                    "protocol_schema_digest": report.protocol_schema_digest,
+                    "known_fixture_validated": report.known_fixture_validated,
+                    "incompatibility_reason": report.incompatibility_reason,
                     "isolation_verified": report.verified(),
                 })),
                 "needle": needle_status,
@@ -376,12 +385,11 @@ fn render_uninitialized_status(
 ) -> String {
     let disabled = paint("Needle is disabled.", AnsiColor::Yellow, use_color);
     format!(
-        "{disabled}\n\nRepository:      {}\nSetup:           Not completed\nNeedle:          {}\nCodex CLI:       {}\nCodex Desktop:   {}\nWorker runtime:  {}\n\nRun `needle enable` to set up and activate Needle for this repository.",
+        "{disabled}\n\nRepository:      {}\nSetup:           Not completed\nNeedle:          {}\nCodex CLI:       {}\nCodex Desktop:   {}\nWorker host:     Not configured\n\nRun `needle enable` to set up and activate Needle for this repository.",
         display_path(repository),
         needle.human_summary(use_color),
         cli_summary(&codex.cli, integrations, use_color),
         desktop_summary(&codex.desktop, integrations, use_color),
-        codex.managed.human_summary(use_color, true),
     )
 }
 
@@ -428,12 +436,11 @@ fn render_initialized_status(
     };
 
     format!(
-        "Needle status\n\nState:              {state}\nRepository:         {}\nScope:              {scope}\nProfile:            {profile}\nNeedle:             {}\nCodex CLI:          {}\nCodex Desktop:      {}\nWorker runtime:     {}\nConfigured worker:  {codex}\nMode:               On demand\n\n{next_step}",
+        "Needle status\n\nState:              {state}\nRepository:         {}\nScope:              {scope}\nProfile:            {profile}\nNeedle:             {}\nCodex CLI:          {}\nCodex Desktop:      {}\nConfigured host:    {codex}\nMode:               On demand\n\n{next_step}",
         display_path(repository),
         needle.human_summary(use_color),
         cli_summary(&codex_installations.cli, integrations, use_color),
         desktop_summary(&codex_installations.desktop, integrations, use_color),
-        codex_installations.managed.human_summary(use_color, true),
     )
 }
 
@@ -441,7 +448,6 @@ fn render_initialized_status(
 struct CodexInstallations {
     cli: DetectedInstallation,
     desktop: DetectedInstallation,
-    managed: DetectedInstallation,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -563,7 +569,6 @@ enum UpdateAvailability {
     NotApplicable,
     UpToDate,
     Available,
-    ManagedByNeedle,
     NoPublishedRelease,
     Unknown,
 }
@@ -627,9 +632,6 @@ fn update_summary(update: &UpdateAvailability, use_color: bool) -> String {
         UpdateAvailability::NotApplicable => String::new(),
         UpdateAvailability::UpToDate => paint("Up to date", AnsiColor::Green, use_color),
         UpdateAvailability::Available => paint("Update available", AnsiColor::Yellow, use_color),
-        UpdateAvailability::ManagedByNeedle => {
-            paint("Ready and validated by Needle", AnsiColor::Green, use_color)
-        }
         UpdateAvailability::NoPublishedRelease => {
             paint("Development build", AnsiColor::Gray, use_color)
         }
@@ -642,7 +644,6 @@ fn update_summary(update: &UpdateAvailability, use_color: bool) -> String {
 fn detect_codex_installations() -> CodexInstallations {
     let mut cli = detect_codex_cli();
     let mut desktop = detect_codex_desktop();
-    let mut managed = detect_managed_codex();
     if cli.found {
         cli.update = match fetch_latest_release_version("openai/codex") {
             ReleaseLookup::Version(latest) => {
@@ -654,10 +655,7 @@ fn detect_codex_installations() -> CodexInstallations {
     if desktop.found {
         desktop.update = detect_desktop_update_availability(desktop.version.as_deref());
     }
-    if managed.found {
-        managed.update = UpdateAvailability::ManagedByNeedle;
-    }
-    CodexInstallations { cli, desktop, managed }
+    CodexInstallations { cli, desktop }
 }
 
 fn detect_needle_status() -> NeedleStatus {
@@ -752,17 +750,6 @@ fn parse_release_response(bytes: &[u8]) -> ReleaseLookup {
         "404" => ReleaseLookup::NotPublished,
         _ => ReleaseLookup::Unavailable,
     }
-}
-
-fn detect_managed_codex() -> DetectedInstallation {
-    let Some(path) = managed_codex_executable() else {
-        return DetectedInstallation::not_found();
-    };
-    let Ok(output) = Command::new(path).arg("--version").output() else {
-        return DetectedInstallation::not_found();
-    };
-    let version = parse_command_version(&String::from_utf8_lossy(&output.stdout));
-    DetectedInstallation::found(version)
 }
 
 #[cfg(windows)]
@@ -1044,8 +1031,12 @@ fn initialize_first_run(
     let isolation = CodexWorker::verify_isolation(&codex_executable).map_err(AppError::Runtime)?;
     if !isolation.verified() {
         return Err(AppError::Runtime(format!(
-            "Codex {} is not in the exact validated set or lacks required isolation flags; no onboarding settings were written",
-            isolation.codex_version
+            "Codex {} is not App Server protocol-compatible: {}; no onboarding settings were written",
+            isolation.codex_version,
+            isolation
+                .incompatibility_reason
+                .as_deref()
+                .unwrap_or("required capabilities are missing")
         )));
     }
     let worker_model = match option_value(arguments, "--worker-model") {
@@ -1076,6 +1067,55 @@ fn initialize_first_run(
     };
     store.initialize_defaults(&settings).map_err(runtime_error)?;
     Ok(settings)
+}
+
+fn reconcile_legacy_managed_host(
+    store: &RuntimeStore,
+    mut settings: RuntimeSettings,
+) -> Result<RuntimeSettings, AppError> {
+    let current_executable = env::current_exe()?;
+    let Some(legacy_host) = legacy_managed_codex_candidate(&current_executable) else {
+        return Ok(settings);
+    };
+    if !configured_path_matches(&settings.codex_executable, &legacy_host) || legacy_host.is_file() {
+        return Ok(settings);
+    }
+
+    let replacement = resolve_codex(None)?;
+    let replacement = replacement.to_string_lossy().into_owned();
+    let isolation = CodexWorker::verify_isolation(&replacement).map_err(AppError::Runtime)?;
+    if !isolation.verified() {
+        return Err(AppError::Runtime(format!(
+            "Codex {} is not App Server protocol-compatible: {}; the legacy host setting was not changed",
+            isolation.codex_version,
+            isolation
+                .incompatibility_reason
+                .as_deref()
+                .unwrap_or("required capabilities are missing")
+        )));
+    }
+    if store
+        .replace_codex_executable_if_current(&settings.codex_executable, &replacement)
+        .map_err(runtime_error)?
+    {
+        settings.codex_executable = replacement;
+        return Ok(settings);
+    }
+    store.settings().map_err(runtime_error)
+}
+
+fn configured_path_matches(configured: &str, expected: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let normalize = |value: &Path| {
+            value.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_owned()
+        };
+        normalize(Path::new(configured)).eq_ignore_ascii_case(&normalize(expected))
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new(configured) == expected
+    }
 }
 
 fn select_worker_model(codex_executable: &str) -> Result<String, AppError> {
@@ -1480,6 +1520,15 @@ impl Action {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_host_path_match_is_exact_and_platform_normalized() {
+        let expected = Path::new("installation/runtime/bin/codex.exe");
+        assert!(configured_path_matches("installation/runtime/bin/codex.exe", expected));
+        assert!(!configured_path_matches("other/runtime/bin/codex.exe", expected));
+        #[cfg(windows)]
+        assert!(configured_path_matches("INSTALLATION\\runtime\\bin\\CODEX.EXE", expected));
+    }
+
     fn integration_status(cli_registered: bool, desktop_ready: bool) -> CodexIntegrationStatus {
         CodexIntegrationStatus {
             cli_hooks: Some(crate::codex_hooks::HookRegistration {
@@ -1527,7 +1576,6 @@ mod tests {
         let installations = CodexInstallations {
             cli: DetectedInstallation::found(Some("0.144.0".to_owned())),
             desktop: DetectedInstallation::found(Some("26.727.6591.0".to_owned())),
-            managed: DetectedInstallation::found(Some("0.144.0".to_owned())),
         };
         let integrations = integration_status(true, true);
         let output = render_enable_success(
@@ -1546,7 +1594,7 @@ mod tests {
         assert!(output.starts_with("Needle enabled."));
         assert!(output.contains(r"Repository:     C:\work\needle"));
         assert!(output.contains("Worker model:   gpt-5.6-terra"));
-        assert!(output.contains("Codex runtime:  0.144.0 - Verified"));
+        assert!(output.contains("Codex host:     0.144.0 - Protocol compatible"));
         assert!(output.contains("Codex CLI:      Found (0.144.0)"));
         assert!(output.contains("Hooks registered"));
         assert!(output.contains("Codex Desktop:  Found (26.727.6591.0)"));
@@ -1564,10 +1612,8 @@ mod tests {
         let mut installations = CodexInstallations {
             cli: DetectedInstallation::not_found(),
             desktop: DetectedInstallation::found(Some("26.727.6591.0".to_owned())),
-            managed: DetectedInstallation::found(Some("0.144.0".to_owned())),
         };
         installations.desktop.update = UpdateAvailability::UpToDate;
-        installations.managed.update = UpdateAvailability::ManagedByNeedle;
         let integrations = integration_status(false, true);
         let output = render_uninitialized_status(
             std::path::Path::new(r"\\?\C:\work\needle"),
@@ -1586,9 +1632,7 @@ mod tests {
                 "Codex Desktop:   Found (26.727.6591.0) - Up to date - Needle skill ready"
             )
         );
-        assert!(
-            output.contains("Worker runtime:  Found (0.144.0) - Ready and validated by Needle")
-        );
+        assert!(output.contains("Worker host:     Not configured"));
         assert!(!output.trim_start().starts_with('{'));
     }
 

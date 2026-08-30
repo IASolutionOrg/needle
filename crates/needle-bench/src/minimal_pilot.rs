@@ -254,6 +254,7 @@ impl WorkerExecutor for DeterministicPilotWorker {
             worker_model: config.model.clone(),
             worker_reasoning: config.reasoning.clone(),
             codex_version: "deterministic-offline-fixture".to_owned(),
+            host_protocol_schema_digest: None,
             input_tokens: None,
             cached_input_tokens: None,
             output_tokens: None,

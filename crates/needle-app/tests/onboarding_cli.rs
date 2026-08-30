@@ -1,5 +1,5 @@
-use needle_core::RoleProfileId;
-use needle_runtime::RuntimeStore;
+use needle_core::{EvidenceFailurePolicy, MultiNeedPolicy, RoleProfileId};
+use needle_runtime::{RuntimeSettings, RuntimeStore};
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -264,4 +264,43 @@ fn companion_commands_are_process_level_idempotent_persistent_and_bounded() {
     let disabled_status = fixture.run_json(&status_arguments);
     assert_eq!(disabled_status["initialized"], true);
     assert_eq!(disabled_status["enabled"], false);
+}
+
+#[test]
+fn enable_migrates_only_the_missing_legacy_managed_host_and_preserves_settings() {
+    let fixture = Fixture::new();
+    let store = RuntimeStore::new(fixture.data.join("needle.sqlite3"));
+    let legacy_host = needle()
+        .parent()
+        .unwrap()
+        .join("runtime")
+        .join("bin")
+        .join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    assert!(!legacy_host.exists());
+    let initial = RuntimeSettings {
+        codex_executable: legacy_host.display().to_string(),
+        worker_model: "gpt-test".to_owned(),
+        worker_reasoning: "high".to_owned(),
+        worker_timeout_seconds: 123,
+        evidence_failure_policy: EvidenceFailurePolicy::RepairOnce,
+        trusted_test_execution: true,
+        multi_need_policy: MultiNeedPolicy::default(),
+    };
+    store.initialize_defaults(&initial).unwrap();
+
+    let common = fixture.common_arguments();
+    let enabled = fixture.run_json(&[
+        "enable",
+        common[0].as_str(),
+        common[1].as_str(),
+        common[2].as_str(),
+        common[3].as_str(),
+        common[4].as_str(),
+        common[5].as_str(),
+    ]);
+    assert_eq!(enabled["status"], "enabled");
+
+    let mut expected = initial;
+    expected.codex_executable = if cfg!(windows) { "codex.exe" } else { "codex" }.to_owned();
+    assert_eq!(store.settings().unwrap(), expected);
 }

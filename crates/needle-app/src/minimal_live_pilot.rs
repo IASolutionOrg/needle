@@ -1581,6 +1581,7 @@ fn run_declared_test_transport_preflight(
         reasoning: worker_reasoning.to_owned(),
         service_tier: Some(service_tier.to_owned()),
         timeout_seconds: 30,
+        max_turns: 2,
         evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
         role_profile_provenance: None,
     };

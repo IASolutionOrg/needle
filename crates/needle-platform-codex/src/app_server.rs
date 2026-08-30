@@ -22,7 +22,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod main_session;
-mod repository_tools;
 
 pub use main_session::{
     ActiveTurnInterruption, CodexMainSession, ContinueWorkingResult, MainContinuationDiagnostics,
@@ -506,7 +505,6 @@ impl AppServerSession {
                 "developerInstructions": developer_instructions,
                 "ephemeral": true,
                 "historyMode": "paginated",
-                "dynamicTools": repository_tools::specs(),
                 "environments": [],
                 "runtimeWorkspaceRoots": [checkout_root],
                 "config": {
@@ -618,15 +616,12 @@ impl AppServerSession {
                 continue;
             };
             if event.get("method").and_then(Value::as_str) == Some("item/tool/call") {
-                self.handle_repository_tool_call(&event).map_err(|diagnostic| {
-                    AppServerTurnFailure::observed(
-                        diagnostic,
-                        input_tokens,
-                        cached_input_tokens,
-                        output_tokens,
-                    )
-                })?;
-                continue;
+                return Err(AppServerTurnFailure::observed(
+                    "worker requested an undeclared dynamic tool",
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                ));
             }
             if event.get("method").and_then(Value::as_str) == Some("error")
                 && event.pointer("/params/turnId").and_then(Value::as_str) == Some(turn_id.as_str())
@@ -913,36 +908,6 @@ impl AppServerSession {
             return Err(rejection);
         }
         Ok(())
-    }
-
-    fn handle_repository_tool_call(&mut self, event: &Value) -> Result<(), String> {
-        let params = event
-            .get("params")
-            .ok_or_else(|| "repository tool request has no params".to_owned())?;
-        if params.get("threadId").and_then(Value::as_str) != Some(self.thread_id.as_str()) {
-            return Err("repository tool request targeted another thread".to_owned());
-        }
-        let tool = params
-            .get("tool")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "repository tool request has no tool name".to_owned())?;
-        let arguments = params.get("arguments").unwrap_or(&Value::Null);
-        let result =
-            repository_tools::execute(tool, arguments, &self.approval_context.checkout_root);
-        let (success, text) = match result {
-            Ok(output) => {
-                self.observed_files.extend(output.observed_files);
-                (true, output.text)
-            }
-            Err(diagnostic) => (false, diagnostic),
-        };
-        self.respond(
-            event,
-            json!({
-                "success": success,
-                "contentItems": [{"type": "inputText", "text": text}]
-            }),
-        )
     }
 
     fn wait_for_web_decision(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, String> {
@@ -2117,6 +2082,7 @@ mod tests {
             reasoning: "medium".to_owned(),
             service_tier: None,
             timeout_seconds: 60,
+            max_turns: 2,
             evidence_failure_policy: needle_core::EvidenceFailurePolicy::DiscardInvalidFact,
             role_profile_provenance: None,
         };

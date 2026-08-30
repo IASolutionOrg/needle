@@ -2347,6 +2347,7 @@ impl RuntimeSettings {
             reasoning: self.worker_reasoning.clone(),
             service_tier: None,
             timeout_seconds: self.worker_timeout_seconds,
+            max_turns: 2,
             evidence_failure_policy: self.evidence_failure_policy,
             role_profile_provenance: None,
         }
@@ -3240,6 +3241,28 @@ impl RuntimeStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn replace_codex_executable_if_current(
+        &self,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<bool, StoreError> {
+        const MAX_CODEX_EXECUTABLE_BYTES: usize = 4 * 1024;
+        let valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= MAX_CODEX_EXECUTABLE_BYTES
+                && !value.chars().any(|character| character == '\0')
+        };
+        if !valid(expected) || !valid(replacement) {
+            return Err(StoreError::DefinitionDigest("codex_executable".to_owned()));
+        }
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE settings SET value=?2 WHERE key='codex_executable' AND value=?1",
+            params![expected, replacement],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn utility_gate_passed(&self) -> Result<bool, StoreError> {
@@ -7399,6 +7422,7 @@ mod tests {
             reasoning: "medium".to_owned(),
             service_tier: None,
             timeout_seconds: 180,
+            max_turns: 2,
             evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
             role_profile_provenance: None,
         };
@@ -7440,6 +7464,44 @@ mod tests {
     }
 
     #[test]
+    fn codex_executable_replacement_is_bounded_cas_and_preserves_other_settings() {
+        let (path, store) = temporary_store();
+        let initial = RuntimeSettings {
+            codex_executable: "legacy/codex.exe".to_owned(),
+            worker_model: "gpt-5.6-luna".to_owned(),
+            worker_reasoning: "medium".to_owned(),
+            worker_timeout_seconds: 123,
+            evidence_failure_policy: EvidenceFailurePolicy::RepairOnce,
+            trusted_test_execution: true,
+            multi_need_policy: MultiNeedPolicy::default(),
+        };
+        store.initialize_defaults(&initial).unwrap();
+
+        assert!(
+            !store
+                .replace_codex_executable_if_current("different/codex.exe", "user/codex.exe")
+                .unwrap()
+        );
+        assert_eq!(store.settings().unwrap(), initial);
+        assert!(
+            store
+                .replace_codex_executable_if_current("legacy/codex.exe", "user/codex.exe")
+                .unwrap()
+        );
+        let mut expected = initial.clone();
+        expected.codex_executable = "user/codex.exe".to_owned();
+        assert_eq!(store.settings().unwrap(), expected);
+        assert!(
+            !store
+                .replace_codex_executable_if_current("legacy/codex.exe", "other/codex.exe")
+                .unwrap()
+        );
+        assert!(store.replace_codex_executable_if_current("user/codex.exe", "").is_err());
+        assert_eq!(store.settings().unwrap(), expected);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn stale_worker_session_can_be_recovered() {
         let (path, store) = temporary_store();
         store.initialize().unwrap();
@@ -7449,6 +7511,7 @@ mod tests {
             reasoning: "medium".to_owned(),
             service_tier: None,
             timeout_seconds: 180,
+            max_turns: 2,
             evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
             role_profile_provenance: None,
         };

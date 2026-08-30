@@ -120,6 +120,7 @@ fn transport_preflight_reports_optional_runner_unavailable_without_a_model_turn(
                 reasoning: "medium".to_owned(),
                 service_tier: None,
                 timeout_seconds: 10,
+                max_turns: 2,
                 evidence_failure_policy: EvidenceFailurePolicy::DiscardInvalidFact,
                 role_profile_provenance: None,
             },
@@ -158,6 +159,21 @@ fn failed_app_server_turn_preserves_error_usage_and_cleanup() {
     assert_eq!(simulation.cached_input_tokens, Some(40));
     assert_eq!(simulation.output_tokens, Some(20));
     assert_eq!(simulation.session_cleanup_success, Some(true));
+    assert!(simulation.no_pending_worker_sessions);
+    assert!(simulation.checkout_clean);
+    assert!(simulation.sandboxes_cleaned);
+}
+
+#[test]
+fn worker_uses_native_read_only_command_and_finishes_in_one_turn() {
+    let simulation = Simulation::run("worker_native_read_only", 0);
+    assert_eq!(simulation.worker_status, "completed");
+    assert!(simulation.failure_code.is_none());
+    assert_eq!(simulation.logical_worker_spawns, 1);
+    assert_eq!(simulation.worker_turns, 1);
+    assert!(!simulation.repair_performed);
+    assert_eq!(simulation.command_evidence_count, 1);
+    assert!(simulation.no_pending_approvals);
     assert!(simulation.no_pending_worker_sessions);
     assert!(simulation.checkout_clean);
     assert!(simulation.sandboxes_cleaned);
@@ -264,12 +280,22 @@ impl Simulation {
             RuntimeStore::new(data.join("needle.sqlite3")),
             CodexWorker::new(&data),
         );
+        let assistant_message = if scenario == "worker_native_read_only" {
+            "@@need\n\
+@route locate.implementation\n\
+@subject symbol:\"flag_definition\"\n\
+@require implementation-location selection=primary granularity=exact-location\n\
+@world source=current features=default\n\
+\n\
+Locate the primary implementation.\n\
+@@end"
+        } else {
+            "@@need:trace.state-flow\nTrace the simulated flag.\n@@end"
+        };
         let stop = StopInput {
             session_id: Some(session_id.clone()),
             turn_id: Some(turn_id.clone()),
-            last_assistant_message: Some(
-                "@@need:trace.state-flow\nTrace the simulated flag.\n@@end".to_owned(),
-            ),
+            last_assistant_message: Some(assistant_message.to_owned()),
             cwd: repository.to_str().map(str::to_owned),
             model: Some("simulated-main".to_owned()),
             ..StopInput::default()
@@ -285,7 +311,7 @@ impl Simulation {
                     cwd: repository.clone(),
                     need: need.compatibility_request(),
                     need_ir: need.typed().cloned(),
-                    declared_test_plan: Some(test_plan()),
+                    declared_test_plan: (scenario != "worker_native_read_only").then(test_plan),
                 })
                 .map(|outcome| Some(outcome.rendered))
                 .map_err(|error| error.to_string())

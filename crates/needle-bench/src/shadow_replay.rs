@@ -355,6 +355,7 @@ mod tests {
                 worker_model: "test".to_owned(),
                 worker_reasoning: "low".to_owned(),
                 codex_version: "0.144.0".to_owned(),
+                host_protocol_schema_digest: None,
                 input_tokens: None,
                 cached_input_tokens: None,
                 output_tokens: None,

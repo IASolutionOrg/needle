@@ -33,5 +33,5 @@ fn development_binary_cannot_uninstall_its_build_directory() {
     assert!(!output.status.success());
     assert!(executable.is_file());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("not inside a complete managed Needle installation"));
+    assert!(stderr.contains("managed uninstaller is unavailable"));
 }

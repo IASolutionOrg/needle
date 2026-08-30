@@ -400,6 +400,7 @@ fn cache_identity_separates_revisions_and_rejects_unknown_or_mismatched_provenan
         worker_model: "gpt-5".to_owned(),
         worker_reasoning: "medium".to_owned(),
         codex_version: "test".to_owned(),
+        host_protocol_schema_digest: None,
         input_tokens: Some(1),
         cached_input_tokens: Some(0),
         output_tokens: Some(1),
